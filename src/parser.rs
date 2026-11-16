@@ -9,11 +9,20 @@ pub struct MarkdownParser {
     inline_language: Language,
 }
 
+/// Byte ranges an inline tree was parsed over (its `set_included_ranges`). An inline
+/// parse depends only on these ranges and the text inside them, so this is the key under
+/// which an unchanged inline tree can be reused on the next parse.
+type InlineKey = Vec<(usize, usize)>;
+
 #[derive(Debug, Clone)]
 pub struct MarkdownTree {
     block_tree: Tree,
     inline_trees: Vec<Tree>,
     inline_indices: HashMap<usize, usize>,
+    /// Parallel to `inline_trees`: the included byte ranges each one was parsed over,
+    /// kept in current-text coordinates by `edit`, or `None` once an edit touched them
+    /// (the tree's content is then stale and it must be re-parsed, not reused).
+    inline_keys: Vec<Option<InlineKey>>,
 }
 
 impl MarkdownTree {
@@ -21,6 +30,27 @@ impl MarkdownTree {
         self.block_tree.edit(edit);
         for inline_tree in self.inline_trees.iter_mut() {
             inline_tree.edit(edit);
+        }
+        let delta = edit.new_end_byte as isize - edit.old_end_byte as isize;
+        for key in self.inline_keys.iter_mut() {
+            let Some(ranges) = key.as_mut() else { continue };
+            let (Some(first), Some(last)) = (ranges.first(), ranges.last()) else {
+                *key = None;
+                continue;
+            };
+            let (span_start, span_end) = (first.0, last.1);
+            if span_end < edit.start_byte {
+                // Entirely before the edit: unchanged.
+            } else if span_start > edit.old_end_byte {
+                // Entirely after the edit: same text, shifted.
+                for r in ranges.iter_mut() {
+                    r.0 = (r.0 as isize + delta) as usize;
+                    r.1 = (r.1 as isize + delta) as usize;
+                }
+            } else {
+                // Touches the edit (boundaries included): content may have changed.
+                *key = None;
+            }
         }
     }
 
@@ -73,12 +103,31 @@ impl MarkdownParser {
             old_tree.map(|tree| &tree.block_tree),
             None, // No progress callback
         )?;
-        let (mut inline_trees, mut inline_indices) = if let Some(old_tree) = old_tree {
+        let (mut inline_trees, mut inline_indices, mut inline_keys) = if let Some(old_tree) = old_tree {
             let len = old_tree.inline_trees.len();
-            (Vec::with_capacity(len), HashMap::with_capacity(len))
+            (
+                Vec::with_capacity(len),
+                HashMap::with_capacity(len),
+                Vec::with_capacity(len),
+            )
         } else {
-            (Vec::new(), HashMap::new())
+            (Vec::new(), HashMap::new(), Vec::new())
         };
+        // Old inline trees untouched by the edits since the last parse, by their included
+        // ranges. A new leaf with the exact same ranges has identical inline input, so its
+        // tree is reused (`Tree::clone` is a cheap ref-counted copy) instead of re-parsed.
+        // Without this every keystroke re-ran the inline grammar over every paragraph and
+        // table cell of the document.
+        let reusable: HashMap<&[(usize, usize)], &Tree> = old_tree
+            .map(|old| {
+                old.inline_keys
+                    .iter()
+                    .zip(&old.inline_trees)
+                    .filter_map(|(k, t)| k.as_deref().map(|k| (k, t)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut key: InlineKey = Vec::new();
         parser
             .set_language(inline_language)
             .expect("Could not load inline grammar");
@@ -128,23 +177,33 @@ impl MarkdownParser {
                 tree_cursor.goto_parent();
             }
             ranges.push(range);
-            parser.set_included_ranges(&ranges).ok()?;
-            let inline_tree = parser.parse_with_options(
-                callback,
-                old_tree.and_then(|old_tree| old_tree.inline_trees.get(i)),
-                None, // No progress callback
-            )?;
+            key.clear();
+            key.extend(ranges.iter().map(|r| (r.start_byte, r.end_byte)));
+            let inline_tree = match reusable.get(key.as_slice()) {
+                Some(&tree) => tree.clone(),
+                None => {
+                    parser.set_included_ranges(&ranges).ok()?;
+                    parser.parse_with_options(
+                        callback,
+                        None,
+                        None, // No progress callback
+                    )?
+                }
+            };
             inline_trees.push(inline_tree);
+            inline_keys.push(Some(key.clone()));
             inline_indices.insert(node.id(), i);
             i += 1;
         }
         drop(tree_cursor);
         inline_trees.shrink_to_fit();
         inline_indices.shrink_to_fit();
+        inline_keys.shrink_to_fit();
         Some(MarkdownTree {
             block_tree,
             inline_trees,
             inline_indices,
+            inline_keys,
         })
     }
 
@@ -173,6 +232,96 @@ mod tests {
     use tree_sitter::{InputEdit, Point};
 
     use super::*;
+
+    /// Full structural dump of a markdown tree: the block tree plus, for every inline
+    /// tree in document order, its S-expression and every node's byte range. Two trees
+    /// with equal dumps are indistinguishable to every consumer.
+    fn dump(tree: &MarkdownTree) -> String {
+        fn walk(node: tree_sitter::Node, out: &mut String) {
+            out.push_str(&format!("{}[{}..{}]", node.kind(), node.start_byte(), node.end_byte()));
+            let mut c = node.walk();
+            for child in node.children(&mut c) {
+                out.push('(');
+                walk(child, out);
+                out.push(')');
+            }
+        }
+        let mut out = String::new();
+        walk(tree.block_tree().root_node(), &mut out);
+        for t in tree.inline_trees() {
+            out.push_str("\n--inline: ");
+            walk(t.root_node(), &mut out);
+        }
+        out
+    }
+
+    fn point_at(text: &str, byte: usize) -> Point {
+        let before = &text[..byte];
+        let row = before.matches('\n').count();
+        let col = byte - before.rfind('\n').map_or(0, |i| i + 1);
+        Point { row, column: col }
+    }
+
+    /// Incremental parsing with inline-tree reuse must produce exactly the tree a fresh
+    /// parse produces, across random inserts/deletes — including ones landing on node
+    /// boundaries and ones that change block structure (newlines, pipes, fences).
+    #[test]
+    fn incremental_inline_reuse_matches_fresh_parse() {
+        let base = "# Titolo\n\nUn paragrafo con **grassetto** e `codice` e [link](x).\n\n\
+| Col A | Col B |\n|---|---|\n| uno *x* | due |\n| tre | quattro `q` |\n\n\
+> citazione con _enfasi_\n> seconda riga\n\n- voce **uno**\n- voce due\n  continua\n\n\
+```rust\nfn main() {}\n```\n\nUltimo paragrafo\nsu due righe.\n";
+        let mut text = std::env::var("WRIT_PARSE_TEST_FILE")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_else(|| base.repeat(4));
+        let mut parser = MarkdownParser::default();
+        let mut tree = parser.parse(text.as_bytes(), None).unwrap();
+        let inserts = ["a", " ", "\n", "|", "*", "`", "**b**", "\n\n", "# ", "> ", "x | y"];
+        let mut seed: u64 = 0x9e3779b97f4a7c15;
+        let mut rnd = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for step in 0..400 {
+            let len = text.len();
+            let mut start = rnd(len + 1);
+            while !text.is_char_boundary(start) {
+                start -= 1;
+            }
+            let (old_end, insert) = if rnd(3) == 0 && start < len {
+                let mut end = (start + 1 + rnd(8)).min(len);
+                while !text.is_char_boundary(end) {
+                    end += 1;
+                }
+                (end, "")
+            } else {
+                (start, inserts[rnd(inserts.len())])
+            };
+            let new_end = start + insert.len();
+            let start_position = point_at(&text, start);
+            let old_end_position = point_at(&text, old_end);
+            text.replace_range(start..old_end, insert);
+            let new_end_position = point_at(&text, new_end);
+            tree.edit(&InputEdit {
+                start_byte: start,
+                old_end_byte: old_end,
+                new_end_byte: new_end,
+                start_position,
+                old_end_position,
+                new_end_position,
+            });
+            tree = parser.parse(text.as_bytes(), Some(&tree)).unwrap();
+            let fresh = MarkdownParser::default().parse(text.as_bytes(), None).unwrap();
+            assert_eq!(
+                dump(&tree),
+                dump(&fresh),
+                "step {step}: edit {start}..{old_end} -> {insert:?}"
+            );
+        }
+    }
 
     #[test]
     fn inline_ranges() {
