@@ -41,6 +41,7 @@ use crate::buffer::Buffer;
 use crate::chrome::{BarRect, FindButtonRects, StatusInfo, draw_find_bar, draw_status_bar};
 use crate::config::{self, Config, ResolvedConfig};
 use crate::consts::{
+    MAX_CONTENT_WIDTH,
     CARET_WIDTH, FIND_ROW_H, FONT_SIZE, LINE_HEIGHT, OUTLINE_WIDTH, PADDING, STATUS_BAR_H,
     WHEEL_LINE_STEP,
 };
@@ -141,6 +142,18 @@ mod profile {
     }
 
     /// Latency (ms) from the oldest unpresented input event to now, clearing it.
+    /// Benchmark aid: `WRIT_AUTOSCROLL=<device px per frame>` scrolls the document to
+    /// the bottom by itself (through the normal wheel path), then logs once and stops.
+    pub fn autoscroll_step() -> Option<f32> {
+        static STEP: OnceLock<Option<f32>> = OnceLock::new();
+        *STEP.get_or_init(|| {
+            std::env::var("WRIT_AUTOSCROLL")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|v| *v > 0.0)
+        })
+    }
+
     pub fn take_input_latency() -> Option<f64> {
         PENDING_INPUT
             .with(|c| c.take())
@@ -568,6 +581,8 @@ struct App {
     scrollbar_pending: bool,
     /// Wheel scroll (device px) accumulated since the last frame, applied once per frame.
     wheel_pending_dy: f32,
+    /// `WRIT_AUTOSCROLL` benchmark run finished (reached the bottom).
+    autoscroll_done: bool,
     /// Timestamp of the last auto-scroll tick, so scrolling integrates against real
     /// elapsed time (frame-rate independent) rather than a fixed amount per tick.
     last_drag_tick: Option<std::time::Instant>,
@@ -672,6 +687,7 @@ impl App {
             scrollbar_hover: false,
             scrollbar_pending: false,
             wheel_pending_dy: 0.0,
+            autoscroll_done: false,
             last_drag_tick: None,
             pending_rebuild: false,
             frame_retry: FrameRetry::default(),
@@ -714,6 +730,76 @@ impl App {
     }
 }
 
+/// Decoded-pixel budget for file/remote images per document (bytes). Images in the
+/// materialized band are always kept; older ones beyond this are evicted and reloaded on
+/// demand. ~10 downscaled 1024×728 screenshots.
+const IMAGE_MEMORY_BUDGET: usize = 32 * 1024 * 1024;
+
+/// Pin glibc's malloc thresholds so large blocks always go through `mmap` and return
+/// to the OS when freed. By default glibc *raises* both thresholds after the first large
+/// free (up to 32 MB mmap / 64 MB trim), after which image-sized buffers (decode
+/// temporaries, decoded pixels) land in the per-thread arenas of the decoder pool and
+/// are never given back: measured ~136 MB free-but-resident after one pass over a
+/// document with 29 screenshots, which `malloc_trim` did not release. Setting the
+/// values explicitly disables the dynamic adjustment.
+fn configure_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        const M_TRIM_THRESHOLD: std::ffi::c_int = -1;
+        const M_MMAP_THRESHOLD: std::ffi::c_int = -3;
+        unsafe extern "C" {
+            fn mallopt(param: std::ffi::c_int, value: std::ffi::c_int) -> std::ffi::c_int;
+        }
+        // SAFETY: called once at startup, before any other thread exists.
+        unsafe {
+            mallopt(M_MMAP_THRESHOLD, 256 * 1024);
+            mallopt(M_TRIM_THRESHOLD, 1024 * 1024);
+        }
+    }
+}
+
+/// glibc allocator totals (all arenas) for profiling: bytes in use vs. free-but-held.
+fn allocator_stats() -> String {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        #[repr(C)]
+        #[derive(Default)]
+        struct Mallinfo2 {
+            arena: usize,
+            ordblks: usize,
+            smblks: usize,
+            hblks: usize,
+            hblkhd: usize,
+            usmblks: usize,
+            fsmblks: usize,
+            uordblks: usize,
+            fordblks: usize,
+            keepcost: usize,
+        }
+        unsafe extern "C" {
+            fn mallinfo2() -> Mallinfo2;
+        }
+        // SAFETY: mallinfo2 only reads allocator bookkeeping.
+        let m = unsafe { mallinfo2() };
+        let mb = |b: usize| b as f64 / 1048576.0;
+        format!(
+            "malloc: in use {:.1} MB (+ mmapped {:.1} MB), free-held {:.1} MB, arena total {:.1} MB",
+            mb(m.uordblks),
+            mb(m.hblkhd),
+            mb(m.fordblks),
+            mb(m.arena)
+        )
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    String::new()
+}
+
+/// Widest useful raster for images at this window scale: the body never exceeds
+/// `MAX_CONTENT_WIDTH` logical px.
+fn sync_image_raster_width(scale: f32) {
+    crate::image_cache::set_max_raster_width((MAX_CONTENT_WIDTH * scale).ceil() as u32);
+}
+
 /// Free-function form of `App::sync_images` that borrows only the doc-engine (+ runtime
 /// / proxy) — usable from `window_event` where `self.state` is already borrowed mutably.
 fn sync_image_loads(
@@ -748,6 +834,9 @@ fn sync_image_loads(
         }
     }
     let urls = doc.image_urls();
+    // Drop decoded pixels of images far from the viewport beyond the memory budget
+    // (their size is kept, so layout is unaffected); `urls` is the materialized band.
+    doc_engine.images.trim(urls, IMAGE_MEMORY_BUDGET);
     if urls.is_empty() {
         return;
     }
@@ -1893,6 +1982,7 @@ impl ApplicationHandler<WritEvent> for App {
         );
 
         let scale = window.scale_factor() as f32;
+        sync_image_raster_width(scale);
         // Find is closed at startup, so no find-bar inset yet.
         let (_, editor_h) = chrome_metrics(scale, size.height as f32, 0.0);
         let doc = self
@@ -1948,6 +2038,7 @@ impl ApplicationHandler<WritEvent> for App {
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 state.scale = scale_factor as f32;
+                sync_image_raster_width(state.scale);
                 // Text metrics and the find bar are scale-dependent, so a DPI change
                 // (e.g. dragging the window to another monitor) must recompute the bar
                 // height and relayout at the new scale, not just redraw stale geometry.
@@ -2891,6 +2982,24 @@ impl ApplicationHandler<WritEvent> for App {
 
                 // Coalesced scroll input: apply this frame's accumulated wheel delta and
                 // the latest scrollbar-drag position, with at most one relayout each.
+                if let Some(step) = profile::autoscroll_step()
+                    && !self.autoscroll_done
+                    && let Some(doc) = self.doc_engine.doc.as_ref()
+                {
+                    let (_, vh, _) = state.viewport();
+                    if doc.scroll_y >= doc.max_scroll(vh) - 0.5 {
+                        self.autoscroll_done = true;
+                        let (held, _) = self.doc_engine.images.trim(doc.image_urls(), usize::MAX);
+                        eprintln!(
+                            "[writ-autoscroll] reached bottom | image pixels held {:.1} MB | {}",
+                            held as f64 / 1048576.0,
+                            allocator_stats()
+                        );
+                    } else {
+                        self.wheel_pending_dy += step;
+                        state.window.request_redraw();
+                    }
+                }
                 let wheel_dy = std::mem::take(&mut self.wheel_pending_dy);
                 if wheel_dy != 0.0 {
                     let (w, vh, scale) = state.viewport();
@@ -3129,6 +3238,7 @@ impl ApplicationHandler<WritEvent> for App {
 /// Boot the shell: install the TLS provider, stand up a tokio runtime for HTTP/
 /// GitHub work (kept alive for the process), and run the winit event loop.
 pub fn run() -> Result<()> {
+    configure_allocator();
     // Default winit's Wayland client-side decoration (sctk-adwaita) to a dark title
     // bar to match the editor. Set before any threads spawn; user can override.
     if std::env::var_os("WINIT_WAYLAND_CSD_THEME").is_none() {

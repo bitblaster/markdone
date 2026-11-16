@@ -90,10 +90,10 @@ pub fn spawn_image_loads(
     signal: impl RepaintSignal,
 ) {
     for url in urls {
-        if cache.contains(url) {
-            continue; // already loading/loaded/failed
+        // Skips URLs already loading/loaded/failed; claims new and evicted ones.
+        if !cache.begin_evictable_load(url) {
+            continue;
         }
-        cache.mark_loading(url);
         let cache = cache.clone();
         let signal = signal.clone();
         let url = url.clone();

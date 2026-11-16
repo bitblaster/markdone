@@ -795,6 +795,24 @@ fn build_image_block(
             },
             IMG_PLACEHOLDER_H * scale,
         ),
+        // Pixels evicted to save memory: a placeholder at the image's exact fitted size,
+        // so the line keeps its height (no scroll jump) until the reload lands.
+        Some(ImageState::Evicted {
+            display_w,
+            display_h,
+        }) => {
+            let iw = display_w * scale;
+            let ih = display_h * scale;
+            let dw = iw.min(content_w);
+            let dh = if iw > 0.0 { ih * dw / iw } else { 0.0 };
+            (
+                ImageBlock {
+                    alt: img.alt.clone(),
+                    kind: ImageBlockKind::Loading,
+                },
+                dh + 2.0 * vpad,
+            )
+        }
         // Loading, or not yet spawned: a pending placeholder box.
         Some(ImageState::Loading) | None => (
             ImageBlock {
@@ -842,6 +860,26 @@ fn resolve_inline_images(
                         h,
                         InlineImageDraw {
                             brush,
+                            baseline_offset: 0.0,
+                        },
+                    )
+                }
+                // Evicted: reserve the loaded size so the line doesn't reflow.
+                Some(ImageState::Evicted {
+                    display_w,
+                    display_h,
+                }) => {
+                    let mut w = display_w * scale;
+                    let mut h = display_h * scale;
+                    if w > max_advance && w > 0.0 {
+                        h *= max_advance / w;
+                        w = max_advance;
+                    }
+                    (
+                        w,
+                        h,
+                        InlineImageDraw {
+                            brush: None,
                             baseline_offset: 0.0,
                         },
                     )
