@@ -487,6 +487,8 @@ struct App {
     scrollbar_hover: bool,
     /// Scrollbar drag motion not yet applied: applied once per frame in RedrawRequested.
     scrollbar_pending: bool,
+    /// Wheel scroll (device px) accumulated since the last frame, applied once per frame.
+    wheel_pending_dy: f32,
     /// Timestamp of the last auto-scroll tick, so scrolling integrates against real
     /// elapsed time (frame-rate independent) rather than a fixed amount per tick.
     last_drag_tick: Option<std::time::Instant>,
@@ -590,6 +592,7 @@ impl App {
             scrollbar_drag: None,
             scrollbar_hover: false,
             scrollbar_pending: false,
+            wheel_pending_dy: 0.0,
             last_drag_tick: None,
             pending_rebuild: false,
             frame_retry: FrameRetry::default(),
@@ -1856,38 +1859,11 @@ impl ApplicationHandler<WritEvent> for App {
                     MouseScrollDelta::LineDelta(_, y) => -y * WHEEL_LINE_STEP * state.scale,
                     MouseScrollDelta::PixelDelta(p) => -p.y as f32,
                 };
-                let (_, editor_h) = chrome_metrics(
-                    state.scale,
-                    state.surface.config.height as f32,
-                    state.find_bar_h,
-                );
-                let remeasure = if let Some(doc) = self.doc_engine.doc.as_mut() {
-                    doc.scroll_by(dy, editor_h);
-                    doc.needs_remeasure(editor_h)
-                } else {
-                    false
-                };
+                // Coalesced: accumulated here, applied once per frame in RedrawRequested
+                // (a fast wheel/touchpad can deliver several events per frame, and each
+                // one used to trigger its own relayout).
+                self.wheel_pending_dy += dy;
                 self.hovered = None; // stored anchor goes stale on scroll
-                // Wheel-scrolled into height-estimated lines → rebuild to lay them out.
-                if remeasure {
-                    let w = state.surface.config.width as f32;
-                    let scale = state.scale;
-                    self.doc_engine
-                        .rebuild_preserving_scroll(w, scale, editor_h);
-                    // Image lines scrolled into the materialized range need loading.
-                    sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
-                }
-                // Visible refs change with scroll_y alone (no rebuild needed); the cache
-                // dedups, so validating on every wheel tick is cheap and safe.
-                spawn_ref_validations(
-                    &self.doc_engine.editor,
-                    self.doc_engine.doc.as_ref().map(|d| {
-                        let (a, b) = d.visible_range(editor_h);
-                        a..b
-                    }),
-                    &self.runtime,
-                    &self.proxy,
-                );
                 if self.doc_engine.doc.is_some() {
                     state.window.request_redraw();
                 }
@@ -2810,7 +2786,35 @@ impl ApplicationHandler<WritEvent> for App {
                     drag_extend_step(&mut self.doc_engine, self.mouse_pos, 0.0, w, scale, vh);
                 }
 
-                // Scrollbar drag is coalesced: the thumb follows the pointer once per frame.
+                // Coalesced scroll input: apply this frame's accumulated wheel delta and
+                // the latest scrollbar-drag position, with at most one relayout each.
+                let wheel_dy = std::mem::take(&mut self.wheel_pending_dy);
+                if wheel_dy != 0.0 {
+                    let (w, vh, scale) = state.viewport();
+                    let remeasure = if let Some(doc) = self.doc_engine.doc.as_mut() {
+                        doc.scroll_by(wheel_dy, vh);
+                        doc.needs_remeasure(vh)
+                    } else {
+                        false
+                    };
+                    // Wheel-scrolled into height-estimated lines → rebuild to lay them out.
+                    if remeasure {
+                        self.doc_engine.rebuild_preserving_scroll(w, scale, vh);
+                        // Image lines scrolled into the materialized range need loading.
+                        sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
+                    }
+                    // Visible refs change with scroll_y alone (no rebuild needed); the
+                    // cache dedups, so validating once per frame is cheap and safe.
+                    spawn_ref_validations(
+                        &self.doc_engine.editor,
+                        self.doc_engine.doc.as_ref().map(|d| {
+                            let (a, b) = d.visible_range(vh);
+                            a..b
+                        }),
+                        &self.runtime,
+                        &self.proxy,
+                    );
+                }
                 if std::mem::take(&mut self.scrollbar_pending)
                     && let Some(grab) = self.scrollbar_drag
                     && let Some(geo) = scrollbar_geometry(&self.doc_engine, state)
