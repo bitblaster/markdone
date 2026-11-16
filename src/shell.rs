@@ -68,6 +68,85 @@ use crate::overlay::{
 use crate::raster::rasterize_scene_to_png;
 use crate::scrollbar;
 
+/// Frame profiling, enabled with `WRIT_PROFILE=1`: one stderr line per frame with the
+/// number/cost of layout rebuilds since the previous frame and the frame phase timings.
+mod profile {
+    use std::cell::Cell;
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    thread_local! {
+        static REBUILDS: Cell<(u32, u64)> = const { Cell::new((0, 0)) };
+    }
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("WRIT_PROFILE").is_some_and(|v| v != "0"))
+    }
+
+    pub fn record_rebuild(start: Instant) {
+        if enabled() {
+            let us = start.elapsed().as_micros() as u64;
+            REBUILDS.with(|c| {
+                let (n, t) = c.get();
+                c.set((n + 1, t + us));
+            });
+        }
+    }
+
+    /// Rebuilds (count, total µs) since the last call, resetting the counter.
+    pub fn take_rebuilds() -> (u32, u64) {
+        REBUILDS.with(|c| c.replace((0, 0)))
+    }
+
+    thread_local! {
+        /// Arrival time of the oldest input event not yet shown on screen.
+        static PENDING_INPUT: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+
+    /// Times one input event's handling (printed on drop, so early returns count too)
+    /// and marks it as awaiting a frame for the input-to-present latency.
+    pub struct EventTimer {
+        label: &'static str,
+        start: Instant,
+        rebuilds_before: (u32, u64),
+    }
+
+    impl EventTimer {
+        pub fn new(label: &'static str) -> Option<Self> {
+            if !enabled() {
+                return None;
+            }
+            let start = Instant::now();
+            PENDING_INPUT.with(|c| {
+                if c.get().is_none() {
+                    c.set(Some(start));
+                }
+            });
+            Some(Self { label, start, rebuilds_before: REBUILDS.with(|c| c.get()) })
+        }
+    }
+
+    impl Drop for EventTimer {
+        fn drop(&mut self) {
+            let (n, us) = REBUILDS.with(|c| c.get());
+            eprintln!(
+                "[writ-event] {:<10} handler {:7.2} ms (rebuilds {} = {:.2} ms)",
+                self.label,
+                self.start.elapsed().as_secs_f64() * 1e3,
+                n - self.rebuilds_before.0,
+                (us - self.rebuilds_before.1) as f64 / 1e3,
+            );
+        }
+    }
+
+    /// Latency (ms) from the oldest unpresented input event to now, clearing it.
+    pub fn take_input_latency() -> Option<f64> {
+        PENDING_INPUT
+            .with(|c| c.take())
+            .map(|t| t.elapsed().as_secs_f64() * 1e3)
+    }
+}
 use crate::text_engine::{TextEngine, peniko_color, peniko_color_alpha};
 use crate::text_input;
 use crate::validation::{GitHubValidationCache, IssueOrPr, MentionableUser, ValidatedRefData};
@@ -1116,6 +1195,19 @@ impl DocEngine {
         anchor_line: usize,
         viewport_h: f32,
     ) -> DocLayout {
+        let t0 = Instant::now();
+        let layout = self.rebuild_inner(device_width, scale, anchor_line, viewport_h);
+        profile::record_rebuild(t0);
+        layout
+    }
+
+    fn rebuild_inner(
+        &mut self,
+        device_width: f32,
+        scale: f32,
+        anchor_line: usize,
+        viewport_h: f32,
+    ) -> DocLayout {
         let cursor_offset = self.editor.cursor_position();
         let version = self.editor.state.buffer.version();
         // Clone the diff before borrowing the buffer mutably for the snapshot.
@@ -1822,6 +1914,14 @@ impl ApplicationHandler<WritEvent> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let _event_timer = match &event {
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                profile::EventTimer::new("key")
+            }
+            WindowEvent::Ime(winit::event::Ime::Commit(_)) => profile::EventTimer::new("ime-commit"),
+            WindowEvent::Ime(winit::event::Ime::Preedit(..)) => profile::EventTimer::new("ime-preedit"),
+            _ => None,
+        };
         let Some(state) = self.state.as_mut() else {
             return;
         };
@@ -2763,6 +2863,7 @@ impl ApplicationHandler<WritEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                let t_frame = Instant::now();
                 // Acquire before building the scene so an occluded window only
                 // probes the surface. A skipped first frame must wake itself up.
                 let surface_texture = match state.surface.surface.get_current_texture() {
@@ -2776,6 +2877,8 @@ impl ApplicationHandler<WritEvent> for App {
                         return;
                     }
                 };
+
+                let t_acquired = Instant::now();
 
                 if self
                     .selection_drag
@@ -2822,6 +2925,7 @@ impl ApplicationHandler<WritEvent> for App {
                 {
                     sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
                 }
+                let t_input = Instant::now();
                 self.scene.reset();
 
                 // Keep the native title bar's text current (filename + dirty marker).
@@ -2943,6 +3047,7 @@ impl ApplicationHandler<WritEvent> for App {
                         &params,
                     )
                     .expect("render_to_texture failed");
+                let t_rendered = Instant::now();
 
                 let mut encoder =
                     dev.device
@@ -2961,6 +3066,23 @@ impl ApplicationHandler<WritEvent> for App {
                 state.window.pre_present_notify();
                 surface_texture.present();
                 self.frame_retry = FrameRetry::default();
+                if profile::enabled() {
+                    let t_end = Instant::now();
+                    let (n, us) = profile::take_rebuilds();
+                    let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f64() * 1e3;
+                    if let Some(lat) = profile::take_input_latency() {
+                        eprintln!("[writ-latency] input → present {lat:7.2} ms");
+                    }
+                    eprintln!(
+                        "[writ-profile] acquire {:6.2} ms | rebuilds {n} = {:6.2} ms | input {:6.2} ms | scene+gpu {:6.2} ms | present {:6.2} ms | frame-tot {:6.2} ms",
+                        ms(t_frame, t_acquired),
+                        us as f64 / 1e3,
+                        ms(t_acquired, t_input),
+                        ms(t_input, t_rendered),
+                        ms(t_rendered, t_end),
+                        ms(t_frame, t_end),
+                    );
+                }
             }
             _ => {}
         }
