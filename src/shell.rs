@@ -66,6 +66,8 @@ use crate::overlay::{
     HoverTarget, draw_autocomplete, draw_hover_popover, find_hover_target, hover_target_at_offset,
 };
 use crate::raster::rasterize_scene_to_png;
+use crate::scrollbar;
+
 use crate::text_engine::{TextEngine, peniko_color, peniko_color_alpha};
 use crate::text_input;
 use crate::validation::{GitHubValidationCache, IssueOrPr, MentionableUser, ValidatedRefData};
@@ -478,6 +480,13 @@ struct App {
     /// in physical px/second. Drives continuous auto-scroll from `about_to_wait` so the
     /// selection keeps growing even when the pointer is held still at the edge.
     drag_scroll_dy: f32,
+    /// Scrollbar thumb drag in progress: the pointer's offset from the thumb top (device
+    /// px) at grab time, so the thumb doesn't jump under the pointer.
+    scrollbar_drag: Option<f32>,
+    /// Pointer over the scrollbar hit zone (drives the stronger thumb tint).
+    scrollbar_hover: bool,
+    /// Scrollbar drag motion not yet applied: applied once per frame in RedrawRequested.
+    scrollbar_pending: bool,
     /// Timestamp of the last auto-scroll tick, so scrolling integrates against real
     /// elapsed time (frame-rate independent) rather than a fixed amount per tick.
     last_drag_tick: Option<std::time::Instant>,
@@ -578,6 +587,9 @@ impl App {
             last_click: None,
             click_count: 0,
             drag_scroll_dy: 0.0,
+            scrollbar_drag: None,
+            scrollbar_hover: false,
+            scrollbar_pending: false,
             last_drag_tick: None,
             pending_rebuild: false,
             frame_retry: FrameRetry::default(),
@@ -1281,6 +1293,43 @@ fn ac_row_at(rects: &[ScreenRect], pos: (f32, f32)) -> Option<usize> {
 /// around the body (outline panel, find bar, status bar); otherwise the I-beam (`Text`)
 /// over the editable document body. The modifier is checked first so the (snapshot-
 /// building) `link_at` lookup only runs during an actual Ctrl-hover.
+/// Scrollbar geometry for the live surface (None when the document fits the viewport).
+fn scrollbar_geometry(doc_engine: &DocEngine, state: &ActiveSurface) -> Option<scrollbar::Geometry> {
+    let doc = doc_engine.doc.as_ref()?;
+    let width = state.surface.config.width as f32;
+    let height = state.surface.config.height as f32;
+    let (content_top, editor_h) = chrome_metrics(state.scale, height, state.find_bar_h);
+    let doc_w = (width - outline_width(&doc_engine.editor, state.scale)).max(0.0);
+    scrollbar::geometry(doc, doc_w, content_top, editor_h, state.scale)
+}
+
+/// Move the scrollbar thumb so its top sits at `thumb_top` (device px): set the scroll
+/// offset, then lay out any height-estimated lines that came into view.
+fn scrollbar_scroll_to(
+    doc_engine: &mut DocEngine,
+    state: &ActiveSurface,
+    geo: &scrollbar::Geometry,
+    thumb_top: f32,
+) -> bool {
+    let (w, vh, scale) = state.viewport();
+    let remeasure = match doc_engine.doc.as_mut() {
+        Some(doc) => {
+            let target = scrollbar::scroll_for_thumb_top(doc, geo, vh, thumb_top);
+            if (target - doc.scroll_y).abs() < 0.5 {
+                return false;
+            }
+            doc.scroll_y = target;
+            doc.clamp_scroll(vh);
+            doc.needs_remeasure(vh)
+        }
+        None => return false,
+    };
+    if remeasure {
+        doc_engine.rebuild_preserving_scroll(w, scale, vh);
+    }
+    true
+}
+
 fn pointer_cursor(
     doc_engine: &mut DocEngine,
     state: &ActiveSurface,
@@ -1303,6 +1352,9 @@ fn pointer_cursor(
         .any(|(_, r)| rect_contains(r, mouse_pos))
         || ac_rows.iter().any(|r| rect_contains(r, mouse_pos))
     {
+        return CursorIcon::Default;
+    }
+    if scrollbar_geometry(doc_engine, state).is_some_and(|g| g.hit(mouse_pos)) {
         return CursorIcon::Default;
     }
     // The editable body is the editor content minus the right-docked outline panel; the
@@ -1974,6 +2026,19 @@ impl ApplicationHandler<WritEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x as f32, position.y as f32);
+                // Scrollbar thumb drag owns the pointer until release.
+                if self.scrollbar_drag.is_some() {
+                    // Coalesced: the thumb follows the pointer once per frame.
+                    self.scrollbar_pending = true;
+                    state.window.request_redraw();
+                    return;
+                }
+                let sb_hover = scrollbar_geometry(&self.doc_engine, state)
+                    .is_some_and(|g| g.hit(self.mouse_pos));
+                if sb_hover != self.scrollbar_hover {
+                    self.scrollbar_hover = sb_hover;
+                    state.window.request_redraw();
+                }
                 // Outline panel hover: highlight the row under the pointer (independent of
                 // the document/autocomplete hover machinery below).
                 let panel_left = state.surface.config.width as f32 - OUTLINE_WIDTH * state.scale;
@@ -2144,6 +2209,27 @@ impl ApplicationHandler<WritEvent> for App {
                             vh,
                         );
                     }
+                    return;
+                }
+
+                // Scrollbar click: on the thumb, grab it where it was pressed; on the track,
+                // jump so the thumb centers on the pointer, then keep dragging from there.
+                if let Some(geo) = scrollbar_geometry(&self.doc_engine, state)
+                    && geo.hit(self.mouse_pos)
+                {
+                    let y = self.mouse_pos.1;
+                    let grab = if geo.on_thumb(y) {
+                        y - geo.thumb_y0
+                    } else {
+                        let grab = geo.thumb_h() / 2.0;
+                        if scrollbar_scroll_to(&mut self.doc_engine, state, &geo, y - grab) {
+                            sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
+                        }
+                        grab
+                    };
+                    self.scrollbar_drag = Some(grab);
+                    self.hovered = None;
+                    state.window.request_redraw();
                     return;
                 }
 
@@ -2318,6 +2404,9 @@ impl ApplicationHandler<WritEvent> for App {
                 }
                 self.drag_scroll_dy = 0.0;
                 self.last_drag_tick = None;
+                if self.scrollbar_drag.take().is_some() {
+                    state.window.request_redraw();
+                }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 // Ctrl-W / Super-W closes the window (does not auto-save; use Ctrl-S).
@@ -2720,6 +2809,15 @@ impl ApplicationHandler<WritEvent> for App {
                     let (w, vh, scale) = state.viewport();
                     drag_extend_step(&mut self.doc_engine, self.mouse_pos, 0.0, w, scale, vh);
                 }
+
+                // Scrollbar drag is coalesced: the thumb follows the pointer once per frame.
+                if std::mem::take(&mut self.scrollbar_pending)
+                    && let Some(grab) = self.scrollbar_drag
+                    && let Some(geo) = scrollbar_geometry(&self.doc_engine, state)
+                    && scrollbar_scroll_to(&mut self.doc_engine, state, &geo, self.mouse_pos.1 - grab)
+                {
+                    sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
+                }
                 self.scene.reset();
 
                 // Keep the native title bar's text current (filename + dirty marker).
@@ -2760,6 +2858,22 @@ impl ApplicationHandler<WritEvent> for App {
                     self.find_btn_rects = btn_rects;
                     self.outline_row_rects = outline_rects;
                     self.fold_chevron_rects = fold_rects;
+
+                    if let Some(geo) = scrollbar::geometry(
+                        doc,
+                        (width - outline_width(&self.doc_engine.editor, state.scale)).max(0.0),
+                        content_top,
+                        editor_h,
+                        state.scale,
+                    ) {
+                        scrollbar::draw(
+                            &mut self.scene,
+                            &self.doc_engine.theme,
+                            &geo,
+                            self.scrollbar_hover || self.scrollbar_drag.is_some(),
+                            state.scale,
+                        );
+                    }
 
                     // Overlays on top of everything (unclipped): the autocomplete
                     // dropdown takes priority over the hover popover.

@@ -107,6 +107,8 @@ pub mod parser;
 pub mod paste;
 pub mod raster;
 pub mod render;
+#[cfg(feature = "app")]
+pub mod scrollbar;
 pub mod segment_map;
 #[cfg(feature = "app")]
 pub mod shell;
