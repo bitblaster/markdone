@@ -18,6 +18,8 @@ pub const LINE_HEIGHT: f32 = 1.5;
 pub const UI_LINE_HEIGHT: f32 = 1.3;
 /// Height of the bottom status bar.
 pub const STATUS_BAR_H: f32 = 30.0;
+/// Height of the document tab strip, docked just above the status bar.
+pub const TAB_BAR_H: f32 = 28.0;
 /// Width of the right-docked document-map / outline panel when open (0 when closed).
 /// The document region insets by this amount so it never draws under the panel.
 pub const OUTLINE_WIDTH: f32 = 240.0;

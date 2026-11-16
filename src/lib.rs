@@ -112,6 +112,8 @@ pub mod scrollbar;
 pub mod segment_map;
 #[cfg(feature = "app")]
 pub mod shell;
+#[cfg(feature = "app")]
+pub mod tabs;
 pub mod status_bar;
 pub mod table;
 pub mod text_engine;

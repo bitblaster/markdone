@@ -41,6 +41,7 @@ use crate::buffer::Buffer;
 use crate::chrome::{BarRect, FindButtonRects, StatusInfo, draw_find_bar, draw_status_bar};
 use crate::config::{self, Config, ResolvedConfig};
 use crate::consts::{
+    TAB_BAR_H,
     MAX_CONTENT_WIDTH,
     CARET_WIDTH, FIND_ROW_H, FONT_SIZE, LINE_HEIGHT, OUTLINE_WIDTH, PADDING, STATUS_BAR_H,
     WHEEL_LINE_STEP,
@@ -171,7 +172,7 @@ fn chrome_metrics(scale: f32, height_dev: f32, find_h: f32) -> (f32, f32) {
     // The title bar is the native window decoration now, so editor content starts at
     // the surface top; only the bottom strips are inset.
     let content_top = 0.0;
-    let editor_h = (height_dev - STATUS_BAR_H * scale - find_h).max(1.0);
+    let editor_h = (height_dev - (STATUS_BAR_H + TAB_BAR_H) * scale - find_h).max(1.0);
     (content_top, editor_h)
 }
 
@@ -371,11 +372,12 @@ pub(crate) enum WritEvent {
     /// A standalone image finished loading (local or remote). A load changes a line's
     /// height, so the loop rebuilds (not just redraws) to reflow around it.
     ImageLoaded,
-    /// The watched file changed on disk (forwarded from the file-watcher thread). The
-    /// loop kicks off a blocking read off-thread rather than touching disk here.
-    FileChanged,
-    /// A watched git dir moved HEAD; refresh the diff base without reloading the file.
-    GitBaseChanged,
+    /// The watched file of document `id` changed on disk (forwarded from its watcher
+    /// thread). The loop kicks off a blocking read off-thread rather than touching disk
+    /// here; for a background tab it only marks the tab stale (reloaded on activation).
+    FileChanged(u64),
+    /// A watched git dir of document `id` moved HEAD; refresh its diff base.
+    GitBaseChanged(u64),
     FileReloaded(ReloadTicket, ReloadData),
     GitBaseReloaded(u64, Option<String>),
 }
@@ -551,6 +553,95 @@ struct DocEngine {
     preedit: Option<Preedit>,
 }
 
+/// The per-document half of [`DocEngine`]: everything except the resources shared by
+/// all tabs (fonts/text engine, theme, font size). The active document's state lives in
+/// `App::doc_engine` (so every existing code path keeps working on "the" document);
+/// background tabs park theirs here and are swapped in on activation.
+struct DocState {
+    editor: Editor,
+    doc: Option<DocLayout>,
+    images: ImageCache,
+    preedit: Option<Preedit>,
+    line_cache: LineCache,
+    render_cache: RenderCache,
+    height_cache: HeightCache,
+    table_cache: TableCache,
+}
+
+impl DocState {
+    fn new(editor: Editor) -> Self {
+        Self {
+            editor,
+            doc: None,
+            images: ImageCache::new(),
+            preedit: None,
+            line_cache: LineCache::new(),
+            render_cache: RenderCache::new(),
+            height_cache: HeightCache::new(),
+            table_cache: TableCache::new(),
+        }
+    }
+
+    /// Exchange this state with the engine's active document.
+    fn swap_with(&mut self, engine: &mut DocEngine) {
+        std::mem::swap(&mut self.editor, &mut engine.editor);
+        std::mem::swap(&mut self.doc, &mut engine.doc);
+        std::mem::swap(&mut self.images, &mut engine.images);
+        std::mem::swap(&mut self.preedit, &mut engine.preedit);
+        std::mem::swap(&mut self.line_cache, &mut engine.line_cache);
+        std::mem::swap(&mut self.render_cache, &mut engine.render_cache);
+        std::mem::swap(&mut self.height_cache, &mut engine.height_cache);
+        std::mem::swap(&mut self.table_cache, &mut engine.table_cache);
+    }
+
+    /// Release what a background tab doesn't need: the layout and its caches (rebuilt
+    /// on activation from the saved scroll anchor) and all decoded image pixels (sizes
+    /// are kept, so the rebuilt layout has the same heights). The text, parse tree and
+    /// undo history stay.
+    fn park(&mut self) {
+        self.doc = None;
+        self.preedit = None;
+        self.line_cache = LineCache::new();
+        self.render_cache = RenderCache::new();
+        self.height_cache = HeightCache::new();
+        self.table_cache = TableCache::new();
+        self.images.trim(&[], 0);
+    }
+}
+
+/// One open document tab.
+struct Tab {
+    /// Stable id, carried by its file-watch events.
+    id: u64,
+    /// `None` for the active tab (its state is in `App::doc_engine`).
+    state: Option<DocState>,
+    /// Scroll anchor (line, offset) saved when the tab went to the background.
+    anchor: (usize, f32),
+    /// The file / git base changed on disk while in the background.
+    file_stale: bool,
+    base_stale: bool,
+}
+
+/// Forward an editor's file-watch notifications into the loop, tagged with its tab id,
+/// so the loop can park on `Wait` rather than polling. The thread ends when the watcher
+/// (and its sender) drop, making `recv()` return `Err`.
+fn forward_file_watch(editor: &mut Editor, id: u64, proxy: &EventLoopProxy<WritEvent>) {
+    if let Some(rx) = editor.take_file_watch_rx() {
+        let proxy = proxy.clone();
+        std::thread::spawn(move || {
+            while let Ok(kind) = rx.recv() {
+                let event = match kind {
+                    WatchKind::File => WritEvent::FileChanged(id),
+                    WatchKind::GitBase => WritEvent::GitBaseChanged(id),
+                };
+                if proxy.send_event(event).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
 struct App {
     context: RenderContext,
     // One renderer suffices; keyed to the surface's device.
@@ -558,6 +649,12 @@ struct App {
     state: Option<ActiveSurface>,
     scene: Scene,
     doc_engine: DocEngine,
+    /// Open documents in tab order; `tabs[active_tab]` is the one in `doc_engine`.
+    tabs: Vec<Tab>,
+    active_tab: usize,
+    /// Tab hit rects from the last paint, and the tab under the pointer.
+    tab_rects: Vec<ScreenRect>,
+    tab_hover: Option<usize>,
     modifiers: ModifiersState,
     mouse_pos: (f32, f32),
     selection_drag: Option<SelectionDrag>,
@@ -625,11 +722,31 @@ struct App {
 
 impl App {
     fn new(
-        mut editor: Editor,
+        editors: Vec<Editor>,
         config: ResolvedConfig,
         proxy: EventLoopProxy<WritEvent>,
         runtime: tokio::runtime::Handle,
     ) -> Self {
+        let mut editors = editors.into_iter();
+        let mut editor = editors.next().expect("at least one document");
+        let mut tabs = vec![Tab {
+            id: 0,
+            state: None,
+            anchor: (0, 0.0),
+            file_stale: false,
+            base_stale: false,
+        }];
+        for (i, mut background) in editors.enumerate() {
+            let id = i as u64 + 1;
+            forward_file_watch(&mut background, id, &proxy);
+            tabs.push(Tab {
+                id,
+                state: Some(DocState::new(background)),
+                anchor: (0, 0.0),
+                file_stale: false,
+                base_stale: false,
+            });
+        }
         let title = window_title(&editor);
         // Apply the configured font family, but only if it renders fixed-pitch — a
         // proportional (or unloadable) family would break writ's deterministic wrapping.
@@ -641,23 +758,7 @@ impl App {
                 text_engine.set_font_family(None);
             }
         }
-        // Forward file-watch notifications into the loop so it can park on `Wait`
-        // rather than polling on a timer. The thread ends when the watcher (and its
-        // sender) drop at app exit, making `recv()` return `Err`.
-        if let Some(rx) = editor.take_file_watch_rx() {
-            let proxy = proxy.clone();
-            std::thread::spawn(move || {
-                while let Ok(kind) = rx.recv() {
-                    let event = match kind {
-                        WatchKind::File => WritEvent::FileChanged,
-                        WatchKind::GitBase => WritEvent::GitBaseChanged,
-                    };
-                    if proxy.send_event(event).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
+        forward_file_watch(&mut editor, 0, &proxy);
         Self {
             context: RenderContext::new(),
             renderer: None,
@@ -676,6 +777,10 @@ impl App {
                 images: ImageCache::new(),
                 preedit: None,
             },
+            tabs,
+            active_tab: 0,
+            tab_rects: Vec::new(),
+            tab_hover: None,
             modifiers: ModifiersState::empty(),
             mouse_pos: (0.0, 0.0),
             selection_drag: None,
@@ -705,6 +810,79 @@ impl App {
             ac_slot: Arc::new(Mutex::new(None)),
             proxy,
             runtime,
+        }
+    }
+
+    /// Make tab `i` the active document: park the current one (layout and image pixels
+    /// released, scroll anchor saved), swap the target's state in and lay it out at its
+    /// saved anchor. Per-view pointer state is reset; a reload missed while in the
+    /// background is replayed.
+    fn switch_tab(&mut self, i: usize) {
+        if i == self.active_tab || i >= self.tabs.len() {
+            return;
+        }
+        let Some(mut incoming) = self.tabs[i].state.take() else {
+            return;
+        };
+        let old = self.active_tab;
+        let anchor = self
+            .doc_engine
+            .doc
+            .as_ref()
+            .map_or((0, 0.0), |d| d.scroll_anchor());
+        incoming.swap_with(&mut self.doc_engine);
+        incoming.park();
+        self.tabs[old].state = Some(incoming);
+        self.tabs[old].anchor = anchor;
+        self.active_tab = i;
+
+        self.hovered = None;
+        self.selection_drag = None;
+        self.scrollbar_drag = None;
+        self.scrollbar_pending = false;
+        self.wheel_pending_dy = 0.0;
+        self.drag_scroll_dy = 0.0;
+        self.outline_row_rects.clear();
+        self.outline_hover = None;
+        self.fold_chevron_rects.clear();
+        self.gutter_hover = None;
+        self.find_btn_rects = None;
+
+        if let Some(state) = self.state.as_mut() {
+            state.find_bar_h = find_bar_height(&self.doc_engine.editor, state.scale);
+            let (w, vh, scale) = state.viewport();
+            let (line, off) = self.tabs[i].anchor;
+            let mut doc = self.doc_engine.rebuild(w, scale, line, vh);
+            doc.scroll_y = doc.anchor_scroll_y(line, off);
+            doc.clamp_scroll(vh);
+            self.doc_engine.doc = Some(doc);
+            // Re-detect over the restored viewport and relayout in place.
+            self.doc_engine.rebuild_preserving_scroll(w, scale, vh);
+            state.window.request_redraw();
+        }
+        self.spawn_validations();
+
+        let id = self.tabs[i].id;
+        if std::mem::take(&mut self.tabs[i].file_stale) {
+            let _ = self.proxy.send_event(WritEvent::FileChanged(id));
+        }
+        if std::mem::take(&mut self.tabs[i].base_stale) {
+            let _ = self.proxy.send_event(WritEvent::GitBaseChanged(id));
+        }
+    }
+
+    /// Close the active tab (there must be another one): activate a neighbour, then drop
+    /// the old document (its file watcher stops with it).
+    fn close_active_tab(&mut self) {
+        let old = self.active_tab;
+        let next = if old + 1 < self.tabs.len() { old + 1 } else { old - 1 };
+        self.switch_tab(next);
+        self.tabs.remove(old);
+        if self.active_tab > old {
+            self.active_tab -= 1;
+        }
+        if let Some(state) = self.state.as_ref() {
+            state.window.request_redraw();
         }
     }
 
@@ -1728,7 +1906,9 @@ fn paint_document(
     // Chrome (bottom, above the OS-native title bar): the find bar sits in the gap
     // between the document and the status bar, so the status bar starts below it.
     let bar_top = (content_top + editor_h) as f64;
-    let status_top = bar_top + find_h as f64;
+    // The tab strip (painted by the live redraw) sits between the find bar and the
+    // status bar.
+    let status_top = bar_top + find_h as f64 + (TAB_BAR_H * scale) as f64;
     let btn_rects = if find_h > 0.0
         && let Some(find) = editor.find_state()
     {
@@ -1859,7 +2039,13 @@ impl ApplicationHandler<WritEvent> for App {
     /// A tokio task finished (validation/suggestion). Results are already in the
     /// shared caches; rebuild the doc (ref colors may have changed) and redraw.
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: WritEvent) {
-        if matches!(event, WritEvent::GitBaseChanged) {
+        if let WritEvent::GitBaseChanged(id) = event {
+            if id != self.tabs[self.active_tab].id {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+                    tab.base_stale = true;
+                }
+                return;
+            }
             let Some(path) = self.doc_engine.editor.file_path().map(|p| p.to_path_buf()) else {
                 return;
             };
@@ -1885,7 +2071,13 @@ impl ApplicationHandler<WritEvent> for App {
             }
             return;
         }
-        if matches!(event, WritEvent::FileChanged) {
+        if let WritEvent::FileChanged(id) = event {
+            if id != self.tabs[self.active_tab].id {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+                    tab.file_stale = true;
+                }
+                return;
+            }
             let Some(path) = self.doc_engine.editor.file_path().map(|p| p.to_path_buf()) else {
                 return;
             };
@@ -2200,6 +2392,11 @@ impl ApplicationHandler<WritEvent> for App {
                     state.window.request_redraw();
                     return;
                 }
+                let tab_hover = self.tab_rects.iter().position(|r| rect_contains(r, self.mouse_pos));
+                if tab_hover != self.tab_hover {
+                    self.tab_hover = tab_hover;
+                    state.window.request_redraw();
+                }
                 let sb_hover = scrollbar_geometry(&self.doc_engine, state)
                     .is_some_and(|g| g.hit(self.mouse_pos));
                 if sb_hover != self.scrollbar_hover {
@@ -2281,6 +2478,11 @@ impl ApplicationHandler<WritEvent> for App {
                 self.selection_drag = None;
                 self.drag_scroll_dy = 0.0;
                 self.last_drag_tick = None;
+                // Tab strip click: activate that document.
+                if let Some(i) = self.tab_rects.iter().position(|r| rect_contains(r, self.mouse_pos)) {
+                    self.switch_tab(i);
+                    return;
+                }
                 let (w, vh, _) = state.viewport();
 
                 // Find-bar focus routing. The bar is docked at the bottom, so the document
@@ -2576,13 +2778,32 @@ impl ApplicationHandler<WritEvent> for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                // Ctrl-W / Super-W closes the window (does not auto-save; use Ctrl-S).
+                // Ctrl-W / Super-W closes the tab, and the window with the last one (does
+                // not auto-save; use Ctrl-S).
                 let cmd = self.modifiers.control_key() || self.modifiers.super_key();
                 if cmd
                     && matches!(&event.logical_key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("w"))
                 {
-                    event_loop.exit();
+                    if self.tabs.len() <= 1 {
+                        event_loop.exit();
+                    } else {
+                        self.close_active_tab();
+                    }
                     return;
+                }
+                // Tab switching: Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+PageDown / Ctrl+PageUp.
+                if self.modifiers.control_key() && self.tabs.len() > 1 {
+                    let n = self.tabs.len();
+                    let step = match &event.logical_key {
+                        Key::Named(NamedKey::Tab) if self.modifiers.shift_key() => Some(n - 1),
+                        Key::Named(NamedKey::Tab) | Key::Named(NamedKey::PageDown) => Some(1),
+                        Key::Named(NamedKey::PageUp) => Some(n - 1),
+                        _ => None,
+                    };
+                    if let Some(step) = step {
+                        self.switch_tab((self.active_tab + step) % n);
+                        return;
+                    }
                 }
                 let (w, vh, _) = state.viewport();
 
@@ -3092,6 +3313,37 @@ impl ApplicationHandler<WritEvent> for App {
                         );
                     }
 
+                    let tab_top = (content_top + editor_h + state.find_bar_h) as f64;
+                    let labels: Vec<crate::tabs::TabLabel> = self
+                        .tabs
+                        .iter()
+                        .map(|t| {
+                            let editor = t.state.as_ref().map_or(&self.doc_engine.editor, |s| &s.editor);
+                            crate::tabs::TabLabel {
+                                name: editor
+                                    .file_path()
+                                    .and_then(|p| p.file_name())
+                                    .map_or_else(|| "untitled".to_string(), |n| n.to_string_lossy().into_owned()),
+                                dirty: editor.is_dirty(),
+                            }
+                        })
+                        .collect();
+                    self.tab_rects = crate::tabs::draw_tab_bar(
+                        &mut self.doc_engine.text_engine,
+                        &mut self.scene,
+                        &self.doc_engine.theme,
+                        &BarRect {
+                            x0: 0.0,
+                            y0: tab_top,
+                            x1: width as f64,
+                            y1: tab_top + (TAB_BAR_H * state.scale) as f64,
+                        },
+                        &labels,
+                        self.active_tab,
+                        self.tab_hover,
+                        state.scale,
+                    );
+
                     // Overlays on top of everything (unclipped): the autocomplete
                     // dropdown takes priority over the hover popover.
                     let ac_open = self
@@ -3267,10 +3519,10 @@ pub fn run() -> Result<()> {
         return snapshot(&path, w, h, scroll);
     }
 
-    let (editor, app_config) = load_editor_from_cli();
+    let (editors, app_config) = load_editor_from_cli();
     let event_loop = EventLoop::<WritEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
-    let mut app = App::new(editor, app_config, proxy, runtime.handle().clone());
+    let mut app = App::new(editors, app_config, proxy, runtime.handle().clone());
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -3279,25 +3531,32 @@ pub fn run() -> Result<()> {
 /// watching the file for external edits (the pivot use case — an agent edits the
 /// file, writ shows the live diff). With no args, falls back to the sample doc. Also
 /// loads the user config (theme + font) from `--config` or the default location.
-fn load_editor_from_cli() -> (Editor, ResolvedConfig) {
+fn load_editor_from_cli() -> (Vec<Editor>, ResolvedConfig) {
     use clap::Parser;
 
     // No args → the demo showcase with default config.
     if std::env::args().len() <= 1 {
-        return (demo_editor(), ResolvedConfig::default());
+        return (vec![demo_editor()], ResolvedConfig::default());
     }
 
     let config = Config::parse();
     let app_config = config::load(config.config.as_deref());
     // `--demo`: showcase doc with a synthetic HEAD diff (no file needed).
     if config.demo {
-        return (demo_editor(), app_config);
+        return (vec![demo_editor()], app_config);
     }
-    let Some(path) = config.file.clone() else {
-        return (demo_editor(), app_config);
-    };
+    let paths: Vec<std::path::PathBuf> = config.file.iter().chain(&config.files).cloned().collect();
+    if paths.is_empty() {
+        return (vec![demo_editor()], app_config);
+    }
+    let editors = paths.iter().map(|p| open_editor(p, &config)).collect();
+    (editors, app_config)
+}
 
-    let mut editor = Editor::open(&path);
+/// Open one document as configured on the CLI: autosave, GitHub context (explicit
+/// --github-repo, else auto-detected from the file's repo), ref detection, file watch.
+fn open_editor(path: &std::path::Path, config: &Config) -> Editor {
+    let mut editor = Editor::open(path);
     editor.set_autosave(config.autosave);
 
     // GitHub context for ref detection: explicit --github-repo, else auto-detect.
@@ -3305,7 +3564,7 @@ fn load_editor_from_cli() -> (Editor, ResolvedConfig) {
         .github_repo
         .as_deref()
         .and_then(parse_github_repo_string)
-        .or_else(|| detect_github_context(&path));
+        .or_else(|| detect_github_context(path));
     if let Some(ctx) = context {
         editor.set_github_context(ctx);
     }
@@ -3319,7 +3578,7 @@ fn load_editor_from_cli() -> (Editor, ResolvedConfig) {
     if let Err(e) = editor.watch_file() {
         eprintln!("[writ] file watch failed: {e}");
     }
-    (editor, app_config)
+    editor
 }
 
 /// Synchronously validate every detected GitHub ref (blocking on the current tokio

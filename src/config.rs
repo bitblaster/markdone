@@ -22,8 +22,13 @@ pub const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 pub struct Config {
-    #[arg(short, long, required_unless_present = "demo")]
+    /// Document to open (the first tab).
+    #[arg(short, long, required_unless_present_any = ["demo", "files"])]
     pub file: Option<PathBuf>,
+
+    /// More documents to open, one tab each (after `--file`, if given).
+    #[arg(value_name = "FILE")]
+    pub files: Vec<PathBuf>,
 
     #[arg(long)]
     pub demo: bool,
