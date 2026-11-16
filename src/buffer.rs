@@ -21,6 +21,12 @@ use crate::math::MathBlock;
 #[cfg(feature = "mermaid")]
 use crate::mermaid::MermaidBlock;
 use crate::parser::{MarkdownParser, MarkdownTree};
+
+/// `WRIT_PROFILE=1`: per-edit timing of the parse and cache passes on stderr.
+fn edit_profile_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WRIT_PROFILE").is_some_and(|v| v != "0"))
+}
 use crate::table::{RowKind, TableInfo, row_kind_at_line};
 
 /// Compute the byte range for a line (excludes trailing newline).
@@ -468,18 +474,27 @@ impl BufferContent {
     }
 
     fn update_caches(&mut self) {
+        let t0 = std::time::Instant::now();
         self.parsed = Rc::new(
             self.tree
                 .as_ref()
                 .map(|t| collect_node_infos(&t.block_tree().root_node(), &self.text))
                 .unwrap_or_default(),
         );
+        let t1 = std::time::Instant::now();
 
         self.inline_styles = Rc::new(if let Some(ref tree) = self.tree {
             extract_all_inline_styles(tree, &self.text)
         } else {
             Vec::new()
         });
+        if edit_profile_enabled() {
+            eprintln!(
+                "[writ-edit] collect_node_infos {:6.2} ms | inline_styles {:6.2} ms",
+                (t1 - t0).as_secs_f64() * 1e3,
+                t1.elapsed().as_secs_f64() * 1e3
+            );
+        }
     }
 
     fn apply_edit(&mut self, offset: usize, to_delete: &str, to_insert: &str) {
@@ -519,10 +534,14 @@ impl BufferContent {
             self.text.insert(char_offset, to_insert);
         }
 
+        let t_parse = std::time::Instant::now();
         if let Some(ref mut tree) = self.tree {
             tree.edit(&edit);
         }
         self.tree = self.parser.parse_rope(&self.text, self.tree.as_ref());
+        if edit_profile_enabled() {
+            eprintln!("[writ-edit] parse {:6.2} ms", t_parse.elapsed().as_secs_f64() * 1e3);
+        }
 
         // Renumbering only matters when the edit lands inside an ordered list, which
         // is the uncommon case — skip the tree walk + reparse otherwise.

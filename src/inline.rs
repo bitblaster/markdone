@@ -723,9 +723,32 @@ pub struct StyledRegion {
 pub fn extract_all_inline_styles(tree: &MarkdownTree, rope: &Rope) -> Vec<StyledRegion> {
     let mut styles = Vec::new();
     // The parser already stores every inline subtree; iterate them directly instead of
-    // re-walking the whole block tree to rediscover the nodes they hang off.
-    for inline_tree in tree.inline_trees() {
-        collect_from_inline_tree(inline_tree.root_node(), rope, &mut styles);
+    // re-walking the whole block tree to rediscover the nodes they hang off. Each tree's
+    // regions are cached on the tree and survive its reuse across edits (same text, only
+    // shifted), so an edit re-extracts just the paragraph/cell it touched.
+    for (i, inline_tree) in tree.inline_trees().iter().enumerate() {
+        let Some((slot, start)) = tree.inline_styles_cache(i) else {
+            collect_from_inline_tree(inline_tree.root_node(), rope, &mut styles);
+            continue;
+        };
+        let (cached_start, regions) = slot.get_or_init(|| {
+            let mut own = Vec::new();
+            collect_from_inline_tree(inline_tree.root_node(), rope, &mut own);
+            (start, std::sync::Arc::new(own))
+        });
+        let delta = start as isize - *cached_start as isize;
+        if delta == 0 {
+            styles.extend(regions.iter().cloned());
+        } else {
+            let shift = |r: &Range<usize>| {
+                (r.start as isize + delta) as usize..(r.end as isize + delta) as usize
+            };
+            styles.extend(regions.iter().map(|r| StyledRegion {
+                full_range: shift(&r.full_range),
+                content_range: shift(&r.content_range),
+                ..r.clone()
+            }));
+        }
     }
     styles.sort_by_key(|s| s.full_range.start);
     styles

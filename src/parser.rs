@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+
+use crate::inline::StyledRegion;
 
 use tree_sitter::{InputEdit, Language, Node, Parser, Point, Range, Tree};
 use tree_sitter_md::{INLINE_LANGUAGE, LANGUAGE};
@@ -14,6 +17,11 @@ pub struct MarkdownParser {
 /// which an unchanged inline tree can be reused on the next parse.
 type InlineKey = Vec<(usize, usize)>;
 
+/// Styled regions extracted from one inline tree, with the tree's span start at
+/// extraction time. A reused tree has identical text, so its regions are these shifted
+/// by (current span start − `.0`): see [`MarkdownTree::inline_styles_cache`].
+pub type CachedInlineStyles = (usize, Arc<Vec<StyledRegion>>);
+
 #[derive(Debug, Clone)]
 pub struct MarkdownTree {
     block_tree: Tree,
@@ -23,6 +31,9 @@ pub struct MarkdownTree {
     /// kept in current-text coordinates by `edit`, or `None` once an edit touched them
     /// (the tree's content is then stale and it must be re-parsed, not reused).
     inline_keys: Vec<Option<InlineKey>>,
+    /// Parallel to `inline_trees`: lazily extracted styles, carried over with the tree
+    /// when it is reused so unchanged paragraphs/cells are not re-walked on every edit.
+    inline_styles: Vec<OnceLock<CachedInlineStyles>>,
 }
 
 impl MarkdownTree {
@@ -66,6 +77,13 @@ impl MarkdownTree {
     pub fn inline_trees(&self) -> &[Tree] {
         &self.inline_trees
     }
+
+    /// For inline tree `i`: its style cache slot and current span start (the first byte
+    /// of its included ranges), or `None` when the key is unknown (stale since an edit).
+    pub fn inline_styles_cache(&self, i: usize) -> Option<(&OnceLock<CachedInlineStyles>, usize)> {
+        let start = self.inline_keys.get(i)?.as_ref()?.first()?.0;
+        Some((self.inline_styles.get(i)?, start))
+    }
 }
 
 impl Default for MarkdownParser {
@@ -103,27 +121,22 @@ impl MarkdownParser {
             old_tree.map(|tree| &tree.block_tree),
             None, // No progress callback
         )?;
-        let (mut inline_trees, mut inline_indices, mut inline_keys) = if let Some(old_tree) = old_tree {
-            let len = old_tree.inline_trees.len();
-            (
-                Vec::with_capacity(len),
-                HashMap::with_capacity(len),
-                Vec::with_capacity(len),
-            )
-        } else {
-            (Vec::new(), HashMap::new(), Vec::new())
-        };
+        let len = old_tree.map_or(0, |t| t.inline_trees.len());
+        let mut inline_trees = Vec::with_capacity(len);
+        let mut inline_indices = HashMap::with_capacity(len);
+        let mut inline_keys = Vec::with_capacity(len);
+        let mut inline_styles = Vec::with_capacity(len);
         // Old inline trees untouched by the edits since the last parse, by their included
         // ranges. A new leaf with the exact same ranges has identical inline input, so its
         // tree is reused (`Tree::clone` is a cheap ref-counted copy) instead of re-parsed.
         // Without this every keystroke re-ran the inline grammar over every paragraph and
         // table cell of the document.
-        let reusable: HashMap<&[(usize, usize)], &Tree> = old_tree
+        let reusable: HashMap<&[(usize, usize)], usize> = old_tree
             .map(|old| {
                 old.inline_keys
                     .iter()
-                    .zip(&old.inline_trees)
-                    .filter_map(|(k, t)| k.as_deref().map(|k| (k, t)))
+                    .enumerate()
+                    .filter_map(|(i, k)| k.as_deref().map(|k| (k, i)))
                     .collect()
             })
             .unwrap_or_default();
@@ -179,18 +192,20 @@ impl MarkdownParser {
             ranges.push(range);
             key.clear();
             key.extend(ranges.iter().map(|r| (r.start_byte, r.end_byte)));
-            let inline_tree = match reusable.get(key.as_slice()) {
-                Some(&tree) => tree.clone(),
-                None => {
+            let (inline_tree, styles) = match (reusable.get(key.as_slice()), old_tree) {
+                (Some(&j), Some(old)) => (old.inline_trees[j].clone(), old.inline_styles[j].clone()),
+                _ => {
                     parser.set_included_ranges(&ranges).ok()?;
-                    parser.parse_with_options(
+                    let tree = parser.parse_with_options(
                         callback,
                         None,
                         None, // No progress callback
-                    )?
+                    )?;
+                    (tree, OnceLock::new())
                 }
             };
             inline_trees.push(inline_tree);
+            inline_styles.push(styles);
             inline_keys.push(Some(key.clone()));
             inline_indices.insert(node.id(), i);
             i += 1;
@@ -199,11 +214,13 @@ impl MarkdownParser {
         inline_trees.shrink_to_fit();
         inline_indices.shrink_to_fit();
         inline_keys.shrink_to_fit();
+        inline_styles.shrink_to_fit();
         Some(MarkdownTree {
             block_tree,
             inline_trees,
             inline_indices,
             inline_keys,
+            inline_styles,
         })
     }
 
@@ -319,6 +336,13 @@ mod tests {
                 dump(&tree),
                 dump(&fresh),
                 "step {step}: edit {start}..{old_end} -> {insert:?}"
+            );
+            // Cached (shifted) inline styles must equal a from-scratch extraction.
+            let rope = ropey::Rope::from_str(&text);
+            assert_eq!(
+                crate::inline::extract_all_inline_styles(&tree, &rope),
+                crate::inline::extract_all_inline_styles(&fresh, &rope),
+                "styles, step {step}: edit {start}..{old_end} -> {insert:?}"
             );
         }
     }

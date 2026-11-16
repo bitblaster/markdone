@@ -807,6 +807,8 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
 
     loop {
         let node = cursor.node();
+        // `Node::kind` is a C-string lookup + strlen + UTF-8 check per call; read it once.
+        let kind = node.kind();
 
         while let Some(&(end_byte, _)) = checked_task_stack.last() {
             if node.start_byte() >= end_byte {
@@ -822,7 +824,7 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
             code_block_end = None;
         }
 
-        if node.kind() == "list_item" {
+        if kind == "list_item" {
             let is_checked = list_item_is_checked_task(&node);
             checked_task_stack.push((node.end_byte(), is_checked));
 
@@ -856,7 +858,7 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
             });
         }
 
-        if node.kind() == "fenced_code_block" {
+        if kind == "fenced_code_block" {
             code_block_end = Some(node.end_byte());
             fence_first_delim_seen = false;
 
@@ -902,7 +904,7 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
             });
         }
 
-        if node.kind() == "pipe_table"
+        if kind == "pipe_table"
             && let Some(table) = extract_table(&node, rope)
         {
             tables.push(table);
@@ -914,7 +916,7 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
         // from `node.start_byte()` (not the line start) strips exactly one `>` and matches
         // `> > [!type]`. A plain outer quote wrapping an inner callout parses as `None` on
         // the outer (its own first line isn't `[!type]`) and the callout on the inner.
-        if node.kind() == "block_quote" {
+        if kind == "block_quote" {
             let header_line = rope.char_to_line(rope.byte_to_char(node.start_byte()));
             let line_start = rope.char_to_byte(rope.line_to_char(header_line));
             let line_end = if header_line + 1 < rope.len_lines() {
@@ -950,7 +952,7 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
         // ATX heading markers only appear at block level; tree-sitter never emits them
         // inside a fenced code block (its body is opaque `code_fence_content`), so
         // headings inside fences are naturally excluded.
-        if let Some(level) = atx_marker_level(node.kind()) {
+        if let Some(level) = atx_marker_level(kind) {
             let marker_start = node.start_byte();
             let char_start = rope.byte_to_char(marker_start);
             let line = rope.char_to_line(char_start);
@@ -983,7 +985,7 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
         let in_code_block = code_block_end.is_some();
         let parent_kind = kind_stack.last().copied();
 
-        let is_first_fence_delimiter = if node.kind() == "fenced_code_block_delimiter" {
+        let is_first_fence_delimiter = if kind == "fenced_code_block_delimiter" {
             if parent_kind == Some("fenced_code_block") {
                 let first = !fence_first_delim_seen;
                 fence_first_delim_seen = true;
@@ -998,7 +1000,7 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
         nodes.push(NodeInfo {
             start_byte: node.start_byte(),
             end_byte: node.end_byte(),
-            kind: node.kind(),
+            kind,
             parent_kind,
             is_first_fence_delimiter,
             in_checked_task,
@@ -1006,7 +1008,7 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
         });
 
         if cursor.goto_first_child() {
-            kind_stack.push(node.kind());
+            kind_stack.push(kind);
             continue;
         }
         if cursor.goto_next_sibling() {
