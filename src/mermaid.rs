@@ -58,10 +58,10 @@ pub fn spawn_mermaid_renders(
     notify: impl Fn() + Send + Clone + 'static,
 ) {
     for (key, source) in sources {
-        if cache.contains(key) {
-            continue; // already loading/loaded/failed
+        // Skips renders already in flight/loaded/failed; redoes evicted ones.
+        if !cache.begin_render(key) {
+            continue;
         }
-        cache.mark_loading(key);
         let cache = cache.clone();
         let notify = notify.clone();
         let key = key.clone();

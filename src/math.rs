@@ -124,10 +124,10 @@ pub fn spawn_math_renders(
     notify: impl Fn() + Send + Clone + 'static,
 ) {
     for (key, job) in jobs {
-        if cache.contains(key) {
+        // Skips renders already in flight/loaded/failed; redoes evicted ones.
+        if !cache.begin_render(key) {
             continue;
         }
-        cache.mark_loading(key);
         let cache = cache.clone();
         let notify = notify.clone();
         let key = key.clone();

@@ -100,6 +100,9 @@ struct Inner {
     /// Last `trim` tick each evictable URL was wanted near the viewport (LRU order).
     last_used: HashMap<String, u64>,
     tick: u64,
+    /// The owning document is in a background tab: everything is evicted, and loads or
+    /// renders that land meanwhile are stored evicted (size only) instead of pinned.
+    parked: bool,
 }
 
 /// Thread-safe cache of image load states, shared across clones (like the GitHub
@@ -126,7 +129,52 @@ impl ImageCache {
     fn insert(&self, url: &str, state: ImageState) {
         let mut inner = self.inner.lock().unwrap();
         inner.in_flight.remove(url);
+        let state = match state {
+            ImageState::Loaded(img) if inner.parked => ImageState::Evicted {
+                display_w: img.display_w,
+                display_h: img.display_h,
+            },
+            other => other,
+        };
         inner.states.insert(url.to_string(), state);
+    }
+
+    /// Claim a render (mermaid/math) for an off-thread job: like
+    /// [`begin_evictable_load`](Self::begin_evictable_load), but the result is not
+    /// LRU-evictable while the document is active (re-rendering is the costly part); it
+    /// is only dropped when the document is parked, and re-rendered from here after.
+    pub fn begin_render(&self, key: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.in_flight.contains(key) {
+            return false;
+        }
+        match inner.states.get(key) {
+            None => {
+                inner.states.insert(key.to_string(), ImageState::Loading);
+            }
+            Some(ImageState::Evicted { .. }) => {}
+            Some(_) => return false,
+        }
+        inner.in_flight.insert(key.to_string());
+        true
+    }
+
+    /// The document went to a background tab: drop every decoded image and render
+    /// (sizes kept), and keep anything still in flight from pinning pixels on arrival.
+    pub fn park(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.parked = true;
+        for state in inner.states.values_mut() {
+            if let ImageState::Loaded(img) = state {
+                let (display_w, display_h) = (img.display_w, img.display_h);
+                *state = ImageState::Evicted { display_w, display_h };
+            }
+        }
+    }
+
+    /// The document is active again: loads and renders are kept normally.
+    pub fn unpark(&self) {
+        self.inner.lock().unwrap().parked = false;
     }
 
     /// Claim an evictable image (file/remote) for loading: returns `false` when it is
@@ -147,6 +195,24 @@ impl ImageCache {
         inner.in_flight.insert(url.to_string());
         inner.evictable.insert(url.to_string());
         true
+    }
+
+    /// Decoded-pixel bytes held, split into (evictable file/remote images, renders such
+    /// as mermaid/math) — for profiling.
+    pub fn memory_stats(&self) -> (usize, usize) {
+        let inner = self.inner.lock().unwrap();
+        let mut out = (0, 0);
+        for (url, state) in &inner.states {
+            if let ImageState::Loaded(img) = state {
+                let bytes = img.width as usize * img.height as usize * 4;
+                if inner.evictable.contains(url) {
+                    out.0 += bytes;
+                } else {
+                    out.1 += bytes;
+                }
+            }
+        }
+        out
     }
 
     /// Bound the decoded-pixel memory of evictable images to `budget_bytes`. URLs in
@@ -396,6 +462,29 @@ mod tests {
         assert!(cache.begin_evictable_load(url));
         assert!(!cache.begin_evictable_load(url), "second claim while in flight");
         assert!(matches!(cache.get(url), Some(ImageState::Evicted { .. })));
+    }
+
+    #[test]
+    fn park_evicts_everything_and_late_arrivals() {
+        let cache = ImageCache::new();
+        assert!(cache.begin_evictable_load("img"));
+        cache.set_loaded("img", decode(&tiny_png(4, 2)).unwrap());
+        assert!(cache.begin_render("mermaid:1"));
+        cache.set_loaded("mermaid:1", decode(&tiny_png(8, 8)).unwrap());
+        assert!(cache.begin_render("mermaid:2")); // still rendering when parked
+        cache.park();
+        for key in ["img", "mermaid:1"] {
+            assert!(matches!(cache.get(key), Some(ImageState::Evicted { .. })), "{key}");
+        }
+        cache.set_loaded("mermaid:2", decode(&tiny_png(8, 8)).unwrap());
+        assert!(matches!(cache.get("mermaid:2"), Some(ImageState::Evicted { .. })));
+        assert_eq!(cache.memory_stats(), (0, 0));
+        // Active again: evicted renders can be re-rendered and are kept.
+        cache.unpark();
+        assert!(cache.begin_render("mermaid:1"));
+        cache.set_loaded("mermaid:1", decode(&tiny_png(8, 8)).unwrap());
+        assert!(matches!(cache.get("mermaid:1"), Some(ImageState::Loaded(_))));
+        assert!(!cache.begin_render("mermaid:1"), "loaded renders are not redone");
     }
 
     #[test]

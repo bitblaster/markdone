@@ -605,7 +605,7 @@ impl DocState {
         self.render_cache = RenderCache::new();
         self.height_cache = HeightCache::new();
         self.table_cache = TableCache::new();
-        self.images.trim(&[], 0);
+        self.images.park();
     }
 }
 
@@ -680,6 +680,13 @@ struct App {
     wheel_pending_dy: f32,
     /// `WRIT_AUTOSCROLL` benchmark run finished (reached the bottom).
     autoscroll_done: bool,
+    /// Tab switch requested from inside a redraw (where `state` is borrowed), applied
+    /// in `about_to_wait`. Used by the `WRIT_AUTOTABS` benchmark.
+    pending_tab_switch: Option<usize>,
+    /// `WRIT_AUTOTABS`: the final switch back to the first tab has been queued.
+    autotabs_returning: bool,
+    /// `WRIT_AUTOTABS=<rounds>`: the current round (1-based).
+    autotabs_round: u32,
     /// Timestamp of the last auto-scroll tick, so scrolling integrates against real
     /// elapsed time (frame-rate independent) rather than a fixed amount per tick.
     last_drag_tick: Option<std::time::Instant>,
@@ -793,6 +800,9 @@ impl App {
             scrollbar_pending: false,
             wheel_pending_dy: 0.0,
             autoscroll_done: false,
+            pending_tab_switch: None,
+            autotabs_returning: false,
+            autotabs_round: 1,
             last_drag_tick: None,
             pending_rebuild: false,
             frame_retry: FrameRetry::default(),
@@ -824,6 +834,9 @@ impl App {
         let Some(mut incoming) = self.tabs[i].state.take() else {
             return;
         };
+        if profile::enabled() {
+            eprintln!("[writ-mem] switch tab {} -> {i} | {}", self.active_tab, allocator_stats());
+        }
         let old = self.active_tab;
         let anchor = self
             .doc_engine
@@ -832,6 +845,7 @@ impl App {
             .map_or((0, 0.0), |d| d.scroll_anchor());
         incoming.swap_with(&mut self.doc_engine);
         incoming.park();
+        self.doc_engine.images.unpark();
         self.tabs[old].state = Some(incoming);
         self.tabs[old].anchor = anchor;
         self.active_tab = i;
@@ -934,6 +948,46 @@ fn configure_allocator() {
             mallopt(M_TRIM_THRESHOLD, 1024 * 1024);
         }
     }
+}
+
+/// Bytes the allocator currently has handed out (arena + mmapped chunks).
+fn malloc_bytes_in_use() -> usize {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        #[repr(C)]
+        struct Mallinfo2 {
+            arena: usize,
+            ordblks: usize,
+            smblks: usize,
+            hblks: usize,
+            hblkhd: usize,
+            usmblks: usize,
+            fsmblks: usize,
+            uordblks: usize,
+            fordblks: usize,
+            keepcost: usize,
+        }
+        unsafe extern "C" {
+            fn mallinfo2() -> Mallinfo2;
+        }
+        // SAFETY: mallinfo2 only reads allocator bookkeeping.
+        let m = unsafe { mallinfo2() };
+        m.uordblks + m.hblkhd
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    0
+}
+
+/// This process's PSS from /proc/self/smaps_rollup (profiling only).
+fn self_pss() -> String {
+    std::fs::read_to_string("/proc/self/smaps_rollup")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Pss:"))
+                .and_then(|l| l.split_whitespace().nth(1).map(str::to_string))
+        })
+        .map_or_else(|| "?".to_string(), |kb| format!("{:.1} MB", kb.parse::<f64>().unwrap_or(0.0) / 1024.0))
 }
 
 /// glibc allocator totals (all arenas) for profiling: bytes in use vs. free-but-held.
@@ -2125,6 +2179,9 @@ impl ApplicationHandler<WritEvent> for App {
                 apply_fetched(&mut self.doc_engine.editor, fetched);
             }
         }
+        if profile::enabled() && matches!(event, WritEvent::ImageLoaded) {
+            eprintln!("[writ-mem] image/render loaded (tab {}) | {}", self.active_tab, allocator_stats());
+        }
         // Defer the relayout to the next redraw so a burst of completions (many refs /
         // images finishing in the same frame) collapses into a single rebuild.
         if let Some(state) = self.state.as_ref() {
@@ -3212,10 +3269,22 @@ impl ApplicationHandler<WritEvent> for App {
                         self.autoscroll_done = true;
                         let (held, _) = self.doc_engine.images.trim(doc.image_urls(), usize::MAX);
                         eprintln!(
-                            "[writ-autoscroll] reached bottom | image pixels held {:.1} MB | {}",
+                            "[writ-autoscroll] tab {} reached bottom | PSS {} | image pixels held {:.1} MB | {}",
+                            self.active_tab,
+                            self_pss(),
                             held as f64 / 1048576.0,
                             allocator_stats()
                         );
+                        // WRIT_AUTOTABS: scroll every tab in turn, then return to the first.
+                        if std::env::var_os("WRIT_AUTOTABS").is_some() {
+                            if self.active_tab + 1 < self.tabs.len() {
+                                self.pending_tab_switch = Some(self.active_tab + 1);
+                                self.autoscroll_done = false;
+                            } else if !self.autotabs_returning {
+                                self.autotabs_returning = true;
+                                self.pending_tab_switch = Some(0);
+                            }
+                        }
                     } else {
                         self.wheel_pending_dy += step;
                         state.window.request_redraw();
@@ -3454,6 +3523,87 @@ impl ApplicationHandler<WritEvent> for App {
     /// need to poll except to retry a skipped frame or auto-scroll a selection while
     /// the pointer is held still in an edge hot zone.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // WRIT_DROPTEST: attribution baseline — once the first frame is up, report memory
+        // with all documents loaded, then drop the parked ones and report again.
+        if std::env::var_os("WRIT_DROPTEST").is_some()
+            && !self.autotabs_returning
+            && self.doc_engine.doc.is_some()
+            && self.tabs.len() > 1
+        {
+            self.autotabs_returning = true;
+            eprintln!("[writ-droptest] all docs loaded | PSS {} | {}", self_pss(), allocator_stats());
+            for i in (1..self.tabs.len()).rev() {
+                let before = malloc_bytes_in_use();
+                drop(self.tabs[i].state.take());
+                eprintln!(
+                    "[writ-droptest] dropped parked tab {i}: freed {:.1} MB",
+                    (before as f64 - malloc_bytes_in_use() as f64) / 1048576.0
+                );
+            }
+            eprintln!("[writ-droptest] only tab 0 left | PSS {} | {}", self_pss(), allocator_stats());
+        }
+        if let Some(i) = self.pending_tab_switch.take() {
+            self.switch_tab(i);
+            if self.autotabs_returning {
+                let parked: Vec<String> = self
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, t)| {
+                        let (files, renders) = t.state.as_ref()?.images.memory_stats();
+                        Some(format!(
+                            "{i}:{:.1}+{:.1}",
+                            files as f64 / 1048576.0,
+                            renders as f64 / 1048576.0
+                        ))
+                    })
+                    .collect();
+                eprintln!(
+                    "[writ-autotabs] back on tab 0 | PSS {} | {} | parked tabs image MB (files+renders) {}",
+                    self_pss(),
+                    allocator_stats(),
+                    parked.join(" ")
+                );
+                let rounds: u32 = std::env::var("WRIT_AUTOTABS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1);
+                if self.autotabs_round < rounds {
+                    // Next round: every tab from the top again.
+                    self.autotabs_round += 1;
+                    self.autotabs_returning = false;
+                    self.autoscroll_done = false;
+                    for tab in &mut self.tabs {
+                        tab.anchor = (0, 0.0);
+                    }
+                    if let Some(doc) = self.doc_engine.doc.as_mut() {
+                        doc.scroll_y = 0.0;
+                    }
+                    self.pending_rebuild = true;
+                    if let Some(state) = self.state.as_ref() {
+                        state.window.request_redraw();
+                    }
+                    eprintln!("[writ-autotabs] starting round {}", self.autotabs_round);
+                    return;
+                }
+                // Attribution: drop each parked document in turn and report what it freed.
+                // Whatever survives dropping them all is held by shared state.
+                for i in (1..self.tabs.len()).rev() {
+                    let before = malloc_bytes_in_use();
+                    drop(self.tabs[i].state.take());
+                    let after = malloc_bytes_in_use();
+                    eprintln!(
+                        "[writ-autotabs] dropped parked tab {i}: freed {:.1} MB",
+                        (before as f64 - after as f64) / 1048576.0
+                    );
+                }
+                eprintln!(
+                    "[writ-autotabs] only tab 0 left | PSS {} | {}",
+                    self_pss(),
+                    allocator_stats()
+                );
+            }
+        }
         let now = Instant::now();
         if self.frame_retry.take_due(now)
             && let Some(state) = self.state.as_ref()
