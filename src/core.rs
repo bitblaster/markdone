@@ -602,7 +602,11 @@ impl Editor {
     /// path) resolves against the document's directory — matching how images are loaded,
     /// so Ctrl-clicking a relative link/image opens the right file, not one relative to cwd.
     fn resolve_link_target(&self, url: String) -> String {
-        if url.contains("://") || url.starts_with("mailto:") || Path::new(&url).is_absolute() {
+        if url.contains("://")
+            || url.starts_with("mailto:")
+            || url.starts_with('#')
+            || Path::new(&url).is_absolute()
+        {
             return url;
         }
         match self.file_path.as_ref().and_then(|p| p.parent()) {

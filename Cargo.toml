@@ -49,7 +49,7 @@ math = ["dep:ratex-parser", "dep:ratex-layout", "dep:ratex-render", "dep:ratex-t
 editor = ["git", "github", "watch"]
 
 # the desktop editor application (winit shell). implies editor.
-app = ["editor", "remote-images", "mermaid", "math", "dep:winit", "dep:arboard", "dep:open", "dep:clap", "dep:toml", "dep:dirs", "dep:egui", "dep:egui-winit", "dep:egui-wgpu", "dep:rfd", "dep:toml_edit", "dep:skrifa"]
+app = ["editor", "remote-images", "mermaid", "math", "dep:winit", "dep:arboard", "dep:open", "dep:clap", "dep:toml", "dep:dirs", "dep:egui", "dep:egui-winit", "dep:egui-wgpu", "dep:rfd", "dep:toml_edit", "dep:skrifa", "dep:interprocess"]
 
 # the GhostText daemon (writd binary)
 ghosttext = ["app", "dep:tokio-tungstenite", "dep:futures"]
@@ -108,6 +108,7 @@ egui-wgpu = { version = "0.35", default-features = false, optional = true }
 rfd = { version = "0.18", optional = true }
 toml_edit = { version = "0.25.19", optional = true }
 skrifa = { version = "0.42", optional = true }
+interprocess = { version = "2", optional = true }
 
 # Optimize dependencies even in dev/test builds. writ's own code stays unoptimized
 # (fast incremental compile + debuggable), but the graphics/parsing stack (wgpu, vello,

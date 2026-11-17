@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Name=Markdone
+GenericName=Markdown Editor
+GenericName[it]=Editor Markdown
+Comment=Fast, lightweight Markdown editor with live rendering
+Comment[it]=Editor Markdown veloce e leggero con resa in tempo reale
+Exec=markdone %F
+Icon=markdone
+Terminal=false
+Categories=Utility;TextEditor;
+MimeType=text/markdown;text/x-markdown;
+Keywords=markdown;md;editor;notes;documentation;
+StartupNotify=true
+StartupWMClass=markdone
+Actions=new-instance;
+
+[Desktop Action new-instance]
+Name=New Window
+Name[it]=Nuova finestra
+Exec=markdone --new-instance

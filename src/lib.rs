@@ -110,6 +110,10 @@ pub mod parser;
 pub mod platform;
 #[cfg(feature = "app")]
 pub mod session;
+#[cfg(feature = "app")]
+pub mod single_instance;
+#[cfg(feature = "app")]
+pub mod links;
 pub mod paste;
 pub mod raster;
 pub mod render;

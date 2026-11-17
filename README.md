@@ -12,8 +12,14 @@ egui on top of writ's Vello document renderer.
 ## Install
 
 ```bash
-cargo install --path . --locked
+packaging/install.sh            # binary in ~/.local/bin, launcher entry and icon
+packaging/install.sh --default  # also the default application for Markdown files
+packaging/install.sh --uninstall
 ```
+
+Markdone runs as a single instance: opening a file while it is running (from the file
+manager or the command line) adds a tab to the open window. `--new-instance` starts a
+separate one.
 
 ## Usage
 

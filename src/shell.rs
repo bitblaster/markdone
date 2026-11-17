@@ -167,7 +167,9 @@ mod profile {
 use crate::commands::Command;
 use crate::text_engine::{TextEngine, peniko_color, peniko_color_alpha};
 use crate::text_input;
+use crate::links::{self, LinkTarget};
 use crate::session::Session;
+use crate::single_instance::{self, Instance};
 use crate::ui::UiLayer;
 use crate::ui::dialogs::{self, Answer, DialogView};
 use crate::ui::preferences;
@@ -438,6 +440,8 @@ pub(crate) enum WritEvent {
     },
     /// The Open dialog closed with these files (empty: cancelled).
     OpenPicked(Vec<PathBuf>),
+    /// Another launch handed over these files (empty: just raise the window).
+    InstanceOpen(Vec<PathBuf>),
 }
 
 /// Tabs to close (by id), and whether the application quits once they are closed.
@@ -869,7 +873,14 @@ impl App {
             session_path,
             config_path,
             github,
+            instance,
         } = startup;
+        if let Some(listener) = instance {
+            let proxy = proxy.clone();
+            single_instance::serve(listener, move |paths| {
+                let _ = proxy.send_event(WritEvent::InstanceOpen(paths));
+            });
+        }
         let active = active.min(editors.len() - 1);
         let mut editor = None;
         let mut tabs = Vec::with_capacity(editors.len());
@@ -1439,6 +1450,48 @@ impl App {
         }
         sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
         self.redraw();
+    }
+
+    /// Follow a Ctrl+clicked link: a heading of this document, another Markdown file
+    /// (in a tab, at its anchor if any), or the desktop's handler for anything else.
+    fn follow_link(&mut self, url: &str) {
+        match links::classify(url) {
+            LinkTarget::Anchor(anchor) => self.go_to_anchor(&anchor),
+            LinkTarget::Document { path, anchor } => {
+                if !path.is_file() {
+                    self.show_message(
+                        "File not found",
+                        format!("The link points to “{}”, which does not exist.", path.display()),
+                    );
+                    return;
+                }
+                self.open_paths(vec![path]);
+                if let Some(anchor) = anchor {
+                    self.go_to_anchor(&anchor);
+                }
+            }
+            LinkTarget::External(target) => {
+                if let Err(e) = open::that_detached(&target) {
+                    eprintln!("[markdone] failed to open {target}: {e}");
+                }
+            }
+        }
+    }
+
+    /// Jump to the heading of the active document that `anchor` designates, if any.
+    fn go_to_anchor(&mut self, anchor: &str) {
+        let index = self
+            .doc_engine
+            .editor
+            .state
+            .buffer
+            .headings()
+            .iter()
+            .position(|h| links::anchor_matches(&h.text, anchor));
+        match index {
+            Some(i) => self.go_to_heading(i),
+            None => eprintln!("[markdone] no heading for #{anchor}"),
+        }
     }
 
     /// With "check on focus" on, compare the active document with its file on disk
@@ -3044,6 +3097,14 @@ impl ApplicationHandler<WritEvent> for App {
             self.open_paths(paths);
             return;
         }
+        if let WritEvent::InstanceOpen(paths) = event {
+            self.open_paths(paths);
+            if let Some(state) = self.state.as_ref() {
+                state.window.set_minimized(false);
+                state.window.focus_window();
+            }
+            return;
+        }
         if let WritEvent::GitBaseChanged(id) = event {
             if id != self.tabs[self.active_tab].id {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
@@ -3719,9 +3780,7 @@ impl ApplicationHandler<WritEvent> for App {
                     if (self.modifiers.control_key() || self.modifiers.super_key())
                         && let Some(url) = self.doc_engine.editor.link_at(off)
                     {
-                        if let Err(e) = open::that_detached(&url) {
-                            eprintln!("[markdone] failed to open {url}: {e}");
-                        }
+                        self.follow_link(&url);
                         return;
                     }
                     // Clicking a checkbox toggles it (leaving the caret where it was)
@@ -4804,7 +4863,10 @@ pub fn run() -> Result<()> {
         return snapshot(&path, w, h, scroll);
     }
 
-    let startup = startup_from_cli();
+    // A second launch hands its files to the running instance and exits here.
+    let Some(startup) = startup_from_cli() else {
+        return Ok(());
+    };
     let event_loop = EventLoop::<WritEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let mut app = App::new(startup, proxy, runtime.handle().clone());
@@ -4826,12 +4888,14 @@ struct Startup {
     /// The config file the preferences are saved to.
     config_path: Option<PathBuf>,
     github: GithubSetup,
+    /// Where later launches hand over their files (single instance).
+    instance: Option<interprocess::local_socket::prelude::LocalSocketListener>,
 }
 
 /// Build the startup state from the command line. Files given there open one tab each
 /// (watched for external edits). Without files the previous session is restored, or an
 /// empty document opens. `--demo` opens the showcase document (no session).
-fn startup_from_cli() -> Startup {
+fn startup_from_cli() -> Option<Startup> {
     use clap::Parser;
 
     let config = Config::parse();
@@ -4844,7 +4908,7 @@ fn startup_from_cli() -> Startup {
     };
     // `--demo`: showcase doc with a synthetic HEAD diff (no file needed).
     if config.demo {
-        return Startup {
+        return Some(Startup {
             editors: vec![demo_editor()],
             active: 0,
             missing: Vec::new(),
@@ -4853,7 +4917,8 @@ fn startup_from_cli() -> Startup {
             session_path: None,
             config_path,
             github,
-        };
+            instance: None,
+        });
     }
     let session_path = Session::default_path();
     let mut session = session_path.as_deref().map(Session::load).unwrap_or_default();
@@ -4863,6 +4928,16 @@ fn startup_from_cli() -> Startup {
         .chain(&config.files)
         .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone()))
         .collect();
+    // Single instance: hand the files to a running Markdone, before loading anything.
+    let instance = if config.new_instance {
+        None
+    } else {
+        match single_instance::claim(&paths) {
+            Instance::Forwarded => return None,
+            Instance::Primary(listener) => Some(listener),
+            Instance::Standalone => None,
+        }
+    };
     if paths.is_empty() {
         let (restore, active) = session.restorable();
         let mut editors: Vec<Editor> = restore
@@ -4872,7 +4947,7 @@ fn startup_from_cli() -> Startup {
         if editors.is_empty() {
             editors.push(Editor::new(""));
         }
-        return Startup {
+        return Some(Startup {
             editors,
             active,
             missing: Vec::new(),
@@ -4881,7 +4956,8 @@ fn startup_from_cli() -> Startup {
             session_path,
             config_path,
             github,
-        };
+            instance,
+        });
     }
     let missing = paths.iter().filter(|p| !p.exists()).cloned().collect();
     for path in paths.iter().filter(|p| p.exists()) {
@@ -4891,7 +4967,7 @@ fn startup_from_cli() -> Startup {
         .iter()
         .map(|p| open_document(p, &github, config.autosave))
         .collect();
-    Startup {
+    Some(Startup {
         editors,
         active: 0,
         missing,
@@ -4900,7 +4976,8 @@ fn startup_from_cli() -> Startup {
         session_path,
         config_path,
         github,
-    }
+        instance,
+    })
 }
 
 /// Label of a recent file in the menu: the file name, and its folder shortened (home as

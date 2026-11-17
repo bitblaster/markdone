@@ -274,7 +274,8 @@ async fn handle_websocket(
 
     // Build writ command with optional GitHub context
     let mut cmd = Command::new("markdone");
-    cmd.arg("--file").arg(&temp_file).arg("--autosave");
+    // Its own instance: the temp file must not land in an already open Markdone.
+    cmd.arg("--new-instance").arg("--file").arg(&temp_file).arg("--autosave");
 
     // Pass GitHub repo context if URL is a GitHub page or title contains repo info
     let github_repo = client_msg

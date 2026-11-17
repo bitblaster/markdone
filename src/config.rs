@@ -34,6 +34,10 @@ pub struct Config {
     #[arg(long)]
     pub demo: bool,
 
+    /// Start a separate instance instead of opening the files in the running one.
+    #[arg(long)]
+    pub new_instance: bool,
+
     /// Save file automatically on every edit (useful for GhostText integration)
     #[arg(long)]
     pub autosave: bool,
