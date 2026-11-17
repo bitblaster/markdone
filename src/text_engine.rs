@@ -93,6 +93,26 @@ impl TextEngine {
             .map(str::to_string)
     }
 
+    /// The system UI font (`system-ui`, else `sans-serif`) as raw file bytes and face
+    /// index, for the egui chrome. Resolved through the same font collection the
+    /// document uses, so no second system-font scan is needed.
+    pub fn system_ui_font(&mut self) -> Option<(Vec<u8>, u32)> {
+        for generic in [GenericFamily::SystemUi, GenericFamily::SansSerif] {
+            let ids: Vec<_> = self.fcx.collection.generic_families(generic).collect();
+            for id in ids {
+                let Some(family) = self.fcx.collection.family(id) else {
+                    continue;
+                };
+                if let Some(font) = family.default_font()
+                    && let Some(blob) = font.load(None)
+                {
+                    return Some((blob.data().to_vec(), font.index()));
+                }
+            }
+        }
+        None
+    }
+
     /// The default font for a line: the configured family with a monospace fallback, or
     /// system monospace when unset. Owned (`'static`) so it borrows nothing from `self`.
     fn body_family(&self) -> FontFamily<'static> {

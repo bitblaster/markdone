@@ -15,6 +15,7 @@
 //! to render one frame headlessly instead.
 
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,10 +42,8 @@ use crate::buffer::Buffer;
 use crate::chrome::{BarRect, FindButtonRects, StatusInfo, draw_find_bar, draw_status_bar};
 use crate::config::{self, Config, ResolvedConfig};
 use crate::consts::{
-    TAB_BAR_H,
-    MAX_CONTENT_WIDTH,
-    CARET_WIDTH, FIND_ROW_H, FONT_SIZE, LINE_HEIGHT, OUTLINE_WIDTH, PADDING, STATUS_BAR_H,
-    WHEEL_LINE_STEP,
+    CARET_WIDTH, FIND_ROW_H, FONT_SIZE, LINE_HEIGHT, MAX_CONTENT_WIDTH, OUTLINE_WIDTH, PADDING,
+    STATUS_BAR_H, WHEEL_LINE_STEP,
 };
 use crate::core::{
     AutocompleteSuggestion, AutocompleteTrigger, Editor, FieldFocus, FindMode, WatchKind,
@@ -125,7 +124,11 @@ mod profile {
                     c.set(Some(start));
                 }
             });
-            Some(Self { label, start, rebuilds_before: REBUILDS.with(|c| c.get()) })
+            Some(Self {
+                label,
+                start,
+                rebuilds_before: REBUILDS.with(|c| c.get()),
+            })
         }
     }
 
@@ -161,8 +164,13 @@ mod profile {
             .map(|t| t.elapsed().as_secs_f64() * 1e3)
     }
 }
+use crate::commands::Command;
 use crate::text_engine::{TextEngine, peniko_color, peniko_color_alpha};
 use crate::text_input;
+use crate::ui::UiLayer;
+use crate::ui::dialogs::{self, Answer, DialogView};
+use crate::ui::menu::{MenuState, menu_bar};
+use crate::ui::tabs::{TabInfo, tab_strip};
 use crate::validation::{GitHubValidationCache, IssueOrPr, MentionableUser, ValidatedRefData};
 
 /// Chrome layout in device px: y where editor content begins, and its height. The
@@ -172,7 +180,7 @@ fn chrome_metrics(scale: f32, height_dev: f32, find_h: f32) -> (f32, f32) {
     // The title bar is the native window decoration now, so editor content starts at
     // the surface top; only the bottom strips are inset.
     let content_top = 0.0;
-    let editor_h = (height_dev - (STATUS_BAR_H + TAB_BAR_H) * scale - find_h).max(1.0);
+    let editor_h = (height_dev - STATUS_BAR_H * scale - find_h).max(1.0);
     (content_top, editor_h)
 }
 
@@ -205,16 +213,20 @@ fn find_bar_height(editor: &Editor, scale: f32) -> f32 {
 /// The native window title: the file name with a `●` dirty marker, shown in the OS
 /// decoration (we no longer draw our own title bar).
 fn window_title(editor: &Editor) -> String {
-    let name = editor
-        .file_path()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "untitled".to_string());
+    let name = doc_name(editor);
     if editor.is_dirty() {
         format!("● {name}")
     } else {
         name
     }
+}
+
+/// The document's display name: its file name, or "Untitled".
+fn doc_name(editor: &Editor) -> String {
+    editor
+        .file_path()
+        .and_then(Path::file_name)
+        .map_or_else(|| "Untitled".to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 /// Nearest heading level at or above `line`, if any.
@@ -336,6 +348,11 @@ impl ReloadState {
         }
     }
 
+    /// Whether `ticket` belongs to the most recent file read (no newer read started).
+    fn is_latest(&self, ticket: ReloadTicket) -> bool {
+        ticket.file_generation == self.file_generation
+    }
+
     fn begin_base(&mut self) -> u64 {
         self.base_generation += 1;
         self.base_generation
@@ -380,6 +397,36 @@ pub(crate) enum WritEvent {
     GitBaseChanged(u64),
     FileReloaded(ReloadTicket, ReloadData),
     GitBaseReloaded(u64, Option<String>),
+    /// The Save As dialog for tab `id` closed (`path` = `None`: cancelled). `then` is the
+    /// close request that asked for the save, resumed once the document is saved.
+    SaveAsPicked {
+        id: u64,
+        path: Option<PathBuf>,
+        then: Option<CloseRequest>,
+    },
+    /// The Open dialog closed with these files (empty: cancelled).
+    OpenPicked(Vec<PathBuf>),
+}
+
+/// Tabs to close (by id), and whether the application quits once they are closed.
+#[derive(Debug, Clone)]
+pub(crate) struct CloseRequest {
+    ids: Vec<u64>,
+    quit: bool,
+}
+
+/// A dialog waiting for the user, with the state needed to act on the answer.
+enum PendingModal {
+    /// Some tabs of `req` have unsaved changes (`dirty`, by id in tab order).
+    Unsaved { req: CloseRequest, dirty: Vec<u64> },
+    /// The active tab's file changed on disk while its buffer had unsaved changes;
+    /// `data` is the disk version.
+    DiskConflict {
+        id: u64,
+        ticket: ReloadTicket,
+        data: ReloadData,
+    },
+    Message { title: String, text: String },
 }
 
 /// Concrete `RepaintSignal` for the winit shell: wakes the loop with `ImageLoaded` so a
@@ -414,6 +461,8 @@ struct ActiveSurface {
     /// shared `viewport()` accessor can shrink the editor height without threading the
     /// editor's find state through its ten call sites; synced by `sync_find_chrome`.
     find_bar_h: f32,
+    /// Whether the egui menu bar is shown (off with `WRIT_NO_UI=1`, for A/B measurements).
+    menu_bar: bool,
 }
 
 struct SelectionDrag {
@@ -498,14 +547,27 @@ impl FrameRetry {
 }
 
 impl ActiveSurface {
+    /// Height of the egui menu bar at the top (device px). The document scene is drawn
+    /// shifted down by this, and pointer positions are shifted up by it, so all the
+    /// document/chrome code below keeps its origin at the top of the document area.
+    fn top_inset(&self) -> f32 {
+        if self.menu_bar {
+            UiLayer::top_inset(self.scale)
+        } else {
+            0.0
+        }
+    }
+
+    /// Height of the area below the menu bar (device px): what the document code sees
+    /// as the surface height.
+    fn doc_height(&self) -> f32 {
+        (self.surface.config.height as f32 - self.top_inset()).max(1.0)
+    }
+
     /// The editor viewport in device px: (surface width, editor content height, scale).
     /// The content height excludes the bottom status-bar and find-bar strips.
     fn viewport(&self) -> (f32, f32, f32) {
-        let (_, editor_h) = chrome_metrics(
-            self.scale,
-            self.surface.config.height as f32,
-            self.find_bar_h,
-        );
+        let (_, editor_h) = chrome_metrics(self.scale, self.doc_height(), self.find_bar_h);
         (self.surface.config.width as f32, editor_h, self.scale)
     }
 }
@@ -648,13 +710,20 @@ struct App {
     renderer: Option<Renderer>,
     state: Option<ActiveSurface>,
     scene: Scene,
+    /// The document scene shifted below the menu bar (rebuilt from `scene` each frame).
+    frame_scene: Scene,
+    /// egui chrome: menu bar, menus, dialogs. Created with the surface.
+    ui: Option<UiLayer>,
     doc_engine: DocEngine,
     /// Open documents in tab order; `tabs[active_tab]` is the one in `doc_engine`.
     tabs: Vec<Tab>,
     active_tab: usize,
-    /// Tab hit rects from the last paint, and the tab under the pointer.
-    tab_rects: Vec<ScreenRect>,
-    tab_hover: Option<usize>,
+    /// Id for the next tab opened (ids tag file-watch events).
+    next_tab_id: u64,
+    /// The dialog being shown, if any. While set, the document gets no input.
+    modal: Option<PendingModal>,
+    /// A native Open / Save As dialog is open (at most one at a time).
+    file_dialog_open: bool,
     modifiers: ModifiersState,
     mouse_pos: (f32, f32),
     selection_drag: Option<SelectionDrag>,
@@ -730,6 +799,7 @@ struct App {
 impl App {
     fn new(
         editors: Vec<Editor>,
+        missing: Vec<PathBuf>,
         config: ResolvedConfig,
         proxy: EventLoopProxy<WritEvent>,
         runtime: tokio::runtime::Handle,
@@ -754,6 +824,7 @@ impl App {
                 base_stale: false,
             });
         }
+        let next_tab_id = tabs.len() as u64;
         let title = window_title(&editor);
         // Apply the configured font family, but only if it renders fixed-pitch — a
         // proportional (or unloadable) family would break writ's deterministic wrapping.
@@ -771,6 +842,8 @@ impl App {
             renderer: None,
             state: None,
             scene: Scene::new(),
+            frame_scene: Scene::new(),
+            ui: None,
             doc_engine: DocEngine {
                 text_engine,
                 line_cache: LineCache::new(),
@@ -786,8 +859,9 @@ impl App {
             },
             tabs,
             active_tab: 0,
-            tab_rects: Vec::new(),
-            tab_hover: None,
+            next_tab_id,
+            modal: missing_files_notice(&missing),
+            file_dialog_open: false,
             modifiers: ModifiersState::empty(),
             mouse_pos: (0.0, 0.0),
             selection_drag: None,
@@ -835,7 +909,11 @@ impl App {
             return;
         };
         if profile::enabled() {
-            eprintln!("[writ-mem] switch tab {} -> {i} | {}", self.active_tab, allocator_stats());
+            eprintln!(
+                "[writ-mem] switch tab {} -> {i} | {}",
+                self.active_tab,
+                allocator_stats()
+            );
         }
         let old = self.active_tab;
         let anchor = self
@@ -885,15 +963,503 @@ impl App {
         }
     }
 
-    /// Close the active tab (there must be another one): activate a neighbour, then drop
-    /// the old document (its file watcher stops with it).
-    fn close_active_tab(&mut self) {
-        let old = self.active_tab;
-        let next = if old + 1 < self.tabs.len() { old + 1 } else { old - 1 };
-        self.switch_tab(next);
-        self.tabs.remove(old);
-        if self.active_tab > old {
-            self.active_tab -= 1;
+    /// The editor of tab `i` (the active one lives in `doc_engine`).
+    fn tab_editor(&self, i: usize) -> &Editor {
+        self.tabs[i]
+            .state
+            .as_ref()
+            .map_or(&self.doc_engine.editor, |s| &s.editor)
+    }
+
+    fn tab_editor_mut(&mut self, i: usize) -> &mut Editor {
+        match self.tabs[i].state.as_mut() {
+            Some(s) => &mut s.editor,
+            None => &mut self.doc_engine.editor,
+        }
+    }
+
+    /// Index of the tab with id `id`, if still open.
+    fn tab_index(&self, id: u64) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id == id)
+    }
+
+    fn redraw(&self) {
+        if let Some(state) = self.state.as_ref() {
+            state.window.request_redraw();
+        }
+    }
+
+    /// Close the tabs of `req` (and quit, if asked), first asking what to do with
+    /// unsaved changes. Re-entrant: after a Save As the request is simply re-run.
+    fn request_close(&mut self, req: CloseRequest, event_loop: &ActiveEventLoop) {
+        let dirty: Vec<u64> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| req.ids.contains(&t.id) && self.tab_editor(*i).is_dirty())
+            .map(|(_, t)| t.id)
+            .collect();
+        // Without the egui layer (`WRIT_NO_UI`, benchmarks) there is no way to ask.
+        if dirty.is_empty() || self.ui.is_none() {
+            self.finish_close(req, event_loop);
+            return;
+        }
+        if let Some(PendingModal::DiskConflict { .. }) = self.modal {
+            // Replaced by this dialog: ask again about the disk version afterwards.
+            self.tabs[self.active_tab].file_stale = true;
+        }
+        self.modal = Some(PendingModal::Unsaved { req, dirty });
+        self.redraw();
+    }
+
+    fn finish_close(&mut self, req: CloseRequest, event_loop: &ActiveEventLoop) {
+        if req.quit {
+            event_loop.exit();
+        } else {
+            self.remove_tabs(&req.ids);
+        }
+    }
+
+    /// Drop the tabs with these ids (their file watchers stop with them). If the active
+    /// tab goes, its nearest surviving neighbour (right first) is activated; if none
+    /// survives, an empty untitled tab takes its place, so the window stays open.
+    fn remove_tabs(&mut self, ids: &[u64]) {
+        let closing = |t: &Tab| ids.contains(&t.id);
+        let active = self.active_tab;
+        if closing(&self.tabs[active]) {
+            let n = self.tabs.len();
+            let next = (active + 1..n)
+                .chain((0..active).rev())
+                .find(|&i| !closing(&self.tabs[i]));
+            match next {
+                Some(i) => self.switch_tab(i),
+                None => self.open_blank_tab(),
+            }
+        }
+        let active_id = self.tabs[self.active_tab].id;
+        self.tabs.retain(|t| !closing(t));
+        self.active_tab = self.tab_index(active_id).expect("active tab survives");
+        self.redraw();
+    }
+
+    fn close_tab(&mut self, i: usize, event_loop: &ActiveEventLoop) {
+        if let Some(tab) = self.tabs.get(i) {
+            let req = CloseRequest {
+                ids: vec![tab.id],
+                quit: false,
+            };
+            self.request_close(req, event_loop);
+        }
+    }
+
+    fn show_message(&mut self, title: &str, text: String) {
+        self.modal = Some(PendingModal::Message {
+            title: title.to_string(),
+            text,
+        });
+        self.redraw();
+    }
+
+    /// Save tab `i` to its file. An untitled document asks for a path instead (the save
+    /// then completes asynchronously). Returns `true` only if the document was saved.
+    fn save_tab(&mut self, i: usize) -> bool {
+        if self.tab_editor(i).file_path().is_none() {
+            self.start_save_as(i, None);
+            return false;
+        }
+        match self.tab_editor_mut(i).save() {
+            Ok(()) => true,
+            Err(e) => {
+                let name = doc_name(self.tab_editor(i));
+                self.show_message("Could not save", format!("Saving “{name}” failed: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Directory a file dialog starts in: the folder of tab `i`'s file, else the
+    /// working directory.
+    fn dialog_dir(&self, i: usize) -> Option<PathBuf> {
+        self.tab_editor(i)
+            .file_path()
+            .and_then(|p| std::path::absolute(p).ok())
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .or_else(|| std::env::current_dir().ok())
+    }
+
+    /// Ask for a path for tab `i` and save it there. The native dialog runs on its own
+    /// thread (the loop keeps drawing); the answer comes back as `SaveAsPicked`.
+    fn start_save_as(&mut self, i: usize, then: Option<CloseRequest>) {
+        if self.file_dialog_open {
+            return;
+        }
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let editor = self.tab_editor(i);
+        let name = editor
+            .file_path()
+            .and_then(Path::file_name)
+            .map_or_else(|| "untitled.md".to_string(), |n| n.to_string_lossy().into_owned());
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save As")
+            .add_filter("Markdown", &["md", "markdown"])
+            .set_file_name(name)
+            .set_parent(&*state.window);
+        if let Some(dir) = self.dialog_dir(i) {
+            dialog = dialog.set_directory(dir);
+        }
+        let id = self.tabs[i].id;
+        let proxy = self.proxy.clone();
+        self.file_dialog_open = true;
+        std::thread::spawn(move || {
+            let path = dialog.save_file();
+            let _ = proxy.send_event(WritEvent::SaveAsPicked { id, path, then });
+        });
+    }
+
+    /// Ask for files to open (answer comes back as `OpenPicked`).
+    fn start_open(&mut self) {
+        if self.file_dialog_open {
+            return;
+        }
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Open")
+            .add_filter("Markdown", &["md", "markdown", "mdown", "mkd"])
+            .add_filter("Text", &["txt"])
+            .set_parent(&*state.window);
+        if let Some(dir) = self.dialog_dir(self.active_tab) {
+            dialog = dialog.set_directory(dir);
+        }
+        let proxy = self.proxy.clone();
+        self.file_dialog_open = true;
+        std::thread::spawn(move || {
+            let paths = dialog.pick_files().unwrap_or_default();
+            let _ = proxy.send_event(WritEvent::OpenPicked(paths));
+        });
+    }
+
+    /// The Save As dialog answered: save tab `id` at `path`, watch the new file, and
+    /// resume the close request that asked for it, if any.
+    fn finish_save_as(
+        &mut self,
+        id: u64,
+        path: PathBuf,
+        then: Option<CloseRequest>,
+        event_loop: &ActiveEventLoop,
+    ) {
+        let Some(i) = self.tab_index(id) else {
+            return;
+        };
+        let proxy = self.proxy.clone();
+        let editor = self.tab_editor_mut(i);
+        if let Err(e) = editor.save_as(path.clone()) {
+            self.show_message(
+                "Could not save",
+                format!("Saving “{}” failed: {e}", path.display()),
+            );
+            return;
+        }
+        editor.refresh_git_base();
+        if let Err(e) = editor.watch_file() {
+            eprintln!("[writ] file watch failed: {e}");
+        }
+        forward_file_watch(editor, id, &proxy);
+        self.redraw();
+        if let Some(req) = then {
+            self.request_close(req, event_loop);
+        }
+    }
+
+    /// Open files in new tabs (a file already open just gets activated). A pristine
+    /// untitled tab that was active is replaced.
+    fn open_paths(&mut self, paths: Vec<PathBuf>) {
+        let pristine = {
+            let editor = &self.doc_engine.editor;
+            (editor.file_path().is_none() && editor.is_empty() && !editor.is_dirty())
+                .then(|| self.tabs[self.active_tab].id)
+        };
+        let mut last = None;
+        for path in paths {
+            let path = std::path::absolute(&path).unwrap_or(path);
+            let key = path.canonicalize().ok();
+            let open = (0..self.tabs.len()).find(|&i| {
+                key.is_some()
+                    && self.tab_editor(i).file_path().and_then(|p| p.canonicalize().ok()) == key
+            });
+            if let Some(i) = open {
+                last = Some(i);
+                continue;
+            }
+            let id = self.next_tab_id;
+            self.next_tab_id += 1;
+            let mut editor = Editor::open(&path);
+            editor.refresh_detection(0..usize::MAX);
+            if let Err(e) = editor.watch_file() {
+                eprintln!("[writ] file watch failed: {e}");
+            }
+            forward_file_watch(&mut editor, id, &self.proxy);
+            self.tabs.push(Tab {
+                id,
+                state: Some(DocState::new(editor)),
+                anchor: (0, 0.0),
+                file_stale: false,
+                base_stale: false,
+            });
+            last = Some(self.tabs.len() - 1);
+        }
+        let Some(i) = last else {
+            return;
+        };
+        self.switch_tab(i);
+        if let Some(blank) = pristine
+            && blank != self.tabs[self.active_tab].id
+        {
+            self.remove_tabs(&[blank]);
+        }
+        self.redraw();
+    }
+
+    /// What the pending dialog shows.
+    fn dialog_view(&self) -> Option<DialogView> {
+        let name = |id: u64| self.tab_index(id).map(|i| doc_name(self.tab_editor(i)));
+        Some(match self.modal.as_ref()? {
+            PendingModal::Unsaved { req, dirty } => DialogView::Unsaved {
+                names: dirty.iter().filter_map(|&id| name(id)).collect(),
+                quitting: req.quit,
+            },
+            PendingModal::DiskConflict { id, .. } => DialogView::DiskConflict {
+                name: name(*id).unwrap_or_default(),
+            },
+            PendingModal::Message { title, text } => DialogView::Message {
+                title: title.clone(),
+                text: text.clone(),
+            },
+        })
+    }
+
+    /// Act on the user's answer to the pending dialog.
+    fn answer_dialog(&mut self, answer: Answer, event_loop: &ActiveEventLoop) {
+        let Some(modal) = self.modal.take() else {
+            return;
+        };
+        match modal {
+            PendingModal::Unsaved { req, dirty } => match answer {
+                Answer::Save => {
+                    // Documents with a file first, then the first untitled one (its
+                    // Save As resumes the request, which asks again for the rest).
+                    let mut untitled = None;
+                    for id in dirty {
+                        let Some(i) = self.tab_index(id) else {
+                            continue;
+                        };
+                        if self.tab_editor(i).file_path().is_none() {
+                            untitled = untitled.or(Some(i));
+                        } else if !self.save_tab(i) {
+                            return; // the error is shown; nothing is closed
+                        }
+                    }
+                    match untitled {
+                        Some(i) => self.start_save_as(i, Some(req)),
+                        None => self.finish_close(req, event_loop),
+                    }
+                }
+                Answer::Discard => self.finish_close(req, event_loop),
+                _ => {}
+            },
+            PendingModal::DiskConflict { id, ticket, data } => {
+                if id == self.tabs[self.active_tab].id && self.reloads.is_latest(ticket) {
+                    if answer == Answer::Reload {
+                        self.doc_engine.editor.apply_file_content(data.0);
+                        self.reloads.apply_base(
+                            &mut self.doc_engine.editor,
+                            ticket.base_generation,
+                            data.1,
+                        );
+                        self.after_reload();
+                    } else {
+                        // Keep the buffer; only the diff base follows HEAD.
+                        self.reloads.apply_base(
+                            &mut self.doc_engine.editor,
+                            ticket.base_generation,
+                            data.1,
+                        );
+                    }
+                }
+            }
+            PendingModal::Message { .. } => {}
+        }
+        // A disk change that arrived while another dialog was open is asked now.
+        if self.modal.is_none() && std::mem::take(&mut self.tabs[self.active_tab].file_stale) {
+            let _ = self
+                .proxy
+                .send_event(WritEvent::FileChanged(self.tabs[self.active_tab].id));
+        }
+        self.redraw();
+    }
+
+    /// The active document's text was replaced from disk: treat it like an edit
+    /// (refresh detection, revalidate refs, reload images) and redraw.
+    fn after_reload(&mut self) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let (w, vh, scale) = state.viewport();
+        let window = state.window.clone();
+        apply_edit_effects(
+            &mut self.doc_engine,
+            &mut self.hovered,
+            &self.runtime,
+            &self.proxy,
+            None,
+            &window,
+            w,
+            scale,
+            vh,
+        );
+    }
+
+    /// Append an empty untitled document and activate it.
+    fn open_blank_tab(&mut self) {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.push(Tab {
+            id,
+            state: Some(DocState::new(Editor::new(""))),
+            anchor: (0, 0.0),
+            file_stale: false,
+            base_stale: false,
+        });
+        self.switch_tab(self.tabs.len() - 1);
+    }
+
+    /// Move tab `from` to position `to` (drag-and-drop reorder), keeping the active
+    /// document active.
+    fn move_tab(&mut self, from: usize, to: usize) {
+        let n = self.tabs.len();
+        if from >= n || to >= n || from == to {
+            return;
+        }
+        let active_id = self.tabs[self.active_tab].id;
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active_tab = self
+            .tabs
+            .iter()
+            .position(|t| t.id == active_id)
+            .expect("active tab still present");
+    }
+
+    /// Execute an application command (from the menu bar).
+    fn run_command(&mut self, cmd: Command, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        match cmd {
+            Command::New => self.open_blank_tab(),
+            Command::Open => {
+                self.start_open();
+                return;
+            }
+            Command::Save => {
+                self.save_tab(self.active_tab);
+            }
+            Command::SaveAs => {
+                self.start_save_as(self.active_tab, None);
+                return;
+            }
+            Command::CloseTab => {
+                self.close_tab(self.active_tab, event_loop);
+                return;
+            }
+            Command::SwitchTab(i) => self.switch_tab(i),
+            Command::CloseTabAt(i) => {
+                self.close_tab(i, event_loop);
+                return;
+            }
+            Command::CloseOtherTabs(keep) => {
+                if let Some(keep_id) = self.tabs.get(keep).map(|t| t.id) {
+                    self.switch_tab(keep);
+                    let ids = self.tabs.iter().map(|t| t.id).filter(|&id| id != keep_id).collect();
+                    self.request_close(CloseRequest { ids, quit: false }, event_loop);
+                }
+                return;
+            }
+            Command::CloseAllTabs | Command::Quit => {
+                let ids = self.tabs.iter().map(|t| t.id).collect();
+                let quit = cmd == Command::Quit;
+                self.request_close(CloseRequest { ids, quit }, event_loop);
+                return;
+            }
+            Command::CopyPath(i) => {
+                if let Some(path) = self.tab_editor(i).file_path().map(Path::to_path_buf)
+                    && let Some(cb) = self.clipboard.as_mut()
+                    && let Err(e) = cb.set_text(path.display().to_string())
+                {
+                    eprintln!("[writ] failed to copy path: {e}");
+                }
+                return;
+            }
+            Command::RevealInFileManager(i) => {
+                if let Some(path) = self.tab_editor(i).file_path() {
+                    crate::platform::reveal_in_file_manager(path);
+                }
+                return;
+            }
+            Command::MoveTab { from, to } => {
+                self.move_tab(from, to);
+            }
+            Command::Undo | Command::Redo => {
+                if cmd == Command::Undo {
+                    self.doc_engine.editor.undo();
+                } else {
+                    self.doc_engine.editor.redo();
+                }
+                self.doc_engine.editor.find_rescan();
+                let (w, vh, scale) = state.viewport();
+                apply_edit_effects(
+                    &mut self.doc_engine,
+                    &mut self.hovered,
+                    &self.runtime,
+                    &self.proxy,
+                    None,
+                    &state.window,
+                    w,
+                    scale,
+                    vh,
+                );
+            }
+            Command::Find | Command::Replace => {
+                self.doc_engine.editor.open_find(cmd == Command::Replace);
+                state.find_bar_h = find_bar_height(&self.doc_engine.editor, state.scale);
+                let (w, vh, scale) = state.viewport();
+                apply_edit_effects(
+                    &mut self.doc_engine,
+                    &mut self.hovered,
+                    &self.runtime,
+                    &self.proxy,
+                    None,
+                    &state.window,
+                    w,
+                    scale,
+                    vh,
+                );
+            }
+            Command::ToggleOutline => {
+                self.doc_engine.editor.toggle_outline();
+                let (w, vh, scale) = state.viewport();
+                self.doc_engine.rebuild_preserving_scroll(w, scale, vh);
+            }
+            Command::NextTab | Command::PrevTab => {
+                let n = self.tabs.len();
+                if n > 1 {
+                    let step = if cmd == Command::NextTab { 1 } else { n - 1 };
+                    self.switch_tab((self.active_tab + step) % n);
+                }
+            }
         }
         if let Some(state) = self.state.as_ref() {
             state.window.request_redraw();
@@ -987,7 +1553,10 @@ fn self_pss() -> String {
                 .find(|l| l.starts_with("Pss:"))
                 .and_then(|l| l.split_whitespace().nth(1).map(str::to_string))
         })
-        .map_or_else(|| "?".to_string(), |kb| format!("{:.1} MB", kb.parse::<f64>().unwrap_or(0.0) / 1024.0))
+        .map_or_else(
+            || "?".to_string(),
+            |kb| format!("{:.1} MB", kb.parse::<f64>().unwrap_or(0.0) / 1024.0),
+        )
 }
 
 /// glibc allocator totals (all arenas) for profiling: bytes in use vs. free-but-held.
@@ -1710,10 +2279,13 @@ fn ac_row_at(rects: &[ScreenRect], pos: (f32, f32)) -> Option<usize> {
 /// over the editable document body. The modifier is checked first so the (snapshot-
 /// building) `link_at` lookup only runs during an actual Ctrl-hover.
 /// Scrollbar geometry for the live surface (None when the document fits the viewport).
-fn scrollbar_geometry(doc_engine: &DocEngine, state: &ActiveSurface) -> Option<scrollbar::Geometry> {
+fn scrollbar_geometry(
+    doc_engine: &DocEngine,
+    state: &ActiveSurface,
+) -> Option<scrollbar::Geometry> {
     let doc = doc_engine.doc.as_ref()?;
     let width = state.surface.config.width as f32;
-    let height = state.surface.config.height as f32;
+    let height = state.doc_height();
     let (content_top, editor_h) = chrome_metrics(state.scale, height, state.find_bar_h);
     let doc_w = (width - outline_width(&doc_engine.editor, state.scale)).max(0.0);
     scrollbar::geometry(doc, doc_w, content_top, editor_h, state.scale)
@@ -1776,7 +2348,7 @@ fn pointer_cursor(
     // The editable body is the editor content minus the right-docked outline panel; the
     // find bar and status bar sit below `editor_h`. I-beam inside, arrow over the chrome.
     let width = state.surface.config.width as f32;
-    let height = state.surface.config.height as f32;
+    let height = state.doc_height();
     let outline_w = outline_width(&doc_engine.editor, state.scale);
     let (_, editor_h) = chrome_metrics(state.scale, height, state.find_bar_h);
     let body: ScreenRect = (0.0, 0.0, (width - outline_w) as f64, editor_h as f64);
@@ -1960,9 +2532,7 @@ fn paint_document(
     // Chrome (bottom, above the OS-native title bar): the find bar sits in the gap
     // between the document and the status bar, so the status bar starts below it.
     let bar_top = (content_top + editor_h) as f64;
-    // The tab strip (painted by the live redraw) sits between the find bar and the
-    // status bar.
-    let status_top = bar_top + find_h as f64 + (TAB_BAR_H * scale) as f64;
+    let status_top = bar_top + find_h as f64;
     let btn_rects = if find_h > 0.0
         && let Some(find) = editor.find_state()
     {
@@ -1975,7 +2545,7 @@ fn paint_document(
                 x0: 0.0,
                 y0: bar_top,
                 x1: width as f64,
-                y1: status_top,
+                y1: bar_top + find_h as f64,
             },
             scale,
         )
@@ -2092,7 +2662,20 @@ fn draw_fold_chevrons(
 impl ApplicationHandler<WritEvent> for App {
     /// A tokio task finished (validation/suggestion). Results are already in the
     /// shared caches; rebuild the doc (ref colors may have changed) and redraw.
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: WritEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WritEvent) {
+        if let WritEvent::SaveAsPicked { id, path, then } = event {
+            self.file_dialog_open = false;
+            // Cancelled: a close that was waiting for this save is abandoned too.
+            if let Some(path) = path {
+                self.finish_save_as(id, path, then, event_loop);
+            }
+            return;
+        }
+        if let WritEvent::OpenPicked(paths) = event {
+            self.file_dialog_open = false;
+            self.open_paths(paths);
+            return;
+        }
         if let WritEvent::GitBaseChanged(id) = event {
             if id != self.tabs[self.active_tab].id {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
@@ -2148,6 +2731,28 @@ impl ApplicationHandler<WritEvent> for App {
         // The off-thread read finished: apply it (cheap parse/diff) and treat it like an
         // edit (refresh detection / revalidate refs / reload images).
         if let WritEvent::FileReloaded(ticket, data) = event {
+            if !self.reloads.is_latest(ticket) {
+                return; // a newer read is on its way
+            }
+            // Unsaved changes and a different disk version: never overwrite silently.
+            let editor = &self.doc_engine.editor;
+            if self.ui.is_some()
+                && editor.is_dirty()
+                && !editor.state.buffer.content_eq(&data.0)
+            {
+                let id = self.tabs[self.active_tab].id;
+                match &mut self.modal {
+                    None => self.modal = Some(PendingModal::DiskConflict { id, ticket, data }),
+                    Some(PendingModal::DiskConflict { ticket: t, data: d, .. }) => {
+                        *t = ticket;
+                        *d = data;
+                    }
+                    // Another dialog is open: ask once it is answered.
+                    Some(_) => self.tabs[self.active_tab].file_stale = true,
+                }
+                self.redraw();
+                return;
+            }
             if self
                 .reloads
                 .apply_file(&mut self.doc_engine.editor, ticket, data)
@@ -2180,7 +2785,11 @@ impl ApplicationHandler<WritEvent> for App {
             }
         }
         if profile::enabled() && matches!(event, WritEvent::ImageLoaded) {
-            eprintln!("[writ-mem] image/render loaded (tab {}) | {}", self.active_tab, allocator_stats());
+            eprintln!(
+                "[writ-mem] image/render loaded (tab {}) | {}",
+                self.active_tab,
+                allocator_stats()
+            );
         }
         // Defer the relayout to the next redraw so a burst of completions (many refs /
         // images finishing in the same frame) collapses into a single rebuild.
@@ -2233,7 +2842,14 @@ impl ApplicationHandler<WritEvent> for App {
         let scale = window.scale_factor() as f32;
         sync_image_raster_width(scale);
         // Find is closed at startup, so no find-bar inset yet.
-        let (_, editor_h) = chrome_metrics(scale, size.height as f32, 0.0);
+        let menu_bar = std::env::var_os("WRIT_NO_UI").is_none();
+        let top_inset = if menu_bar {
+            UiLayer::top_inset(scale)
+        } else {
+            0.0
+        };
+        let doc_h = (size.height as f32 - top_inset).max(1.0);
+        let (_, editor_h) = chrome_metrics(scale, doc_h, 0.0);
         let doc = self
             .doc_engine
             .rebuild(size.width as f32, scale, 0, editor_h);
@@ -2241,11 +2857,22 @@ impl ApplicationHandler<WritEvent> for App {
         // The loop parks on Wait, so the first frame must not depend on input,
         // a resize, or an asynchronous resource finishing.
         window.request_redraw();
+        self.ui = menu_bar.then(|| {
+            let ui_font = self.doc_engine.text_engine.system_ui_font();
+            UiLayer::new(
+                &window,
+                &dev.device,
+                surface.config.format,
+                &self.doc_engine.theme,
+                ui_font,
+            )
+        });
         self.state = Some(ActiveSurface {
             surface,
             window,
             scale,
             find_bar_h: 0.0,
+            menu_bar,
         });
         // Validate refs already present in the loaded file, and start loading images
         // (spawn_validations already calls sync_images).
@@ -2257,15 +2884,53 @@ impl ApplicationHandler<WritEvent> for App {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 profile::EventTimer::new("key")
             }
-            WindowEvent::Ime(winit::event::Ime::Commit(_)) => profile::EventTimer::new("ime-commit"),
-            WindowEvent::Ime(winit::event::Ime::Preedit(..)) => profile::EventTimer::new("ime-preedit"),
+            WindowEvent::Ime(winit::event::Ime::Commit(_)) => {
+                profile::EventTimer::new("ime-commit")
+            }
+            WindowEvent::Ime(winit::event::Ime::Preedit(..)) => {
+                profile::EventTimer::new("ime-preedit")
+            }
             _ => None,
+        };
+        let dialog_view = if matches!(event, WindowEvent::RedrawRequested) {
+            self.dialog_view()
+        } else {
+            None
         };
         let Some(state) = self.state.as_mut() else {
             return;
         };
+        if let Some(ui) = self.ui.as_mut() {
+            let menu_was_open = ui.is_active();
+            if ui.on_window_event(&state.window, &event) {
+                return;
+            }
+            // A dialog owns all input until it is answered.
+            if self.modal.is_some()
+                && matches!(
+                    event,
+                    WindowEvent::KeyboardInput { .. }
+                        | WindowEvent::MouseInput { .. }
+                        | WindowEvent::MouseWheel { .. }
+                        | WindowEvent::CursorMoved { .. }
+                        | WindowEvent::Ime(_)
+                )
+            {
+                state.window.request_redraw();
+                return;
+            }
+            // A click outside an open menu only closes the menu.
+            if menu_was_open
+                && matches!(
+                    event,
+                    WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }
+                )
+            {
+                return;
+            }
+        }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.run_command(Command::Quit, event_loop),
             WindowEvent::Focused(false) => {
                 self.selection_drag = None;
                 self.drag_scroll_dy = 0.0;
@@ -2356,7 +3021,7 @@ impl ApplicationHandler<WritEvent> for App {
                         .or_else(|| doc.caret_rect(self.doc_engine.editor.cursor_position(), cw));
                     if let Some((x0, y0, x1, y1)) = rect {
                         state.window.set_ime_cursor_area(
-                            PhysicalPosition::new(x0, y0),
+                            PhysicalPosition::new(x0, y0 + state.top_inset() as f64),
                             PhysicalSize::new((x1 - x0).max(1.0), (y1 - y0).max(1.0)),
                         );
                     }
@@ -2441,18 +3106,18 @@ impl ApplicationHandler<WritEvent> for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.mouse_pos = (position.x as f32, position.y as f32);
+                // Document coordinates: origin at the top of the area below the menu bar.
+                self.mouse_pos = (position.x as f32, position.y as f32 - state.top_inset());
+                if self.ui.as_mut().is_some_and(UiLayer::take_cursor_released) {
+                    // egui drew its own cursor over the menu: re-apply the editor's one.
+                    self.cursor_icon = CursorIcon::Progress;
+                }
                 // Scrollbar thumb drag owns the pointer until release.
                 if self.scrollbar_drag.is_some() {
                     // Coalesced: the thumb follows the pointer once per frame.
                     self.scrollbar_pending = true;
                     state.window.request_redraw();
                     return;
-                }
-                let tab_hover = self.tab_rects.iter().position(|r| rect_contains(r, self.mouse_pos));
-                if tab_hover != self.tab_hover {
-                    self.tab_hover = tab_hover;
-                    state.window.request_redraw();
                 }
                 let sb_hover = scrollbar_geometry(&self.doc_engine, state)
                     .is_some_and(|g| g.hit(self.mouse_pos));
@@ -2535,11 +3200,6 @@ impl ApplicationHandler<WritEvent> for App {
                 self.selection_drag = None;
                 self.drag_scroll_dy = 0.0;
                 self.last_drag_tick = None;
-                // Tab strip click: activate that document.
-                if let Some(i) = self.tab_rects.iter().position(|r| rect_contains(r, self.mouse_pos)) {
-                    self.switch_tab(i);
-                    return;
-                }
                 let (w, vh, _) = state.viewport();
 
                 // Find-bar focus routing. The bar is docked at the bottom, so the document
@@ -2835,18 +3495,25 @@ impl ApplicationHandler<WritEvent> for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                // Ctrl-W / Super-W closes the tab, and the window with the last one (does
-                // not auto-save; use Ctrl-S).
+                // Application commands: Ctrl+N new, Ctrl+O open, Ctrl+S save, Ctrl+Shift+S
+                // save as, Ctrl+W close tab, Ctrl+Q quit (the last two ask about unsaved
+                // changes).
                 let cmd = self.modifiers.control_key() || self.modifiers.super_key();
-                if cmd
-                    && matches!(&event.logical_key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("w"))
-                {
-                    if self.tabs.len() <= 1 {
-                        event_loop.exit();
-                    } else {
-                        self.close_active_tab();
+                if cmd && let Key::Character(c) = &event.logical_key {
+                    let shift = self.modifiers.shift_key();
+                    let app_cmd = match c.as_str().to_ascii_lowercase().as_str() {
+                        "n" if !shift => Some(Command::New),
+                        "o" if !shift => Some(Command::Open),
+                        "s" if shift => Some(Command::SaveAs),
+                        "s" => Some(Command::Save),
+                        "w" => Some(Command::CloseTab),
+                        "q" => Some(Command::Quit),
+                        _ => None,
+                    };
+                    if let Some(app_cmd) = app_cmd {
+                        self.run_command(app_cmd, event_loop);
+                        return;
                     }
-                    return;
                 }
                 // Tab switching: Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+PageDown / Ctrl+PageUp.
                 if self.modifiers.control_key() && self.tabs.len() > 1 {
@@ -3320,7 +3987,12 @@ impl ApplicationHandler<WritEvent> for App {
                 if std::mem::take(&mut self.scrollbar_pending)
                     && let Some(grab) = self.scrollbar_drag
                     && let Some(geo) = scrollbar_geometry(&self.doc_engine, state)
-                    && scrollbar_scroll_to(&mut self.doc_engine, state, &geo, self.mouse_pos.1 - grab)
+                    && scrollbar_scroll_to(
+                        &mut self.doc_engine,
+                        state,
+                        &geo,
+                        self.mouse_pos.1 - grab,
+                    )
                 {
                     sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
                 }
@@ -3335,7 +4007,7 @@ impl ApplicationHandler<WritEvent> for App {
                 }
 
                 let width = state.surface.config.width as f32;
-                let height = state.surface.config.height as f32;
+                let height = state.doc_height();
                 let (content_top, editor_h) = chrome_metrics(state.scale, height, state.find_bar_h);
 
                 // Apply any coalesced async-completion rebuild once, before drawing.
@@ -3382,37 +4054,6 @@ impl ApplicationHandler<WritEvent> for App {
                         );
                     }
 
-                    let tab_top = (content_top + editor_h + state.find_bar_h) as f64;
-                    let labels: Vec<crate::tabs::TabLabel> = self
-                        .tabs
-                        .iter()
-                        .map(|t| {
-                            let editor = t.state.as_ref().map_or(&self.doc_engine.editor, |s| &s.editor);
-                            crate::tabs::TabLabel {
-                                name: editor
-                                    .file_path()
-                                    .and_then(|p| p.file_name())
-                                    .map_or_else(|| "untitled".to_string(), |n| n.to_string_lossy().into_owned()),
-                                dirty: editor.is_dirty(),
-                            }
-                        })
-                        .collect();
-                    self.tab_rects = crate::tabs::draw_tab_bar(
-                        &mut self.doc_engine.text_engine,
-                        &mut self.scene,
-                        &self.doc_engine.theme,
-                        &BarRect {
-                            x0: 0.0,
-                            y0: tab_top,
-                            x1: width as f64,
-                            y1: tab_top + (TAB_BAR_H * state.scale) as f64,
-                        },
-                        &labels,
-                        self.active_tab,
-                        self.tab_hover,
-                        state.scale,
-                    );
-
                     // Overlays on top of everything (unclipped): the autocomplete
                     // dropdown takes priority over the hover popover.
                     let ac_open = self
@@ -3456,6 +4097,48 @@ impl ApplicationHandler<WritEvent> for App {
                     // chrome strip, so the document reflows above it.
                 }
 
+                // egui chrome frame (menu bar). Picked commands run after present.
+                let menu_state = MenuState {
+                    outline_open: self.doc_engine.editor.outline_open(),
+                    tab_count: self.tabs.len(),
+                };
+                let tab_infos: Vec<TabInfo> = self
+                    .tabs
+                    .iter()
+                    .map(|t| {
+                        let editor = t
+                            .state
+                            .as_ref()
+                            .map_or(&self.doc_engine.editor, |s| &s.editor);
+                        let path = editor.file_path().map(Path::to_path_buf);
+                        TabInfo {
+                            name: doc_name(editor),
+                            path,
+                            dirty: editor.is_dirty(),
+                        }
+                    })
+                    .collect();
+                let active_tab = self.active_tab;
+                let mut picked = None;
+                let mut answer = None;
+                let ui_frame = self.ui.as_mut().map(|ui| {
+                    ui.run(&state.window, dialog_view.is_some(), |ui| {
+                        let menu = menu_bar(ui, &menu_state);
+                        let tab = tab_strip(ui, &tab_infos, active_tab);
+                        picked = menu.or(tab);
+                        if let Some(view) = &dialog_view {
+                            answer = dialogs::show(ui.ctx(), view);
+                        }
+                    })
+                });
+
+                // The document scene sits below the menu bar.
+                self.frame_scene.reset();
+                self.frame_scene.append(
+                    &self.scene,
+                    Some(Affine::translate((0.0, state.top_inset() as f64))),
+                );
+
                 let dev = &self.context.devices[state.surface.dev_id];
                 let params = RenderParams {
                     base_color: peniko_color(self.doc_engine.theme.background),
@@ -3472,7 +4155,7 @@ impl ApplicationHandler<WritEvent> for App {
                     .render_to_texture(
                         &dev.device,
                         &dev.queue,
-                        &self.scene,
+                        &self.frame_scene,
                         &state.surface.target_view,
                         &params,
                     )
@@ -3484,18 +4167,34 @@ impl ApplicationHandler<WritEvent> for App {
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                             label: Some("surface_blit"),
                         });
+                let surface_view = surface_texture
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
                 state.surface.blitter.copy(
                     &dev.device,
                     &mut encoder,
                     &state.surface.target_view,
-                    &surface_texture
-                        .texture
-                        .create_view(&wgpu::TextureViewDescriptor::default()),
+                    &surface_view,
                 );
+                if let (Some(ui), Some(frame)) = (self.ui.as_mut(), ui_frame) {
+                    ui.paint(
+                        &dev.device,
+                        &dev.queue,
+                        &mut encoder,
+                        &surface_view,
+                        [state.surface.config.width, state.surface.config.height],
+                        frame,
+                    );
+                }
                 dev.queue.submit([encoder.finish()]);
                 state.window.pre_present_notify();
                 surface_texture.present();
                 self.frame_retry = FrameRetry::default();
+                if let Some(answer) = answer {
+                    self.answer_dialog(answer, event_loop);
+                } else if let Some(cmd) = picked {
+                    self.run_command(cmd, event_loop);
+                }
                 if profile::enabled() {
                     let t_end = Instant::now();
                     let (n, us) = profile::take_rebuilds();
@@ -3531,7 +4230,11 @@ impl ApplicationHandler<WritEvent> for App {
             && self.tabs.len() > 1
         {
             self.autotabs_returning = true;
-            eprintln!("[writ-droptest] all docs loaded | PSS {} | {}", self_pss(), allocator_stats());
+            eprintln!(
+                "[writ-droptest] all docs loaded | PSS {} | {}",
+                self_pss(),
+                allocator_stats()
+            );
             for i in (1..self.tabs.len()).rev() {
                 let before = malloc_bytes_in_use();
                 drop(self.tabs[i].state.take());
@@ -3540,7 +4243,11 @@ impl ApplicationHandler<WritEvent> for App {
                     (before as f64 - malloc_bytes_in_use() as f64) / 1048576.0
                 );
             }
-            eprintln!("[writ-droptest] only tab 0 left | PSS {} | {}", self_pss(), allocator_stats());
+            eprintln!(
+                "[writ-droptest] only tab 0 left | PSS {} | {}",
+                self_pss(),
+                allocator_stats()
+            );
         }
         if let Some(i) = self.pending_tab_switch.take() {
             self.switch_tab(i);
@@ -3605,7 +4312,8 @@ impl ApplicationHandler<WritEvent> for App {
             }
         }
         let now = Instant::now();
-        if self.frame_retry.take_due(now)
+        let ui_due = self.ui.as_mut().is_some_and(|ui| ui.take_due(now));
+        if (self.frame_retry.take_due(now) || ui_due)
             && let Some(state) = self.state.as_ref()
         {
             state.window.request_redraw();
@@ -3633,7 +4341,9 @@ impl ApplicationHandler<WritEvent> for App {
             self.last_drag_tick = None;
             None
         };
-        event_loop.set_control_flow(self.frame_retry.control_flow(drag_deadline));
+        let ui_deadline = self.ui.as_ref().and_then(UiLayer::repaint_deadline);
+        let other = [drag_deadline, ui_deadline].into_iter().flatten().min();
+        event_loop.set_control_flow(self.frame_retry.control_flow(other));
     }
 }
 
@@ -3669,10 +4379,10 @@ pub fn run() -> Result<()> {
         return snapshot(&path, w, h, scroll);
     }
 
-    let (editors, app_config) = load_editor_from_cli();
+    let (editors, missing, app_config) = load_editor_from_cli();
     let event_loop = EventLoop::<WritEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
-    let mut app = App::new(editors, app_config, proxy, runtime.handle().clone());
+    let mut app = App::new(editors, missing, app_config, proxy, runtime.handle().clone());
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -3681,26 +4391,49 @@ pub fn run() -> Result<()> {
 /// watching the file for external edits (the pivot use case — an agent edits the
 /// file, writ shows the live diff). With no args, falls back to the sample doc. Also
 /// loads the user config (theme + font) from `--config` or the default location.
-fn load_editor_from_cli() -> (Vec<Editor>, ResolvedConfig) {
+/// Also returns the paths that do not exist: they open as new, empty documents (created
+/// on save) and the user is told about them.
+fn load_editor_from_cli() -> (Vec<Editor>, Vec<PathBuf>, ResolvedConfig) {
     use clap::Parser;
 
     // No args → the demo showcase with default config.
     if std::env::args().len() <= 1 {
-        return (vec![demo_editor()], ResolvedConfig::default());
+        return (vec![demo_editor()], Vec::new(), ResolvedConfig::default());
     }
 
     let config = Config::parse();
     let app_config = config::load(config.config.as_deref());
     // `--demo`: showcase doc with a synthetic HEAD diff (no file needed).
     if config.demo {
-        return (vec![demo_editor()], app_config);
+        return (vec![demo_editor()], Vec::new(), app_config);
     }
-    let paths: Vec<std::path::PathBuf> = config.file.iter().chain(&config.files).cloned().collect();
+    let paths: Vec<PathBuf> = config.file.iter().chain(&config.files).cloned().collect();
     if paths.is_empty() {
-        return (vec![demo_editor()], app_config);
+        return (vec![demo_editor()], Vec::new(), app_config);
     }
+    let missing = paths.iter().filter(|p| !p.exists()).cloned().collect();
     let editors = paths.iter().map(|p| open_editor(p, &config)).collect();
-    (editors, app_config)
+    (editors, missing, app_config)
+}
+
+/// The startup notice for files given on the command line that do not exist.
+fn missing_files_notice(missing: &[PathBuf]) -> Option<PendingModal> {
+    if missing.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = missing.iter().map(|p| format!("•  {}", p.display())).collect();
+    let (title, intro) = if missing.len() == 1 {
+        ("File not found", "This file does not exist")
+    } else {
+        ("Files not found", "These files do not exist")
+    };
+    Some(PendingModal::Message {
+        title: title.to_string(),
+        text: format!(
+            "{intro}; it opens as an empty document and is created when you save:\n\n{}",
+            list.join("\n")
+        ),
+    })
 }
 
 /// Open one document as configured on the CLI: autosave, GitHub context (explicit
@@ -3725,7 +4458,10 @@ fn open_editor(path: &std::path::Path, config: &Config) -> Editor {
     // (and the shell can spawn validation for) any refs already in the file.
     editor.refresh_detection(0..usize::MAX);
 
-    if let Err(e) = editor.watch_file() {
+    // A missing file is reported by a dialog; watching fails when its folder is missing too.
+    if let Err(e) = editor.watch_file()
+        && path.exists()
+    {
         eprintln!("[writ] file watch failed: {e}");
     }
     editor
@@ -4237,6 +4973,23 @@ mod tests {
             retry.control_flow(Some(now + Duration::from_secs(1))),
             ControlFlow::WaitUntil(now + Duration::from_millis(100))
         );
+    }
+
+    #[test]
+    fn missing_files_notice_lists_each_path() {
+        assert!(missing_files_notice(&[]).is_none());
+        let one = missing_files_notice(&[PathBuf::from("a/x.md")]);
+        let Some(PendingModal::Message { title, text }) = one else {
+            panic!("expected a message");
+        };
+        assert_eq!(title, "File not found");
+        assert!(text.contains("a/x.md"));
+        let two = missing_files_notice(&[PathBuf::from("x.md"), PathBuf::from("y.md")]);
+        let Some(PendingModal::Message { title, text }) = two else {
+            panic!("expected a message");
+        };
+        assert_eq!(title, "Files not found");
+        assert!(text.contains("x.md") && text.contains("y.md"));
     }
 
     #[test]

@@ -1701,6 +1701,17 @@ impl Editor {
         Ok(())
     }
 
+    /// Save the buffer to `path` and make it the document's file. On failure the
+    /// document keeps its previous path (if any).
+    pub fn save_as(&mut self, path: PathBuf) -> std::io::Result<()> {
+        let previous = self.file_path.replace(path);
+        let result = self.save();
+        if result.is_err() {
+            self.file_path = previous;
+        }
+        result
+    }
+
     /// Hand the file-watch receiver to the shell so it can forward change
     /// notifications into the event loop (waking it) instead of polling on a timer.
     pub fn take_file_watch_rx(&mut self) -> Option<mpsc::Receiver<WatchKind>> {
@@ -2077,6 +2088,29 @@ let code = target(); // fenced block line
                 "scan {line_count} lines for {query:?}: {count} hits in {ms:.3} ms (text()+match_indices)",
             );
         }
+    }
+
+    /// Save As writes to the new path and adopts it; a failed write keeps the old path
+    /// and the unsaved state, so nothing is reported as saved that is not on disk.
+    #[test]
+    fn save_as_adopts_the_path_only_on_success() {
+        let dir = std::env::temp_dir().join(format!("writ_save_as_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = Editor::new("");
+        e.type_char('x');
+        assert!(e.is_dirty());
+
+        let bad = dir.join("missing-dir").join("a.md");
+        assert!(e.save_as(bad).is_err());
+        assert_eq!(e.file_path(), None);
+        assert!(e.is_dirty());
+
+        let good = dir.join("a.md");
+        e.save_as(good.clone()).unwrap();
+        assert_eq!(e.file_path(), Some(good.as_path()));
+        assert!(!e.is_dirty());
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "x");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Autosave (used by the GhostText daemon via `--autosave`) writes every edit back to

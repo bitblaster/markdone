@@ -75,6 +75,8 @@ pub mod buffer;
 pub mod callout;
 #[cfg(feature = "editor")]
 pub mod chrome;
+#[cfg(feature = "app")]
+pub mod commands;
 pub mod config;
 pub mod consts;
 #[cfg(feature = "editor")]
@@ -104,6 +106,8 @@ pub mod outline;
 #[cfg(feature = "app")]
 pub mod overlay;
 pub mod parser;
+#[cfg(feature = "app")]
+pub mod platform;
 pub mod paste;
 pub mod raster;
 pub mod render;
@@ -112,11 +116,11 @@ pub mod scrollbar;
 pub mod segment_map;
 #[cfg(feature = "app")]
 pub mod shell;
-#[cfg(feature = "app")]
-pub mod tabs;
 pub mod status_bar;
 pub mod table;
 pub mod text_engine;
 pub mod text_input;
 pub mod tokenize;
+#[cfg(feature = "app")]
+pub mod ui;
 pub mod validation;
