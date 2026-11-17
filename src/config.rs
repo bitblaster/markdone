@@ -53,7 +53,71 @@ pub struct Config {
     pub config: Option<PathBuf>,
 }
 
-/// The runtime config applied at app startup: the editor theme and the document font.
+/// Font size bounds (logical px) accepted from the config and the preferences.
+#[cfg(feature = "app")]
+pub const FONT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 6.0..=96.0;
+/// Text width bounds (logical px) for the "limited width" layout.
+#[cfg(feature = "app")]
+pub const MAX_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 400.0..=2400.0;
+
+/// What to do when an open file changes on disk and its document has no unsaved
+/// changes. (With unsaved changes the user is always asked.)
+#[cfg(feature = "app")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalChange {
+    /// Reload the document silently.
+    Reload,
+    /// Ask before reloading.
+    Ask,
+}
+
+#[cfg(feature = "app")]
+impl ExternalChange {
+    fn key(self) -> &'static str {
+        match self {
+            ExternalChange::Reload => "reload",
+            ExternalChange::Ask => "ask",
+        }
+    }
+}
+
+/// The settings editable in the Preferences window (saved to `config.toml`).
+#[cfg(feature = "app")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Preferences {
+    /// Document font size, logical px.
+    pub font_size: f32,
+    /// Text spans the whole window width instead of `max_width`.
+    pub full_width: bool,
+    /// Maximum text width (logical px) when not `full_width`.
+    pub max_width: f32,
+    /// Theme name: a built-in or a `[themes.<name>]` of the config file.
+    pub theme: String,
+    pub external_change: ExternalChange,
+    /// Compare the files with the disk when the window gets the focus or a tab is
+    /// activated (catches changes the file watcher misses, e.g. on network shares).
+    pub check_on_focus: bool,
+    /// Look up GitHub references (issues, PRs, users) found in documents: reads the
+    /// repository from `.git/config` and calls api.github.com.
+    pub github: bool,
+}
+
+#[cfg(feature = "app")]
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            font_size: FONT_SIZE,
+            full_width: false,
+            max_width: crate::consts::MAX_CONTENT_WIDTH,
+            theme: "dracula".to_string(),
+            external_change: ExternalChange::Reload,
+            check_on_focus: true,
+            github: false,
+        }
+    }
+}
+
+/// The runtime config: the resolved theme, the document font and the preferences.
 /// Built by [`load`] from `config.toml`, falling back to the built-in defaults.
 #[cfg(feature = "app")]
 #[derive(Debug, Clone)]
@@ -62,6 +126,9 @@ pub struct ResolvedConfig {
     /// The document font family; `None` = system monospace.
     pub font_family: Option<String>,
     pub font_size: f32,
+    pub prefs: Preferences,
+    /// Theme names to offer: the built-ins, then the config's own `[themes.*]`.
+    pub theme_names: Vec<String>,
 }
 
 #[cfg(feature = "app")]
@@ -71,6 +138,8 @@ impl Default for ResolvedConfig {
             theme: EditorTheme::dracula(),
             font_family: None,
             font_size: FONT_SIZE,
+            prefs: Preferences::default(),
+            theme_names: EditorTheme::BUILTIN_NAMES.iter().map(|n| n.to_string()).collect(),
         }
     }
 }
@@ -83,6 +152,9 @@ impl Default for ResolvedConfig {
 struct FileConfig {
     font: Option<FontSpec>,
     theme: Option<ThemeSpec>,
+    editor: Option<EditorSpec>,
+    files: Option<FilesSpec>,
+    network: Option<NetworkSpec>,
     /// User-defined named palettes, selectable via `theme.name`.
     #[serde(default)]
     themes: HashMap<String, Palette>,
@@ -94,6 +166,30 @@ struct FileConfig {
 struct FontSpec {
     family: Option<String>,
     size: Option<f32>,
+}
+
+#[cfg(feature = "app")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditorSpec {
+    full_width: Option<bool>,
+    max_width: Option<f32>,
+}
+
+#[cfg(feature = "app")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilesSpec {
+    /// "reload" or "ask".
+    on_external_change: Option<String>,
+    check_on_focus: Option<bool>,
+}
+
+#[cfg(feature = "app")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkSpec {
+    github: Option<bool>,
 }
 
 #[cfg(feature = "app")]
@@ -176,9 +272,9 @@ fn parse_hex(s: &str) -> Result<Color, String> {
     }
 }
 
-/// The default config path: `<platform config dir>/writ/config.toml`.
+/// The default config path: `<platform config dir>/markdone/config.toml`.
 #[cfg(feature = "app")]
-fn default_config_path() -> Option<PathBuf> {
+pub fn default_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("markdone").join("config.toml"))
 }
 
@@ -218,8 +314,17 @@ pub fn load(explicit: Option<&Path>) -> ResolvedConfig {
 #[cfg(feature = "app")]
 fn resolve(file: FileConfig) -> ResolvedConfig {
     let mut cfg = ResolvedConfig::default();
+    let mut custom: Vec<String> = file
+        .themes
+        .keys()
+        .filter(|n| !cfg.theme_names.contains(n))
+        .cloned()
+        .collect();
+    custom.sort();
+    cfg.theme_names.extend(custom);
     if let Some(theme) = &file.theme {
         if let Some(name) = &theme.name {
+            cfg.prefs.theme = name.clone();
             if let Some(custom) = file.themes.get(name) {
                 let mut base = EditorTheme::dracula();
                 custom.apply(&mut base);
@@ -242,8 +347,9 @@ fn resolve(file: FileConfig) -> ResolvedConfig {
             }
         }
         if let Some(size) = font.size {
-            if size.is_finite() && (6.0..=96.0).contains(&size) {
+            if size.is_finite() && FONT_SIZE_RANGE.contains(&size) {
                 cfg.font_size = size;
+                cfg.prefs.font_size = size;
             } else {
                 eprintln!(
                     "[markdone] config: font.size {size} out of range (6–96), using {}",
@@ -252,7 +358,84 @@ fn resolve(file: FileConfig) -> ResolvedConfig {
             }
         }
     }
+    if let Some(editor) = &file.editor {
+        if let Some(full) = editor.full_width {
+            cfg.prefs.full_width = full;
+        }
+        if let Some(w) = editor.max_width {
+            if w.is_finite() && MAX_WIDTH_RANGE.contains(&w) {
+                cfg.prefs.max_width = w;
+            } else {
+                eprintln!("[markdone] config: editor.max_width {w} out of range (400–2400)");
+            }
+        }
+    }
+    if let Some(files) = &file.files {
+        match files.on_external_change.as_deref() {
+            Some("reload") => cfg.prefs.external_change = ExternalChange::Reload,
+            Some("ask") => cfg.prefs.external_change = ExternalChange::Ask,
+            Some(other) => eprintln!(
+                "[markdone] config: files.on_external_change '{other}' (expected reload or ask)"
+            ),
+            None => {}
+        }
+        if let Some(check) = files.check_on_focus {
+            cfg.prefs.check_on_focus = check;
+        }
+    }
+    if let Some(network) = &file.network
+        && let Some(github) = network.github
+    {
+        cfg.prefs.github = github;
+    }
     cfg
+}
+
+/// Write `prefs` into the config file at `path`, keeping everything else in it
+/// (comments, custom themes, overrides). A missing file is created. A file that does
+/// not parse is left untouched (error).
+#[cfg(feature = "app")]
+pub fn save_preferences(path: &Path, prefs: &Preferences) -> std::io::Result<()> {
+    use toml_edit::{DocumentMut, Item, Table, value};
+
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let mut doc: DocumentMut = text.parse().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not valid TOML: {e}", path.display()),
+        )
+    })?;
+    let mut set = |table: &str, key: &str, item: Item| {
+        let entry = doc.entry(table).or_insert_with(|| Item::Table(Table::new()));
+        if let Some(t) = entry.as_table_like_mut() {
+            t.insert(key, item);
+        }
+    };
+    // Whole numbers are written without a fraction ("18", not "18.0").
+    let number = |x: f32| {
+        if x.fract() == 0.0 {
+            value(x as i64)
+        } else {
+            value(f64::from(x))
+        }
+    };
+    set("font", "size", number(prefs.font_size));
+    set("theme", "name", value(prefs.theme.as_str()));
+    set("editor", "full_width", value(prefs.full_width));
+    set("editor", "max_width", number(prefs.max_width));
+    set("files", "on_external_change", value(prefs.external_change.key()));
+    set("files", "check_on_focus", value(prefs.check_on_focus));
+    set("network", "github", value(prefs.github));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, doc.to_string())?;
+    std::fs::rename(&tmp, path)
 }
 
 #[cfg(all(test, feature = "app"))]
@@ -341,5 +524,75 @@ mod tests {
     #[test]
     fn unknown_key_is_rejected() {
         assert!(toml::from_str::<FileConfig>("[font]\nfamly = \"x\"").is_err());
+    }
+
+    #[test]
+    fn preference_sections_parse() {
+        let file: FileConfig = toml::from_str(
+            "[editor]\nfull_width = true\nmax_width = 1000\n\
+             [files]\non_external_change = \"ask\"\ncheck_on_focus = false\n\
+             [network]\ngithub = true\n",
+        )
+        .unwrap();
+        let p = resolve(file).prefs;
+        assert!(p.full_width);
+        assert_eq!(p.max_width, 1000.0);
+        assert_eq!(p.external_change, ExternalChange::Ask);
+        assert!(!p.check_on_focus);
+        assert!(p.github);
+        // Defaults: limited width, reload, check on focus, no network.
+        let d = resolve(FileConfig::default()).prefs;
+        assert_eq!(d, Preferences::default());
+        assert!(!d.github);
+    }
+
+    #[test]
+    fn custom_themes_are_offered_after_the_builtins() {
+        let file: FileConfig =
+            toml::from_str("[themes.zeta]\nbackground = \"#000000\"\n[themes.alpha]\n").unwrap();
+        let names = resolve(file).theme_names;
+        let n = EditorTheme::BUILTIN_NAMES.len();
+        assert_eq!(names[..n], EditorTheme::BUILTIN_NAMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()[..]);
+        assert_eq!(names[n..], ["alpha".to_string(), "zeta".to_string()]);
+    }
+
+    /// Saving the preferences keeps the user's comments, custom themes and unrelated
+    /// keys, and the result loads back to the same preferences.
+    #[test]
+    fn save_preferences_round_trips_and_keeps_comments() {
+        let dir = std::env::temp_dir().join(format!("markdone_prefs_{}", std::process::id()));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            "# my comment\n[font]\nfamily = \"JetBrains Mono\" # inline\nsize = 18\n\n\
+             [themes.mine]\nbackground = \"#101010\"\n",
+        )
+        .unwrap();
+        let prefs = Preferences {
+            font_size: 20.0,
+            full_width: true,
+            max_width: 960.0,
+            theme: "mine".into(),
+            external_change: ExternalChange::Ask,
+            check_on_focus: false,
+            github: true,
+        };
+        save_preferences(&path, &prefs).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# my comment"));
+        assert!(text.contains("# inline"));
+        assert!(text.contains("[themes.mine]"));
+        assert!(text.contains("size = 20\n"), "{text}");
+        let loaded = load(Some(&path));
+        assert_eq!(loaded.prefs, prefs);
+        assert_eq!(loaded.font_family.as_deref(), Some("JetBrains Mono"));
+        assert_eq!(loaded.theme.background.to_rgba8().r, 0x10);
+
+        // A file that is not valid TOML is never overwritten.
+        std::fs::write(&path, "[font\n").unwrap();
+        assert!(save_preferences(&path, &prefs).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[font\n");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

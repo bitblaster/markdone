@@ -169,6 +169,25 @@ impl EditorTheme {
         }
     }
 
+    /// Config names of the built-in themes.
+    pub const BUILTIN_NAMES: &'static [&'static str] = &[
+        "dracula",
+        "nord",
+        "solarized-dark",
+        "gruvbox-dark",
+        "tokyo-night",
+        "catppuccin-mocha",
+        "solarized-light",
+        "catppuccin-latte",
+    ];
+
+    /// Whether this is a light theme (light background).
+    pub fn is_light(&self) -> bool {
+        let c = self.background.to_rgba8();
+        let luma = 0.299 * f32::from(c.r) + 0.587 * f32::from(c.g) + 0.114 * f32::from(c.b);
+        luma > 128.0
+    }
+
     /// A built-in theme by its config name, or `None` if unknown.
     pub fn by_name(name: &str) -> Option<Self> {
         match name {
@@ -227,6 +246,16 @@ impl Default for EditorTheme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The built-in list resolves by name, and light/dark detection matches the presets.
+    #[test]
+    fn builtin_names_resolve_and_light_themes_are_detected() {
+        for name in EditorTheme::BUILTIN_NAMES {
+            let theme = EditorTheme::by_name(name).expect(name);
+            let light = name.ends_with("-light") || *name == "catppuccin-latte";
+            assert_eq!(theme.is_light(), light, "{name}");
+        }
+    }
 
     /// Every built-in preset resolves, and no two share a background — a cheap guard
     /// against a copy-paste slip leaving two presets identical.

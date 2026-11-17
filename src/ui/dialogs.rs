@@ -9,8 +9,6 @@
 pub enum DialogView {
     /// Documents with unsaved changes are about to be closed (file names, in tab order).
     Unsaved { names: Vec<String>, quitting: bool },
-    /// The file of the active document changed on disk while it had unsaved changes.
-    DiskConflict { name: String },
     Message { title: String, text: String },
 }
 
@@ -67,19 +65,6 @@ pub fn show(ctx: &egui::Context, view: &DialogView) -> Option<Answer> {
                     &[("Cancel", Answer::Cancel), (save, Answer::Save)],
                 );
             }
-            DialogView::DiskConflict { name } => {
-                heading(ui, &format!("“{name}” changed on disk"));
-                ui.label(
-                    "Another program modified this file, but it also has unsaved changes \
-                     here. Reloading replaces your changes with the version on disk; \
-                     keeping yours means the next save overwrites the disk version.",
-                );
-                answer = buttons(
-                    ui,
-                    &[("Reload from Disk", Answer::Reload)],
-                    &[("Keep My Changes", Answer::KeepMine)],
-                );
-            }
             DialogView::Message { title, text } => {
                 heading(ui, title);
                 ui.label(text);
@@ -87,14 +72,76 @@ pub fn show(ctx: &egui::Context, view: &DialogView) -> Option<Answer> {
             }
         }
     });
-    // Escape (or a click outside the dialog) takes the choice that loses nothing.
-    if answer.is_none() && response.should_close() {
+    // Escape takes the choice that loses nothing. A click outside does nothing: the
+    // dialog waits for a button.
+    if answer.is_none()
+        && response.is_top_modal
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
         answer = Some(match view {
             DialogView::Unsaved { .. } => Answer::Cancel,
-            DialogView::DiskConflict { .. } => Answer::KeepMine,
             DialogView::Message { .. } => Answer::Ok,
         });
     }
+    answer
+}
+
+/// The file of the active document changed on disk. Shown over the document area only
+/// (`doc_rect`, in points): the menu and the tabs stay usable, and the question waits
+/// on its tab until a button is pressed. `unsaved`: the document has unsaved changes,
+/// which a reload would lose.
+pub fn disk_conflict(
+    ctx: &egui::Context,
+    doc_rect: egui::Rect,
+    name: &str,
+    unsaved: bool,
+) -> Option<Answer> {
+    // Backdrop over the document: dims it and takes the pointer.
+    egui::Area::new(egui::Id::new("writ-conflict-backdrop"))
+        .order(egui::Order::Middle)
+        .fixed_pos(doc_rect.min)
+        .constrain(false)
+        .show(ctx, |ui| {
+            let (rect, _) = ui.allocate_exact_size(doc_rect.size(), egui::Sense::click_and_drag());
+            ui.painter()
+                .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(100));
+        });
+    let mut answer = None;
+    egui::Area::new(egui::Id::new("writ-conflict"))
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::CENTER_CENTER)
+        .fixed_pos(doc_rect.center())
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_width(WIDTH);
+                ui.spacing_mut().item_spacing.y = 10.0;
+                heading(ui, &format!("“{name}” changed on disk"));
+                if unsaved {
+                    ui.label(
+                        "Another program modified this file, but it also has unsaved \
+                         changes here. Reloading replaces your changes with the version on \
+                         disk; keeping yours marks the document as modified, and the next \
+                         save overwrites the disk version.",
+                    );
+                    answer = buttons(
+                        ui,
+                        &[("Reload from Disk", Answer::Reload)],
+                        &[("Keep My Changes", Answer::KeepMine)],
+                    );
+                } else {
+                    ui.label(
+                        "Another program modified this file. Reload it to see the changes, \
+                         or keep the current version (marked as modified: the next save \
+                         overwrites the disk version).",
+                    );
+                    answer = buttons(
+                        ui,
+                        &[],
+                        &[("Keep Current Version", Answer::KeepMine), ("Reload", Answer::Reload)],
+                    );
+                }
+            });
+        });
     answer
 }
 

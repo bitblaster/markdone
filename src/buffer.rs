@@ -955,6 +955,12 @@ impl Buffer {
         self.history.set_saved();
     }
 
+    /// Mark the buffer as differing from the file even with no edit (e.g. the user kept
+    /// this version over a newer one on disk). No undo step leads back to "saved".
+    pub fn mark_dirty(&mut self) {
+        self.history.clear_saved();
+    }
+
     pub fn insert(&mut self, byte_offset: usize, text: &str, cursor_before: usize) -> usize {
         let cursor_after = byte_offset + text.len();
         let edit = TextEdit::new(

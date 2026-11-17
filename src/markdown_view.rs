@@ -29,7 +29,7 @@ use vello::kurbo::{Affine, Rect};
 use vello::peniko::Fill;
 
 use crate::buffer::Buffer;
-use crate::consts::{FONT_SIZE, LINE_HEIGHT, PADDING};
+use crate::consts::{FONT_SIZE, LINE_HEIGHT, MAX_CONTENT_WIDTH, PADDING};
 use crate::doc_layout::{DocLayout, HeightCache, LayoutParams, LineCache, RenderCache, TableCache};
 use crate::editor::EditorTheme;
 use crate::image_cache::{ImageCache, decode};
@@ -125,6 +125,7 @@ impl MarkdownView {
             base_font_size: FONT_SIZE,
             line_height: LINE_HEIGHT,
             fg: peniko_color(self.theme.foreground),
+            max_content_width: Some(MAX_CONTENT_WIDTH),
         };
         // `usize::MAX` is a safe "no cursor" sentinel: `build` clamps it to `len_bytes`
         // for the caret-line lookup, and `cursor_key_for` never reports any line as

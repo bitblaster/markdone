@@ -176,6 +176,9 @@ pub struct Editor {
     file_watcher_rx: Option<mpsc::Receiver<WatchKind>>,
     /// mtime after our own last save, so the watcher can skip self-writes.
     last_save_mtime: Option<SystemTime>,
+    /// Modification time of the file as of the last load, reload or save: a different
+    /// time on disk means the file changed since (see [`Self::changed_on_disk`]).
+    disk_mtime: Option<SystemTime>,
     save_generation: u64,
 }
 
@@ -260,6 +263,7 @@ impl Editor {
             file_watcher: None,
             file_watcher_rx: None,
             last_save_mtime: None,
+            disk_mtime: None,
             save_generation: 0,
         }
     }
@@ -270,6 +274,7 @@ impl Editor {
         let content = std::fs::read_to_string(path).unwrap_or_default();
         let mut editor = Self::new(&content);
         editor.file_path = Some(path.to_path_buf());
+        editor.note_disk_state();
         editor.refresh_git_base();
         editor.seed_default_collapsed_callouts();
         editor
@@ -327,6 +332,11 @@ impl Editor {
 
     pub fn mark_clean(&mut self) {
         self.state.buffer.mark_clean();
+    }
+
+    /// Mark the document as unsaved without editing it (see `Buffer::mark_dirty`).
+    pub fn mark_dirty(&mut self) {
+        self.state.buffer.mark_dirty();
     }
 
     pub fn set_input_blocked(&mut self, blocked: bool) {
@@ -1695,6 +1705,7 @@ impl Editor {
         writer.flush()?;
         if let Ok(metadata) = std::fs::metadata(&path) {
             self.last_save_mtime = metadata.modified().ok();
+            self.disk_mtime = self.last_save_mtime;
         }
         self.state.buffer.mark_clean();
         self.save_generation += 1;
@@ -1716,6 +1727,28 @@ impl Editor {
     /// notifications into the event loop (waking it) instead of polling on a timer.
     pub fn take_file_watch_rx(&mut self) -> Option<mpsc::Receiver<WatchKind>> {
         self.file_watcher_rx.take()
+    }
+
+    /// Record the file's current modification time as seen: call after the buffer was
+    /// brought in line with the disk (reload), or the user chose to keep the buffer.
+    pub fn note_disk_state(&mut self) {
+        self.disk_mtime = self
+            .file_path
+            .as_deref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok());
+    }
+
+    /// Whether the file's modification time differs from the one last seen (a stat; no
+    /// read). False for an untitled document or a file that cannot be read.
+    pub fn changed_on_disk(&self) -> bool {
+        let Some(path) = self.file_path.as_deref() else {
+            return false;
+        };
+        match std::fs::metadata(path).and_then(|m| m.modified()) {
+            Ok(mtime) => Some(mtime) != self.disk_mtime,
+            Err(_) => false,
+        }
     }
 
     pub fn last_save_mtime(&self) -> Option<SystemTime> {
@@ -2088,6 +2121,24 @@ let code = target(); // fenced block line
                 "scan {line_count} lines for {query:?}: {count} hits in {ms:.3} ms (text()+match_indices)",
             );
         }
+    }
+
+    /// Keeping the buffer over a newer disk version marks it unsaved, and no undo / redo
+    /// makes it look saved again; the next save makes it clean.
+    #[test]
+    fn mark_dirty_survives_undo_until_saved() {
+        let mut e = Editor::new("abc");
+        e.type_char('x');
+        e.mark_clean();
+        assert!(!e.is_dirty());
+        e.mark_dirty();
+        assert!(e.is_dirty());
+        e.undo();
+        assert!(e.is_dirty());
+        e.redo();
+        assert!(e.is_dirty());
+        e.mark_clean();
+        assert!(!e.is_dirty());
     }
 
     /// Save As writes to the new path and adopts it; a failed write keeps the old path

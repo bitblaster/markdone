@@ -60,6 +60,8 @@ pub fn menu_bar(ui: &mut egui::Ui, state: &MenuState) -> Option<Command> {
                         ui.separator();
                         item(ui, "Find…", Command::Find, true, &mut picked);
                         item(ui, "Replace…", Command::Replace, true, &mut picked);
+                        ui.separator();
+                        item(ui, "Preferences…", Command::Preferences, true, &mut picked);
                     });
                     ui.menu_button("View", |ui| {
                         let toc = egui::Button::selectable(state.outline_open, "Table of Contents")
@@ -68,6 +70,10 @@ pub fn menu_bar(ui: &mut egui::Ui, state: &MenuState) -> Option<Command> {
                             picked = Some(Command::ToggleOutline);
                             ui.close();
                         }
+                        ui.separator();
+                        item(ui, "Zoom In", Command::ZoomIn, true, &mut picked);
+                        item(ui, "Zoom Out", Command::ZoomOut, true, &mut picked);
+                        item(ui, "Reset Zoom", Command::ResetZoom, true, &mut picked);
                         ui.separator();
                         let multi = state.tab_count > 1;
                         item(ui, "Next Tab", Command::NextTab, multi, &mut picked);

@@ -1,12 +1,31 @@
-# writ configuration — copy to ~/.config/writ/config.toml (or pass --config <path>).
+# Markdone configuration — copy to ~/.config/markdone/config.toml (or pass --config <path>).
 # Everything here is optional; omitted keys fall back to the built-in defaults.
+# Edit → Preferences changes the settings below and keeps your comments.
 
 [font]
-# A monospace font family. writ verifies it is fixed-pitch at startup and falls back
+# A monospace font family. Markdone verifies it is fixed-pitch at startup and falls back
 # to the system monospace (with a warning) if it isn't, or if the font isn't installed.
 family = "JetBrains Mono"
 # Base font size in logical pixels (default 18, clamped to 6–96).
 size = 18.0
+
+[editor]
+# Text spans the whole window (true) or at most `max_width` logical pixels (default).
+full_width = false
+max_width = 880
+
+[files]
+# When an open file changes on disk and has no unsaved changes: "reload" (default) or
+# "ask". A document with unsaved changes is never reloaded without asking.
+on_external_change = "reload"
+# Also compare the files with the disk when the window gets the focus or a tab is
+# selected (catches changes the file watcher misses, e.g. on network shares).
+check_on_focus = true
+
+[network]
+# Look up GitHub issues / pull requests / users referenced in documents: reads the
+# repository from .git/config and calls api.github.com. Off by default.
+github = false
 
 [theme]
 # A built-in preset, or the name of a custom [themes.*] you define below. Built-ins:

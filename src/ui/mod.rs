@@ -26,6 +26,7 @@ use crate::editor::EditorTheme;
 
 pub mod dialogs;
 pub mod menu;
+pub mod preferences;
 pub mod tabs;
 
 /// Height of the top menu bar, in logical px.
@@ -54,6 +55,8 @@ pub struct UiLayer {
     /// The pointer left egui's areas since the last [`Self::take_cursor_released`]: the
     /// editor must re-apply its own cursor even if its cached icon did not change.
     cursor_released: bool,
+    /// The pointer is over egui (bars, a menu, a dialog) as of its last move.
+    pointer_over: bool,
 }
 
 impl UiLayer {
@@ -65,8 +68,6 @@ impl UiLayer {
         ui_font: Option<(Vec<u8>, u32)>,
     ) -> Self {
         let ctx = egui::Context::default();
-        ctx.set_theme(egui::Theme::Dark);
-        ctx.set_style_of(egui::Theme::Dark, style_from_theme(theme));
         if let Some((data, index)) = ui_font {
             ctx.set_fonts(fonts_with_ui_font(data, index));
         }
@@ -80,6 +81,7 @@ impl UiLayer {
             Some(max_texture_side),
         );
         let renderer = Renderer::new(device, format, RendererOptions::default());
+        Self::apply_theme(&ctx, theme);
         Self {
             ctx,
             winit,
@@ -88,7 +90,24 @@ impl UiLayer {
             egui_ime: false,
             repaint_at: None,
             cursor_released: false,
+            pointer_over: false,
         }
+    }
+
+    /// Restyle the chrome for a new editor theme (light or dark).
+    pub fn set_theme(&mut self, window: &Window, theme: &EditorTheme) {
+        Self::apply_theme(&self.ctx, theme);
+        window.request_redraw();
+    }
+
+    fn apply_theme(ctx: &egui::Context, theme: &EditorTheme) {
+        let mode = if theme.is_light() {
+            egui::Theme::Light
+        } else {
+            egui::Theme::Dark
+        };
+        ctx.set_theme(mode);
+        ctx.set_style_of(mode, style_from_theme(theme));
     }
 
     /// The menu bar height in device px for the given scale factor.
@@ -100,6 +119,30 @@ impl UiLayer {
     /// must not see it. Requests a redraw when egui needs a new frame.
     pub fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
         let response = self.winit.on_window_event(window, event);
+        // Pointer moves over egui belong to egui: the editor must not react to them (its
+        // hover would set the text cursor under an open menu). Decided by position: the
+        // bars at the top, or any egui area (menu, popup, dialog) drawn last frame.
+        if let WindowEvent::CursorMoved { position, .. } = event {
+            let ppp = self.ctx.pixels_per_point();
+            let pos = egui::pos2(position.x as f32 / ppp, position.y as f32 / ppp);
+            let over = (position.y as f32) < Self::top_inset(window.scale_factor() as f32)
+                || area_at(&self.ctx, pos);
+            if over && !self.pointer_over {
+                // egui-winit sets the cursor only when its own icon changes, and it does
+                // not know what the editor set: start from the default arrow.
+                window.set_cursor(winit::window::CursorIcon::Default);
+            } else if !over && self.pointer_over {
+                self.cursor_released = true;
+            }
+            self.pointer_over = over;
+            if over {
+                window.request_redraw();
+                return true;
+            }
+        }
+        if let WindowEvent::CursorLeft { .. } = event {
+            self.pointer_over = false;
+        }
         let repaint = match event {
             // A move over the document does not concern egui unless a menu is open or
             // the pointer is in (or just left) the bar: no frame for that.
@@ -261,6 +304,14 @@ impl UiLayer {
     }
 }
 
+/// Whether an egui area (menu, popup, dialog, backdrop) lies under `pos` (points), as of
+/// the last frame. The background layer, which holds the bars and spans the whole
+/// window, does not count: over the document it is empty.
+fn area_at(ctx: &egui::Context, pos: egui::Pos2) -> bool {
+    ctx.layer_id_at(pos)
+        .is_some_and(|layer| layer.order != egui::Order::Background)
+}
+
 fn color32(c: vello::peniko::Color) -> egui::Color32 {
     let rgba = c.to_rgba8();
     egui::Color32::from_rgba_unmultiplied(rgba.r, rgba.g, rgba.b, rgba.a)
@@ -309,8 +360,23 @@ fn style_from_theme(theme: &EditorTheme) -> egui::Style {
     let hover = color32(theme.selection);
     let accent = color32(theme.purple);
 
+    let light = theme.is_light();
+    // Faint lines and shadows: white on dark themes, black on light ones.
+    let faint = |alpha: u8| {
+        if light {
+            egui::Color32::from_black_alpha(alpha)
+        } else {
+            egui::Color32::from_white_alpha(alpha)
+        }
+    };
+    let shadow_alpha = if light { 40 } else { 110 };
+
     let v = &mut style.visuals;
-    *v = egui::Visuals::dark();
+    *v = if light {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    };
     v.panel_fill = surface;
     v.window_fill = surface;
     v.extreme_bg_color = background;
@@ -319,20 +385,20 @@ fn style_from_theme(theme: &EditorTheme) -> egui::Style {
     v.hyperlink_color = color32(theme.cyan);
     v.selection.bg_fill = hover;
     v.selection.stroke = Stroke::new(1.0, fg);
-    v.window_stroke = Stroke::new(1.0, egui::Color32::from_white_alpha(18));
+    v.window_stroke = Stroke::new(1.0, faint(18));
     v.window_corner_radius = CornerRadius::same(8);
     v.menu_corner_radius = CornerRadius::same(8);
     v.window_shadow = Shadow {
         offset: [0, 6],
         blur: 24,
         spread: 0,
-        color: egui::Color32::from_black_alpha(110),
+        color: egui::Color32::from_black_alpha(shadow_alpha),
     };
     v.popup_shadow = Shadow {
         offset: [0, 4],
         blur: 16,
         spread: 0,
-        color: egui::Color32::from_black_alpha(100),
+        color: egui::Color32::from_black_alpha(shadow_alpha - 10),
     };
     for w in [
         &mut v.widgets.noninteractive,
@@ -345,7 +411,10 @@ fn style_from_theme(theme: &EditorTheme) -> egui::Style {
         w.fg_stroke = Stroke::new(1.0, fg);
     }
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, dim);
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, egui::Color32::from_white_alpha(14));
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, faint(14));
+    // Text fields and other framed widgets: a visible border on both themes.
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, faint(30));
+    v.widgets.inactive.bg_fill = background;
     v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
     v.widgets.hovered.weak_bg_fill = hover;
     v.widgets.hovered.bg_fill = hover;
@@ -378,4 +447,49 @@ fn fonts_with_ui_font(data: Vec<u8>, index: u32) -> egui::FontDefinitions {
         .or_default()
         .insert(0, "system-ui".to_owned());
     fonts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(ctx: &egui::Context, popup: bool) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            egui::Panel::top("bar").exact_size(30.0).show(ui, |ui| {
+                ui.label("menu");
+            });
+            if popup {
+                egui::Area::new(egui::Id::new("popup"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(egui::pos2(100.0, 100.0))
+                    .show(ui.ctx(), |ui| {
+                        ui.allocate_exact_size(egui::vec2(200.0, 200.0), egui::Sense::click());
+                    });
+            }
+        });
+    }
+
+    /// The document area is not "over egui" (regression: the background layer spans the
+    /// window, and counting it swallowed every pointer move over the document), while a
+    /// popup is.
+    #[test]
+    fn only_real_areas_count_as_pointer_over_egui() {
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            frame(&ctx, true);
+        }
+        assert!(area_at(&ctx, egui::pos2(150.0, 150.0)), "popup");
+        assert!(!area_at(&ctx, egui::pos2(600.0, 500.0)), "document area");
+        for _ in 0..2 {
+            frame(&ctx, false);
+        }
+        assert!(!area_at(&ctx, egui::pos2(150.0, 150.0)), "popup closed");
+    }
 }

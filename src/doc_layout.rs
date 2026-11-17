@@ -20,7 +20,7 @@ use vello::kurbo::{Affine, Rect, Stroke};
 use vello::peniko::{Brush, Color, Fill, ImageBrush};
 
 use crate::buffer::RenderSnapshot;
-use crate::consts::{MAX_CONTENT_WIDTH, UI_LINE_HEIGHT};
+use crate::consts::UI_LINE_HEIGHT;
 use crate::diff::{DiffState, InlineChange};
 use crate::editor::EditorTheme;
 use crate::image_cache::{ImageCache, ImageState};
@@ -644,6 +644,8 @@ pub struct LayoutParams {
     pub base_font_size: f32,
     pub line_height: f32,
     pub fg: Color,
+    /// Maximum body width (logical px), centered in the region; `None` = the full width.
+    pub max_content_width: Option<f32>,
 }
 
 /// Build the ghost (deleted) lines that render above buffer line `new_line`,
@@ -1231,6 +1233,7 @@ impl DocLayout {
             base_font_size,
             line_height,
             fg,
+            max_content_width,
         } = *params;
         // Cap the body width for readability and center it *within the content region*
         // `[content_x0, content_x0 + content_w]`: the left margin is the base padding,
@@ -1238,7 +1241,7 @@ impl DocLayout {
         // padding. `left` is the draw origin and both margins for `max_advance`; because
         // caret/hit-test/draw all read `self.pad_x = left`, shrinking/shifting the region
         // moves them for free.
-        let inset = (content_w - MAX_CONTENT_WIDTH * scale).max(0.0) / 2.0;
+        let inset = max_content_width.map_or(0.0, |w| (content_w - w * scale).max(0.0) / 2.0);
         let left = content_x0 + inset.max(pad_x * scale);
         let max_advance = (content_w - 2.0 * (left - content_x0)).max(1.0);
         // Right edge of the doc region (stored as `self.width`), captured before the local
@@ -2530,7 +2533,7 @@ impl DocLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consts::{FONT_SIZE, LINE_HEIGHT, OUTLINE_WIDTH, PADDING};
+    use crate::consts::{FONT_SIZE, LINE_HEIGHT, MAX_CONTENT_WIDTH, OUTLINE_WIDTH, PADDING};
     use crate::text_engine::peniko_color;
 
     /// Device-px content width shared by the image-sizing tests (scale 1.0).
@@ -2549,6 +2552,7 @@ mod tests {
             base_font_size: FONT_SIZE,
             line_height: LINE_HEIGHT,
             fg: peniko_color(theme.foreground),
+            max_content_width: Some(MAX_CONTENT_WIDTH),
         }
     }
 
@@ -2898,6 +2902,7 @@ mod tests {
             base_font_size: FONT_SIZE,
             line_height: LINE_HEIGHT,
             fg: peniko_color(theme.foreground),
+            max_content_width: Some(MAX_CONTENT_WIDTH),
         };
         let mut build = |params: &LayoutParams| {
             DocLayout::build(

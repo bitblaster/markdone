@@ -40,7 +40,7 @@ use winit::event_loop::ControlFlow;
 
 use crate::buffer::Buffer;
 use crate::chrome::{BarRect, FindButtonRects, StatusInfo, draw_find_bar, draw_status_bar};
-use crate::config::{self, Config, ResolvedConfig};
+use crate::config::{self, Config, ExternalChange, Preferences, ResolvedConfig};
 use crate::consts::{
     CARET_WIDTH, FIND_ROW_H, FONT_SIZE, LINE_HEIGHT, MAX_CONTENT_WIDTH, OUTLINE_WIDTH, PADDING,
     STATUS_BAR_H, WHEEL_LINE_STEP,
@@ -170,6 +170,7 @@ use crate::text_input;
 use crate::session::Session;
 use crate::ui::UiLayer;
 use crate::ui::dialogs::{self, Answer, DialogView};
+use crate::ui::preferences;
 use crate::ui::menu::{MenuState, menu_bar};
 use crate::ui::tabs::{TabInfo, tab_strip};
 use crate::validation::{GitHubValidationCache, IssueOrPr, MentionableUser, ValidatedRefData};
@@ -220,6 +221,11 @@ fn window_title(editor: &Editor) -> String {
     } else {
         format!("{name} — Markdone")
     }
+}
+
+/// The body width cap for the layout: `None` (full width) or the configured maximum.
+fn content_width(prefs: &Preferences) -> Option<f32> {
+    (!prefs.full_width).then_some(prefs.max_width)
 }
 
 /// The document's display name: its file name, or "Untitled".
@@ -420,14 +426,14 @@ pub(crate) struct CloseRequest {
 enum PendingModal {
     /// Some tabs of `req` have unsaved changes (`dirty`, by id in tab order).
     Unsaved { req: CloseRequest, dirty: Vec<u64> },
-    /// The active tab's file changed on disk while its buffer had unsaved changes;
-    /// `data` is the disk version.
-    DiskConflict {
-        id: u64,
-        ticket: ReloadTicket,
-        data: ReloadData,
-    },
     Message { title: String, text: String },
+}
+
+/// A tab's file changed on disk and the user must choose between the disk version
+/// (`data`) and the buffer. Kept on the tab: the question shows whenever it is active.
+struct DiskConflict {
+    ticket: ReloadTicket,
+    data: ReloadData,
 }
 
 /// Concrete `RepaintSignal` for the winit shell: wakes the loop with `ImageLoaded` so a
@@ -607,6 +613,8 @@ struct DocEngine {
     theme: EditorTheme,
     /// Base document font size (logical px), from config; defaults to `FONT_SIZE`.
     font_size: f32,
+    /// Maximum body width (logical px); `None` = full window width.
+    max_content_width: Option<f32>,
     editor: Editor,
     doc: Option<DocLayout>,
     /// Shared cache of decoded standalone images, threaded into `DocLayout::build`.
@@ -682,6 +690,8 @@ struct Tab {
     anchor: (usize, f32),
     /// The file / git base changed on disk while in the background.
     file_stale: bool,
+    /// The file changed on disk and the user has not chosen which version to keep.
+    conflict: Option<DiskConflict>,
     base_stale: bool,
 }
 
@@ -731,6 +741,19 @@ struct App {
     session_path: Option<PathBuf>,
     /// The session as last written, to rewrite the file only when it changes.
     session_saved: Option<Session>,
+    /// The preferences in effect.
+    prefs: Preferences,
+    /// Themes offered in the Preferences window.
+    theme_names: Vec<String>,
+    /// The config file preferences are saved to.
+    config_path: Option<PathBuf>,
+    /// The Preferences window is shown.
+    prefs_open: bool,
+    /// Preferences changed and not yet saved: saved at this time (debounced, so dragging
+    /// a slider does not rewrite the file every frame).
+    prefs_save_at: Option<Instant>,
+    /// GitHub lookups for documents opened from now on.
+    github: GithubSetup,
     modifiers: ModifiersState,
     mouse_pos: (f32, f32),
     selection_drag: Option<SelectionDrag>,
@@ -816,6 +839,8 @@ impl App {
             config,
             session,
             session_path,
+            config_path,
+            github,
         } = startup;
         let active = active.min(editors.len() - 1);
         let mut editor = None;
@@ -836,6 +861,7 @@ impl App {
                 anchor: (0, 0.0),
                 file_stale: false,
                 base_stale: false,
+                conflict: None,
             });
         }
         let editor = editor.expect("at least one document");
@@ -866,6 +892,7 @@ impl App {
                 table_cache: TableCache::new(),
                 theme: config.theme,
                 font_size: config.font_size,
+                max_content_width: content_width(&config.prefs),
                 editor,
                 doc: None,
                 images: ImageCache::new(),
@@ -877,6 +904,12 @@ impl App {
             session,
             session_path,
             session_saved: None,
+            prefs: config.prefs.clone(),
+            theme_names: config.theme_names.clone(),
+            config_path,
+            prefs_open: false,
+            prefs_save_at: None,
+            github,
             modal: missing_files_notice(&missing),
             file_dialog_open: false,
             modifiers: ModifiersState::empty(),
@@ -974,6 +1007,8 @@ impl App {
         let id = self.tabs[i].id;
         if std::mem::take(&mut self.tabs[i].file_stale) {
             let _ = self.proxy.send_event(WritEvent::FileChanged(id));
+        } else {
+            self.check_active_on_disk();
         }
         if std::mem::take(&mut self.tabs[i].base_stale) {
             let _ = self.proxy.send_event(WritEvent::GitBaseChanged(id));
@@ -1020,10 +1055,6 @@ impl App {
         if dirty.is_empty() || self.ui.is_none() {
             self.finish_close(req, event_loop);
             return;
-        }
-        if let Some(PendingModal::DiskConflict { .. }) = self.modal {
-            // Replaced by this dialog: ask again about the disk version afterwards.
-            self.tabs[self.active_tab].file_stale = true;
         }
         self.modal = Some(PendingModal::Unsaved { req, dirty });
         self.redraw();
@@ -1085,7 +1116,10 @@ impl App {
             return false;
         }
         match self.tab_editor_mut(i).save() {
-            Ok(()) => true,
+            Ok(()) => {
+                self.tabs[i].conflict = None;
+                true
+            }
             Err(e) => {
                 let name = doc_name(self.tab_editor(i));
                 self.show_message("Could not save", format!("Saving “{name}” failed: {e}"));
@@ -1185,6 +1219,7 @@ impl App {
             eprintln!("[markdone] file watch failed: {e}");
         }
         forward_file_watch(editor, id, &proxy);
+        self.tabs[i].conflict = None;
         self.session.touch_recent(&path);
         self.redraw();
         if let Some(req) = then {
@@ -1215,7 +1250,7 @@ impl App {
             }
             let id = self.next_tab_id;
             self.next_tab_id += 1;
-            let mut editor = open_document(&path);
+            let mut editor = open_document(&path, &self.github, false);
             forward_file_watch(&mut editor, id, &self.proxy);
             self.tabs.push(Tab {
                 id,
@@ -1223,6 +1258,7 @@ impl App {
                 anchor: (0, 0.0),
                 file_stale: false,
                 base_stale: false,
+                conflict: None,
             });
             last = Some(self.tabs.len() - 1);
         }
@@ -1236,6 +1272,104 @@ impl App {
             self.remove_tabs(&[blank]);
         }
         self.redraw();
+    }
+
+    /// Apply new preferences: relayout / restyle what changed, and schedule the save.
+    fn apply_preferences(&mut self, new: Preferences) {
+        let old = std::mem::replace(&mut self.prefs, new);
+        if old == self.prefs {
+            return;
+        }
+        self.github.enabled = self.prefs.github;
+        let mut relayout = false;
+        if old.font_size != self.prefs.font_size {
+            self.doc_engine.font_size = self.prefs.font_size;
+            relayout = true;
+        }
+        if old.full_width != self.prefs.full_width || old.max_width != self.prefs.max_width {
+            self.doc_engine.max_content_width = content_width(&self.prefs);
+            relayout = true;
+        }
+        if old.theme != self.prefs.theme {
+            // The theme may be a custom one of the config file: save, then resolve it.
+            self.prefs_save_at = None;
+            self.save_preferences();
+            let theme = match self.config_path.as_deref() {
+                Some(path) if path.exists() => config::load(Some(path)).theme,
+                _ => EditorTheme::by_name(&self.prefs.theme).unwrap_or_else(EditorTheme::dracula),
+            };
+            self.set_theme(theme);
+            relayout = true;
+        } else {
+            self.prefs_save_at = Some(Instant::now() + Duration::from_millis(500));
+        }
+        if relayout {
+            self.relayout_all();
+        }
+    }
+
+    /// Install a new editor theme: document, chrome and window decoration.
+    fn set_theme(&mut self, theme: EditorTheme) {
+        if let Some(state) = self.state.as_ref() {
+            state.window.set_theme(Some(if theme.is_light() {
+                Theme::Light
+            } else {
+                Theme::Dark
+            }));
+            if let Some(ui) = self.ui.as_mut() {
+                ui.set_theme(&state.window, &theme);
+            }
+        }
+        self.doc_engine.theme = theme;
+    }
+
+    /// Drop the active document's layout caches and lay it out again (font size, width
+    /// or theme changed). Parked tabs drop theirs when parked, so they relayout on
+    /// activation anyway.
+    fn relayout_all(&mut self) {
+        let engine = &mut self.doc_engine;
+        engine.line_cache = LineCache::new();
+        engine.render_cache = RenderCache::new();
+        engine.height_cache = HeightCache::new();
+        engine.table_cache = TableCache::new();
+        if let Some(state) = self.state.as_mut() {
+            sync_image_raster_width(state.scale, self.doc_engine.max_content_width);
+            sync_find_chrome(&mut self.doc_engine, state);
+            state.window.request_redraw();
+        }
+    }
+
+    /// Write the preferences to the config file now.
+    fn save_preferences(&mut self) {
+        let Some(path) = self.config_path.clone() else {
+            return;
+        };
+        if let Err(e) = config::save_preferences(&path, &self.prefs) {
+            self.show_message(
+                "Could not save the preferences",
+                format!("Writing {} failed: {e}", path.display()),
+            );
+        }
+    }
+
+    /// Change the font size by `delta` px (zoom in/out), or reset it (`None`).
+    fn zoom(&mut self, delta: Option<f32>) {
+        let mut prefs = self.prefs.clone();
+        prefs.font_size = match delta {
+            Some(d) => (prefs.font_size + d)
+                .clamp(*config::FONT_SIZE_RANGE.start(), *config::FONT_SIZE_RANGE.end()),
+            None => FONT_SIZE,
+        };
+        self.apply_preferences(prefs);
+    }
+
+    /// With "check on focus" on, compare the active document with its file on disk
+    /// (a stat) and reload / ask if it changed.
+    fn check_active_on_disk(&mut self) {
+        if self.prefs.check_on_focus && self.doc_engine.editor.changed_on_disk() {
+            let id = self.tabs[self.active_tab].id;
+            let _ = self.proxy.send_event(WritEvent::FileChanged(id));
+        }
     }
 
     /// The session as it stands: the open documents (with a file) and the recent list.
@@ -1297,9 +1431,6 @@ impl App {
                 names: dirty.iter().filter_map(|&id| name(id)).collect(),
                 quitting: req.quit,
             },
-            PendingModal::DiskConflict { id, .. } => DialogView::DiskConflict {
-                name: name(*id).unwrap_or_default(),
-            },
             PendingModal::Message { title, text } => DialogView::Message {
                 title: title.clone(),
                 text: text.clone(),
@@ -1336,33 +1467,26 @@ impl App {
                 Answer::Discard => self.finish_close(req, event_loop),
                 _ => {}
             },
-            PendingModal::DiskConflict { id, ticket, data } => {
-                if id == self.tabs[self.active_tab].id && self.reloads.is_latest(ticket) {
-                    if answer == Answer::Reload {
-                        self.doc_engine.editor.apply_file_content(data.0);
-                        self.reloads.apply_base(
-                            &mut self.doc_engine.editor,
-                            ticket.base_generation,
-                            data.1,
-                        );
-                        self.after_reload();
-                    } else {
-                        // Keep the buffer; only the diff base follows HEAD.
-                        self.reloads.apply_base(
-                            &mut self.doc_engine.editor,
-                            ticket.base_generation,
-                            data.1,
-                        );
-                    }
-                }
-            }
             PendingModal::Message { .. } => {}
         }
-        // A disk change that arrived while another dialog was open is asked now.
-        if self.modal.is_none() && std::mem::take(&mut self.tabs[self.active_tab].file_stale) {
-            let _ = self
-                .proxy
-                .send_event(WritEvent::FileChanged(self.tabs[self.active_tab].id));
+        self.redraw();
+    }
+
+    /// Act on the answer to the active tab's disk conflict.
+    fn answer_conflict(&mut self, answer: Answer) {
+        let Some(DiskConflict { ticket, data }) = self.tabs[self.active_tab].conflict.take() else {
+            return;
+        };
+        let editor = &mut self.doc_engine.editor;
+        editor.note_disk_state();
+        if answer == Answer::Reload {
+            editor.apply_file_content(data.0);
+            self.reloads.apply_base(editor, ticket.base_generation, data.1);
+            self.after_reload();
+        } else {
+            // Keep the buffer: it now differs from the file, so it is unsaved.
+            editor.mark_dirty();
+            self.reloads.apply_base(editor, ticket.base_generation, data.1);
         }
         self.redraw();
     }
@@ -1398,6 +1522,7 @@ impl App {
             anchor: (0, 0.0),
             file_stale: false,
             base_stale: false,
+            conflict: None,
         });
         self.switch_tab(self.tabs.len() - 1);
     }
@@ -1426,6 +1551,19 @@ impl App {
         };
         match cmd {
             Command::New => self.open_blank_tab(),
+            Command::Preferences => self.prefs_open = true,
+            Command::ZoomIn => {
+                self.zoom(Some(1.0));
+                return;
+            }
+            Command::ZoomOut => {
+                self.zoom(Some(-1.0));
+                return;
+            }
+            Command::ResetZoom => {
+                self.zoom(None);
+                return;
+            }
             Command::OpenRecent(i) => {
                 self.open_recent(i);
                 return;
@@ -1718,10 +1856,13 @@ fn allocator_stats() -> String {
     String::new()
 }
 
-/// Widest useful raster for images at this window scale: the body never exceeds
-/// `MAX_CONTENT_WIDTH` logical px.
-fn sync_image_raster_width(scale: f32) {
-    crate::image_cache::set_max_raster_width((MAX_CONTENT_WIDTH * scale).ceil() as u32);
+/// Widest useful raster for images at this window scale: the body never exceeds the
+/// configured text width (or, at full width, a large screen's width).
+fn sync_image_raster_width(scale: f32, max_content_width: Option<f32>) {
+    // Full width: images may be shown wider; cap the decode at a large screen's width.
+    const FULL_WIDTH_RASTER: f32 = 1920.0;
+    let width = max_content_width.unwrap_or(FULL_WIDTH_RASTER);
+    crate::image_cache::set_max_raster_width((width * scale).ceil() as u32);
 }
 
 /// Free-function form of `App::sync_images` that borrows only the doc-engine (+ runtime
@@ -2248,6 +2389,7 @@ impl DocEngine {
             base_font_size: self.font_size,
             line_height: LINE_HEIGHT,
             fg: peniko_color(self.theme.foreground),
+            max_content_width: self.max_content_width,
         };
         let preedit = self.preedit.as_ref().map(|p| PreeditView {
             text: &p.text,
@@ -2858,42 +3000,21 @@ impl ApplicationHandler<WritEvent> for App {
                 return; // a newer read is on its way
             }
             // Unsaved changes and a different disk version: never overwrite silently.
+            // Without unsaved changes, ask only if the preferences say so.
             let editor = &self.doc_engine.editor;
-            if self.ui.is_some()
-                && editor.is_dirty()
-                && !editor.state.buffer.content_eq(&data.0)
-            {
-                let id = self.tabs[self.active_tab].id;
-                match &mut self.modal {
-                    None => self.modal = Some(PendingModal::DiskConflict { id, ticket, data }),
-                    Some(PendingModal::DiskConflict { ticket: t, data: d, .. }) => {
-                        *t = ticket;
-                        *d = data;
-                    }
-                    // Another dialog is open: ask once it is answered.
-                    Some(_) => self.tabs[self.active_tab].file_stale = true,
-                }
+            let ask = editor.is_dirty() || self.prefs.external_change == ExternalChange::Ask;
+            if self.ui.is_some() && ask && !editor.state.buffer.content_eq(&data.0) {
+                // A newer disk version replaces the one still waiting for an answer.
+                self.tabs[self.active_tab].conflict = Some(DiskConflict { ticket, data });
                 self.redraw();
                 return;
             }
             if self
                 .reloads
                 .apply_file(&mut self.doc_engine.editor, ticket, data)
-                && let Some(state) = self.state.as_ref()
             {
-                let (w, vh, scale) = state.viewport();
-                let window = state.window.clone();
-                apply_edit_effects(
-                    &mut self.doc_engine,
-                    &mut self.hovered,
-                    &self.runtime,
-                    &self.proxy,
-                    None,
-                    &window,
-                    w,
-                    scale,
-                    vh,
-                );
+                self.doc_engine.editor.note_disk_state();
+                self.after_reload();
             }
             return;
         }
@@ -2931,7 +3052,11 @@ impl ApplicationHandler<WritEvent> for App {
         // dark content. On Wayland CSD this also honors WINIT_WAYLAND_CSD_THEME.
         let attrs = Window::default_attributes()
             .with_title(self.title.clone())
-            .with_theme(Some(Theme::Dark));
+            .with_theme(Some(if self.doc_engine.theme.is_light() {
+                Theme::Light
+            } else {
+                Theme::Dark
+            }));
         // Application id (Wayland app_id / X11 WM_CLASS): matches `markdone.desktop`,
         // so the desktop shows the right icon and groups the windows.
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -2970,7 +3095,7 @@ impl ApplicationHandler<WritEvent> for App {
         );
 
         let scale = window.scale_factor() as f32;
-        sync_image_raster_width(scale);
+        sync_image_raster_width(scale, self.doc_engine.max_content_width);
         // Find is closed at startup, so no find-bar inset yet.
         let menu_bar = std::env::var_os("MARKDONE_NO_UI").is_none();
         let top_inset = if menu_bar {
@@ -3032,11 +3157,21 @@ impl ApplicationHandler<WritEvent> for App {
         };
         if let Some(ui) = self.ui.as_mut() {
             let menu_was_open = ui.is_active();
-            if ui.on_window_event(&state.window, &event) {
+            // A selection or scrollbar drag keeps following the pointer (and ends on
+            // release) even over the bars at the top.
+            let doc_drag = self.selection_drag.is_some() || self.scrollbar_drag.is_some();
+            if ui.on_window_event(&state.window, &event)
+                && !(doc_drag
+                    && matches!(
+                        event,
+                        WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. }
+                    ))
+            {
                 return;
             }
-            // A dialog owns all input until it is answered.
-            if self.modal.is_some()
+            // A dialog or the Preferences own all input until closed; a disk conflict owns
+            // the document (keys included) until it is answered.
+            if (self.modal.is_some() || self.prefs_open)
                 && matches!(
                     event,
                     WindowEvent::KeyboardInput { .. }
@@ -3045,6 +3180,12 @@ impl ApplicationHandler<WritEvent> for App {
                         | WindowEvent::CursorMoved { .. }
                         | WindowEvent::Ime(_)
                 )
+            {
+                state.window.request_redraw();
+                return;
+            }
+            if self.tabs[self.active_tab].conflict.is_some()
+                && matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_))
             {
                 state.window.request_redraw();
                 return;
@@ -3061,6 +3202,7 @@ impl ApplicationHandler<WritEvent> for App {
         }
         match event {
             WindowEvent::CloseRequested => self.run_command(Command::Quit, event_loop),
+            WindowEvent::Focused(true) => self.check_active_on_disk(),
             WindowEvent::Focused(false) => {
                 self.selection_drag = None;
                 self.drag_scroll_dy = 0.0;
@@ -3082,7 +3224,7 @@ impl ApplicationHandler<WritEvent> for App {
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 state.scale = scale_factor as f32;
-                sync_image_raster_width(state.scale);
+                sync_image_raster_width(state.scale, self.doc_engine.max_content_width);
                 // Text metrics and the find bar are scale-dependent, so a DPI change
                 // (e.g. dragging the window to another monitor) must recompute the bar
                 // height and relayout at the new scale, not just redraw stale geometry.
@@ -3638,6 +3780,10 @@ impl ApplicationHandler<WritEvent> for App {
                         "s" => Some(Command::Save),
                         "w" => Some(Command::CloseTab),
                         "q" => Some(Command::Quit),
+                        "," => Some(Command::Preferences),
+                        "+" | "=" => Some(Command::ZoomIn),
+                        "-" => Some(Command::ZoomOut),
+                        "0" => Some(Command::ResetZoom),
                         _ => None,
                     };
                     if let Some(app_cmd) = app_cmd {
@@ -4252,11 +4398,37 @@ impl ApplicationHandler<WritEvent> for App {
                 let active_tab = self.active_tab;
                 let mut picked = None;
                 let mut answer = None;
+                let mut conflict_answer = None;
+                let conflict = self.tabs[active_tab].conflict.as_ref().map(|_| {
+                    let editor = &self.doc_engine.editor;
+                    (doc_name(editor), editor.is_dirty())
+                });
+                let modal_shown = dialog_view.is_some() || self.prefs_open || conflict.is_some();
+                let top_points = UiLayer::top_inset(state.scale) / state.scale;
+                let mut prefs_edit = self.prefs_open.then(|| self.prefs.clone());
+                let mut prefs_changed = false;
+                let mut prefs_open = self.prefs_open;
+                let theme_names = &self.theme_names;
+                let config_path = self.config_path.as_deref();
                 let ui_frame = self.ui.as_mut().map(|ui| {
-                    ui.run(&state.window, dialog_view.is_some(), |ui| {
+                    ui.run(&state.window, modal_shown, |ui| {
                         let menu = menu_bar(ui, &menu_state);
                         let tab = tab_strip(ui, &tab_infos, active_tab);
                         picked = menu.or(tab);
+                        if let Some(prefs) = prefs_edit.as_mut() {
+                            prefs_changed = preferences::show(
+                                ui.ctx(),
+                                &mut prefs_open,
+                                prefs,
+                                theme_names,
+                                config_path,
+                            );
+                        }
+                        if let Some((name, unsaved)) = &conflict {
+                            let mut rect = ui.ctx().content_rect();
+                            rect.min.y += top_points;
+                            conflict_answer = dialogs::disk_conflict(ui.ctx(), rect, name, *unsaved);
+                        }
                         if let Some(view) = &dialog_view {
                             answer = dialogs::show(ui.ctx(), view);
                         }
@@ -4321,6 +4493,13 @@ impl ApplicationHandler<WritEvent> for App {
                 state.window.pre_present_notify();
                 surface_texture.present();
                 self.frame_retry = FrameRetry::default();
+                self.prefs_open = prefs_open;
+                if prefs_changed && let Some(prefs) = prefs_edit {
+                    self.apply_preferences(prefs);
+                }
+                if let Some(answer) = conflict_answer {
+                    self.answer_conflict(answer);
+                }
                 if let Some(answer) = answer {
                     self.answer_dialog(answer, event_loop);
                 } else if let Some(cmd) = picked {
@@ -4354,10 +4533,17 @@ impl ApplicationHandler<WritEvent> for App {
     /// the pointer is held still in an edge hot zone.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.persist_session();
+        if self.prefs_save_at.take().is_some() {
+            self.save_preferences();
+        }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.persist_session();
+        if self.prefs_save_at.is_some_and(|t| t <= Instant::now()) {
+            self.prefs_save_at = None;
+            self.save_preferences();
+        }
         // MARKDONE_DROPTEST: attribution baseline — once the first frame is up, report memory
         // with all documents loaded, then drop the parked ones and report again.
         if std::env::var_os("MARKDONE_DROPTEST").is_some()
@@ -4478,7 +4664,10 @@ impl ApplicationHandler<WritEvent> for App {
             None
         };
         let ui_deadline = self.ui.as_ref().and_then(UiLayer::repaint_deadline);
-        let other = [drag_deadline, ui_deadline].into_iter().flatten().min();
+        let other = [drag_deadline, ui_deadline, self.prefs_save_at]
+            .into_iter()
+            .flatten()
+            .min();
         event_loop.set_control_flow(self.frame_retry.control_flow(other));
     }
 }
@@ -4534,6 +4723,9 @@ struct Startup {
     session: Session,
     /// Where the session is saved; `None` = not saved.
     session_path: Option<PathBuf>,
+    /// The config file the preferences are saved to.
+    config_path: Option<PathBuf>,
+    github: GithubSetup,
 }
 
 /// Build the startup state from the command line. Files given there open one tab each
@@ -4544,6 +4736,12 @@ fn startup_from_cli() -> Startup {
 
     let config = Config::parse();
     let app_config = config::load(config.config.as_deref());
+    let config_path = config.config.clone().or_else(config::default_config_path);
+    let github = GithubSetup {
+        enabled: app_config.prefs.github,
+        repo: config.github_repo.clone(),
+        token: config.github_token.clone(),
+    };
     // `--demo`: showcase doc with a synthetic HEAD diff (no file needed).
     if config.demo {
         return Startup {
@@ -4553,6 +4751,8 @@ fn startup_from_cli() -> Startup {
             config: app_config,
             session: Session::default(),
             session_path: None,
+            config_path,
+            github,
         };
     }
     let session_path = Session::default_path();
@@ -4565,7 +4765,10 @@ fn startup_from_cli() -> Startup {
         .collect();
     if paths.is_empty() {
         let (restore, active) = session.restorable();
-        let mut editors: Vec<Editor> = restore.iter().map(|p| open_document(p)).collect();
+        let mut editors: Vec<Editor> = restore
+            .iter()
+            .map(|p| open_document(p, &github, config.autosave))
+            .collect();
         if editors.is_empty() {
             editors.push(Editor::new(""));
         }
@@ -4576,13 +4779,18 @@ fn startup_from_cli() -> Startup {
             config: app_config,
             session,
             session_path,
+            config_path,
+            github,
         };
     }
     let missing = paths.iter().filter(|p| !p.exists()).cloned().collect();
     for path in paths.iter().filter(|p| p.exists()) {
         session.touch_recent(path);
     }
-    let editors = paths.iter().map(|p| open_editor(p, &config)).collect();
+    let editors = paths
+        .iter()
+        .map(|p| open_document(p, &github, config.autosave))
+        .collect();
     Startup {
         editors,
         active: 0,
@@ -4590,19 +4798,9 @@ fn startup_from_cli() -> Startup {
         config: app_config,
         session,
         session_path,
+        config_path,
+        github,
     }
-}
-
-/// Open a document from the UI (Open dialog, recent files, restored session): load it,
-/// detect links and watch the file. No GitHub context: these documents make no network
-/// calls (a GitHub setting will come with the preferences).
-fn open_document(path: &Path) -> Editor {
-    let mut editor = Editor::open(path);
-    editor.refresh_detection(0..usize::MAX);
-    if let Err(e) = editor.watch_file() {
-        eprintln!("[markdone] file watch failed for {}: {e}", path.display());
-    }
-    editor
 }
 
 /// Label of a recent file in the menu: the file name, and its folder shortened (home as
@@ -4646,33 +4844,43 @@ fn missing_files_notice(missing: &[PathBuf]) -> Option<PendingModal> {
     })
 }
 
-/// Open one document as configured on the CLI: autosave, GitHub context (explicit
-/// --github-repo, else auto-detected from the file's repo), ref detection, file watch.
-fn open_editor(path: &std::path::Path, config: &Config) -> Editor {
-    let mut editor = Editor::open(path);
-    editor.set_autosave(config.autosave);
+/// GitHub lookups for documents opened during this run (Preferences → Privacy).
+#[derive(Clone, Default)]
+struct GithubSetup {
+    enabled: bool,
+    /// `--github-repo`: the repository, instead of detecting it from `.git/config`.
+    repo: Option<String>,
+    /// `--github-token` / `GITHUB_TOKEN`.
+    token: Option<String>,
+}
 
-    // GitHub context for ref detection: explicit --github-repo, else auto-detect.
-    let context = config
-        .github_repo
-        .as_deref()
-        .and_then(parse_github_repo_string)
-        .or_else(|| detect_github_context(path));
-    if let Some(ctx) = context {
-        editor.set_github_context(ctx);
-    }
-    if let Some(token) = config.github_token.clone() {
-        editor.set_github_client(GitHubClient::new(token));
+/// Open a document: load it, set up GitHub lookups if enabled, detect links and watch
+/// the file for external edits.
+fn open_document(path: &Path, github: &GithubSetup, autosave: bool) -> Editor {
+    let mut editor = Editor::open(path);
+    editor.set_autosave(autosave);
+    if github.enabled {
+        // GitHub context for ref detection: explicit --github-repo, else auto-detect.
+        let context = github
+            .repo
+            .as_deref()
+            .and_then(parse_github_repo_string)
+            .or_else(|| detect_github_context(path));
+        if let Some(ctx) = context {
+            editor.set_github_context(ctx);
+        }
+        if let Some(token) = github.token.clone() {
+            editor.set_github_client(GitHubClient::new(token));
+        }
     }
     // Populate github_refs_by_line / naked_urls_by_line so the first frame can color
     // (and the shell can spawn validation for) any refs already in the file.
     editor.refresh_detection(0..usize::MAX);
-
     // A missing file is reported by a dialog; watching fails when its folder is missing too.
     if let Err(e) = editor.watch_file()
         && path.exists()
     {
-        eprintln!("[markdone] file watch failed: {e}");
+        eprintln!("[markdone] file watch failed for {}: {e}", path.display());
     }
     editor
 }
@@ -4772,6 +4980,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         table_cache: TableCache::new(),
         theme: EditorTheme::dracula(),
         font_size: FONT_SIZE,
+        max_content_width: Some(MAX_CONTENT_WIDTH),
         editor,
         doc: None,
         images: ImageCache::new(),
@@ -4942,6 +5151,7 @@ mod tests {
             table_cache: TableCache::new(),
             theme: EditorTheme::dracula(),
             font_size: FONT_SIZE,
+            max_content_width: Some(MAX_CONTENT_WIDTH),
             editor: Editor::new(text),
             doc: None,
             images: ImageCache::new(),
