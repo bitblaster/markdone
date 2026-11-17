@@ -44,14 +44,14 @@ fn load_local_image(doc_dir: Option<&Path>, url: &str) -> Option<LoadedImage> {
 async fn fetch_remote_image(url: &str) -> Option<Vec<u8>> {
     let resp = match IMAGE_CLIENT
         .get(url)
-        .header("User-Agent", "writ")
+        .header("User-Agent", "markdone")
         .send()
         .await
         .and_then(|r| r.error_for_status())
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[writ] image fetch failed ({url}): {e}");
+            eprintln!("[markdone] image fetch failed ({url}): {e}");
             return None;
         }
     };
@@ -64,7 +64,7 @@ fn decode_image_bytes(url: &str, bytes: &[u8]) -> Option<LoadedImage> {
     let img = decode(bytes);
     if img.is_none() {
         eprintln!(
-            "[writ] image decode failed ({url}): {} bytes, unsupported or malformed image",
+            "[markdone] image decode failed ({url}): {} bytes, unsupported or malformed image",
             bytes.len()
         );
     }

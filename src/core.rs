@@ -344,7 +344,7 @@ impl Editor {
             && self.state.buffer.is_dirty()
             && let Err(e) = self.save()
         {
-            eprintln!("[writ] autosave failed: {e}");
+            eprintln!("[markdone] autosave failed: {e}");
         }
     }
 

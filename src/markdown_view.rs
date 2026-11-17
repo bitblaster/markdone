@@ -11,7 +11,7 @@
 //!
 //! ```ignore
 //! use vello::Scene;
-//! use writ::MarkdownView;
+//! use markdone::MarkdownView;
 //!
 //! let mut view = MarkdownView::new();
 //! view.push_str("# Streaming\n\n");

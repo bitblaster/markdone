@@ -11,7 +11,7 @@
 //! them). CSD (custom window frame) and the async-blocked overlays are deferred.
 //! Run with
 //! `WGPU_BACKEND=vulkan cargo run --bin writ-next` on Asahi; set
-//! `WRIT_SHELL_SNAPSHOT=out.png` (+ optional `WRIT_SHELL_{W,H,SCROLL,CURSOR,SEL_A,SEL_B}`)
+//! `MARKDONE_SHELL_SNAPSHOT=out.png` (+ optional `MARKDONE_SHELL_{W,H,SCROLL,CURSOR,SEL_A,SEL_B}`)
 //! to render one frame headlessly instead.
 
 use std::ops::Range;
@@ -69,7 +69,7 @@ use crate::overlay::{
 use crate::raster::rasterize_scene_to_png;
 use crate::scrollbar;
 
-/// Frame profiling, enabled with `WRIT_PROFILE=1`: one stderr line per frame with the
+/// Frame profiling, enabled with `MARKDONE_PROFILE=1`: one stderr line per frame with the
 /// number/cost of layout rebuilds since the previous frame and the frame phase timings.
 mod profile {
     use std::cell::Cell;
@@ -82,7 +82,7 @@ mod profile {
 
     pub fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("WRIT_PROFILE").is_some_and(|v| v != "0"))
+        *ON.get_or_init(|| std::env::var_os("MARKDONE_PROFILE").is_some_and(|v| v != "0"))
     }
 
     pub fn record_rebuild(start: Instant) {
@@ -136,7 +136,7 @@ mod profile {
         fn drop(&mut self) {
             let (n, us) = REBUILDS.with(|c| c.get());
             eprintln!(
-                "[writ-event] {:<10} handler {:7.2} ms (rebuilds {} = {:.2} ms)",
+                "[markdone-event] {:<10} handler {:7.2} ms (rebuilds {} = {:.2} ms)",
                 self.label,
                 self.start.elapsed().as_secs_f64() * 1e3,
                 n - self.rebuilds_before.0,
@@ -146,12 +146,12 @@ mod profile {
     }
 
     /// Latency (ms) from the oldest unpresented input event to now, clearing it.
-    /// Benchmark aid: `WRIT_AUTOSCROLL=<device px per frame>` scrolls the document to
+    /// Benchmark aid: `MARKDONE_AUTOSCROLL=<device px per frame>` scrolls the document to
     /// the bottom by itself (through the normal wheel path), then logs once and stops.
     pub fn autoscroll_step() -> Option<f32> {
         static STEP: OnceLock<Option<f32>> = OnceLock::new();
         *STEP.get_or_init(|| {
-            std::env::var("WRIT_AUTOSCROLL")
+            std::env::var("MARKDONE_AUTOSCROLL")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
                 .filter(|v| *v > 0.0)
@@ -215,9 +215,9 @@ fn find_bar_height(editor: &Editor, scale: f32) -> f32 {
 fn window_title(editor: &Editor) -> String {
     let name = doc_name(editor);
     if editor.is_dirty() {
-        format!("● {name}")
+        format!("● {name} — Markdone")
     } else {
-        name
+        format!("{name} — Markdone")
     }
 }
 
@@ -461,7 +461,7 @@ struct ActiveSurface {
     /// shared `viewport()` accessor can shrink the editor height without threading the
     /// editor's find state through its ten call sites; synced by `sync_find_chrome`.
     find_bar_h: f32,
-    /// Whether the egui menu bar is shown (off with `WRIT_NO_UI=1`, for A/B measurements).
+    /// Whether the egui menu bar is shown (off with `MARKDONE_NO_UI=1`, for A/B measurements).
     menu_bar: bool,
 }
 
@@ -747,14 +747,14 @@ struct App {
     scrollbar_pending: bool,
     /// Wheel scroll (device px) accumulated since the last frame, applied once per frame.
     wheel_pending_dy: f32,
-    /// `WRIT_AUTOSCROLL` benchmark run finished (reached the bottom).
+    /// `MARKDONE_AUTOSCROLL` benchmark run finished (reached the bottom).
     autoscroll_done: bool,
     /// Tab switch requested from inside a redraw (where `state` is borrowed), applied
-    /// in `about_to_wait`. Used by the `WRIT_AUTOTABS` benchmark.
+    /// in `about_to_wait`. Used by the `MARKDONE_AUTOTABS` benchmark.
     pending_tab_switch: Option<usize>,
-    /// `WRIT_AUTOTABS`: the final switch back to the first tab has been queued.
+    /// `MARKDONE_AUTOTABS`: the final switch back to the first tab has been queued.
     autotabs_returning: bool,
-    /// `WRIT_AUTOTABS=<rounds>`: the current round (1-based).
+    /// `MARKDONE_AUTOTABS=<rounds>`: the current round (1-based).
     autotabs_round: u32,
     /// Timestamp of the last auto-scroll tick, so scrolling integrates against real
     /// elapsed time (frame-rate independent) rather than a fixed amount per tick.
@@ -832,7 +832,7 @@ impl App {
         if let Some(family) = config.font_family {
             text_engine.set_font_family(Some(family.clone()));
             if !text_engine.is_monospace() {
-                eprintln!("[writ] config: font '{family}' is not monospace; using the default");
+                eprintln!("[markdone] config: font '{family}' is not monospace; using the default");
                 text_engine.set_font_family(None);
             }
         }
@@ -910,7 +910,7 @@ impl App {
         };
         if profile::enabled() {
             eprintln!(
-                "[writ-mem] switch tab {} -> {i} | {}",
+                "[markdone-mem] switch tab {} -> {i} | {}",
                 self.active_tab,
                 allocator_stats()
             );
@@ -999,7 +999,7 @@ impl App {
             .filter(|(i, t)| req.ids.contains(&t.id) && self.tab_editor(*i).is_dirty())
             .map(|(_, t)| t.id)
             .collect();
-        // Without the egui layer (`WRIT_NO_UI`, benchmarks) there is no way to ask.
+        // Without the egui layer (`MARKDONE_NO_UI`, benchmarks) there is no way to ask.
         if dirty.is_empty() || self.ui.is_none() {
             self.finish_close(req, event_loop);
             return;
@@ -1165,7 +1165,7 @@ impl App {
         }
         editor.refresh_git_base();
         if let Err(e) = editor.watch_file() {
-            eprintln!("[writ] file watch failed: {e}");
+            eprintln!("[markdone] file watch failed: {e}");
         }
         forward_file_watch(editor, id, &proxy);
         self.redraw();
@@ -1199,7 +1199,7 @@ impl App {
             let mut editor = Editor::open(&path);
             editor.refresh_detection(0..usize::MAX);
             if let Err(e) = editor.watch_file() {
-                eprintln!("[writ] file watch failed: {e}");
+                eprintln!("[markdone] file watch failed: {e}");
             }
             forward_file_watch(&mut editor, id, &self.proxy);
             self.tabs.push(Tab {
@@ -1399,7 +1399,7 @@ impl App {
                     && let Some(cb) = self.clipboard.as_mut()
                     && let Err(e) = cb.set_text(path.display().to_string())
                 {
-                    eprintln!("[writ] failed to copy path: {e}");
+                    eprintln!("[markdone] failed to copy path: {e}");
                 }
                 return;
             }
@@ -1948,7 +1948,7 @@ fn apply_key(
                     let c = c.as_str();
                     if c.eq_ignore_ascii_case("s") {
                         if let Err(e) = editor.save() {
-                            eprintln!("[writ] save failed: {e}");
+                            eprintln!("[markdone] save failed: {e}");
                         }
                         return true; // redraw so the title's dirty marker clears
                     }
@@ -2786,7 +2786,7 @@ impl ApplicationHandler<WritEvent> for App {
         }
         if profile::enabled() && matches!(event, WritEvent::ImageLoaded) {
             eprintln!(
-                "[writ-mem] image/render loaded (tab {}) | {}",
+                "[markdone-mem] image/render loaded (tab {}) | {}",
                 self.active_tab,
                 allocator_stats()
             );
@@ -2809,6 +2809,13 @@ impl ApplicationHandler<WritEvent> for App {
         let attrs = Window::default_attributes()
             .with_title(self.title.clone())
             .with_theme(Some(Theme::Dark));
+        // Application id (Wayland app_id / X11 WM_CLASS): matches `markdone.desktop`,
+        // so the desktop shows the right icon and groups the windows.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let attrs = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            WindowAttributesExtWayland::with_name(attrs, "markdone", "markdone")
+        };
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
@@ -2842,7 +2849,7 @@ impl ApplicationHandler<WritEvent> for App {
         let scale = window.scale_factor() as f32;
         sync_image_raster_width(scale);
         // Find is closed at startup, so no find-bar inset yet.
-        let menu_bar = std::env::var_os("WRIT_NO_UI").is_none();
+        let menu_bar = std::env::var_os("MARKDONE_NO_UI").is_none();
         let top_inset = if menu_bar {
             UiLayer::top_inset(scale)
         } else {
@@ -3400,7 +3407,7 @@ impl ApplicationHandler<WritEvent> for App {
                         && let Some(url) = self.doc_engine.editor.link_at(off)
                     {
                         if let Err(e) = open::that_detached(&url) {
-                            eprintln!("[writ] failed to open {url}: {e}");
+                            eprintln!("[markdone] failed to open {url}: {e}");
                         }
                         return;
                     }
@@ -3797,7 +3804,7 @@ impl ApplicationHandler<WritEvent> for App {
                                 },
                             );
                             if let Err(error) = &copied {
-                                eprintln!("[writ] failed to copy selection: {error}");
+                                eprintln!("[markdone] failed to copy selection: {error}");
                             }
                             if matches!(copied, Ok(true)) {
                                 apply_edit_effects(
@@ -3909,7 +3916,7 @@ impl ApplicationHandler<WritEvent> for App {
                         return;
                     }
                     other => {
-                        eprintln!("[writ] skip frame: {:?}", other);
+                        eprintln!("[markdone] skip frame: {:?}", other);
                         return;
                     }
                 };
@@ -3936,14 +3943,14 @@ impl ApplicationHandler<WritEvent> for App {
                         self.autoscroll_done = true;
                         let (held, _) = self.doc_engine.images.trim(doc.image_urls(), usize::MAX);
                         eprintln!(
-                            "[writ-autoscroll] tab {} reached bottom | PSS {} | image pixels held {:.1} MB | {}",
+                            "[markdone-autoscroll] tab {} reached bottom | PSS {} | image pixels held {:.1} MB | {}",
                             self.active_tab,
                             self_pss(),
                             held as f64 / 1048576.0,
                             allocator_stats()
                         );
-                        // WRIT_AUTOTABS: scroll every tab in turn, then return to the first.
-                        if std::env::var_os("WRIT_AUTOTABS").is_some() {
+                        // MARKDONE_AUTOTABS: scroll every tab in turn, then return to the first.
+                        if std::env::var_os("MARKDONE_AUTOTABS").is_some() {
                             if self.active_tab + 1 < self.tabs.len() {
                                 self.pending_tab_switch = Some(self.active_tab + 1);
                                 self.autoscroll_done = false;
@@ -4200,10 +4207,10 @@ impl ApplicationHandler<WritEvent> for App {
                     let (n, us) = profile::take_rebuilds();
                     let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f64() * 1e3;
                     if let Some(lat) = profile::take_input_latency() {
-                        eprintln!("[writ-latency] input → present {lat:7.2} ms");
+                        eprintln!("[markdone-latency] input → present {lat:7.2} ms");
                     }
                     eprintln!(
-                        "[writ-profile] acquire {:6.2} ms | rebuilds {n} = {:6.2} ms | input {:6.2} ms | scene+gpu {:6.2} ms | present {:6.2} ms | frame-tot {:6.2} ms",
+                        "[markdone-profile] acquire {:6.2} ms | rebuilds {n} = {:6.2} ms | input {:6.2} ms | scene+gpu {:6.2} ms | present {:6.2} ms | frame-tot {:6.2} ms",
                         ms(t_frame, t_acquired),
                         us as f64 / 1e3,
                         ms(t_acquired, t_input),
@@ -4222,16 +4229,16 @@ impl ApplicationHandler<WritEvent> for App {
     /// need to poll except to retry a skipped frame or auto-scroll a selection while
     /// the pointer is held still in an edge hot zone.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // WRIT_DROPTEST: attribution baseline — once the first frame is up, report memory
+        // MARKDONE_DROPTEST: attribution baseline — once the first frame is up, report memory
         // with all documents loaded, then drop the parked ones and report again.
-        if std::env::var_os("WRIT_DROPTEST").is_some()
+        if std::env::var_os("MARKDONE_DROPTEST").is_some()
             && !self.autotabs_returning
             && self.doc_engine.doc.is_some()
             && self.tabs.len() > 1
         {
             self.autotabs_returning = true;
             eprintln!(
-                "[writ-droptest] all docs loaded | PSS {} | {}",
+                "[markdone-droptest] all docs loaded | PSS {} | {}",
                 self_pss(),
                 allocator_stats()
             );
@@ -4239,12 +4246,12 @@ impl ApplicationHandler<WritEvent> for App {
                 let before = malloc_bytes_in_use();
                 drop(self.tabs[i].state.take());
                 eprintln!(
-                    "[writ-droptest] dropped parked tab {i}: freed {:.1} MB",
+                    "[markdone-droptest] dropped parked tab {i}: freed {:.1} MB",
                     (before as f64 - malloc_bytes_in_use() as f64) / 1048576.0
                 );
             }
             eprintln!(
-                "[writ-droptest] only tab 0 left | PSS {} | {}",
+                "[markdone-droptest] only tab 0 left | PSS {} | {}",
                 self_pss(),
                 allocator_stats()
             );
@@ -4266,12 +4273,12 @@ impl ApplicationHandler<WritEvent> for App {
                     })
                     .collect();
                 eprintln!(
-                    "[writ-autotabs] back on tab 0 | PSS {} | {} | parked tabs image MB (files+renders) {}",
+                    "[markdone-autotabs] back on tab 0 | PSS {} | {} | parked tabs image MB (files+renders) {}",
                     self_pss(),
                     allocator_stats(),
                     parked.join(" ")
                 );
-                let rounds: u32 = std::env::var("WRIT_AUTOTABS")
+                let rounds: u32 = std::env::var("MARKDONE_AUTOTABS")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(1);
@@ -4290,7 +4297,7 @@ impl ApplicationHandler<WritEvent> for App {
                     if let Some(state) = self.state.as_ref() {
                         state.window.request_redraw();
                     }
-                    eprintln!("[writ-autotabs] starting round {}", self.autotabs_round);
+                    eprintln!("[markdone-autotabs] starting round {}", self.autotabs_round);
                     return;
                 }
                 // Attribution: drop each parked document in turn and report what it freed.
@@ -4300,12 +4307,12 @@ impl ApplicationHandler<WritEvent> for App {
                     drop(self.tabs[i].state.take());
                     let after = malloc_bytes_in_use();
                     eprintln!(
-                        "[writ-autotabs] dropped parked tab {i}: freed {:.1} MB",
+                        "[markdone-autotabs] dropped parked tab {i}: freed {:.1} MB",
                         (before as f64 - after as f64) / 1048576.0
                     );
                 }
                 eprintln!(
-                    "[writ-autotabs] only tab 0 left | PSS {} | {}",
+                    "[markdone-autotabs] only tab 0 left | PSS {} | {}",
                     self_pss(),
                     allocator_stats()
                 );
@@ -4366,16 +4373,16 @@ pub fn run() -> Result<()> {
 
     // Headless golden-image path: render one frame to a PNG and exit. Used to
     // verify the render offscreen (no compositor screenshot needed).
-    if let Ok(path) = std::env::var("WRIT_SHELL_SNAPSHOT") {
+    if let Ok(path) = std::env::var("MARKDONE_SHELL_SNAPSHOT") {
         let env_f32 = |k: &str, d: f32| {
             std::env::var(k)
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d)
         };
-        let w = env_f32("WRIT_SHELL_W", 1000.0) as u32;
-        let h = env_f32("WRIT_SHELL_H", 400.0) as u32;
-        let scroll = env_f32("WRIT_SHELL_SCROLL", 0.0);
+        let w = env_f32("MARKDONE_SHELL_W", 1000.0) as u32;
+        let h = env_f32("MARKDONE_SHELL_H", 400.0) as u32;
+        let scroll = env_f32("MARKDONE_SHELL_SCROLL", 0.0);
         return snapshot(&path, w, h, scroll);
     }
 
@@ -4462,7 +4469,7 @@ fn open_editor(path: &std::path::Path, config: &Config) -> Editor {
     if let Err(e) = editor.watch_file()
         && path.exists()
     {
-        eprintln!("[writ] file watch failed: {e}");
+        eprintln!("[markdone] file watch failed: {e}");
     }
     editor
 }
@@ -4503,36 +4510,36 @@ fn fetch_autocomplete_blocking(editor: &mut Editor) {
 /// `path` as a PNG. Independent of any surface/window, so it runs headlessly and
 /// doubles as a golden-image harness for later phases.
 pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()> {
-    // WRIT_SHELL_FILE opens a real file (with live HEAD diff); else the demo doc.
-    let mut editor = match std::env::var("WRIT_SHELL_FILE") {
+    // MARKDONE_SHELL_FILE opens a real file (with live HEAD diff); else the demo doc.
+    let mut editor = match std::env::var("MARKDONE_SHELL_FILE") {
         Ok(p) => Editor::open(std::path::Path::new(&p)),
         Err(_) => Editor::new(DEMO_DOC),
     };
     // Place the caret mid-document so the snapshot exercises caret geometry.
     let env_usize = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok());
-    editor.set_cursor(env_usize("WRIT_SHELL_CURSOR").unwrap_or(0));
+    editor.set_cursor(env_usize("MARKDONE_SHELL_CURSOR").unwrap_or(0));
     // Optional selection A..B (via click+drag) to exercise selection rendering.
-    if let (Some(a), Some(b)) = (env_usize("WRIT_SHELL_SEL_A"), env_usize("WRIT_SHELL_SEL_B")) {
+    if let (Some(a), Some(b)) = (env_usize("MARKDONE_SHELL_SEL_A"), env_usize("MARKDONE_SHELL_SEL_B")) {
         editor.click(a, false, 1);
         editor.drag(b);
     }
     // Optional diff: set a HEAD base that differs from the current doc so additions
     // (green) + a word-level change render. Exercises the inline-diff path.
-    if std::env::var("WRIT_SHELL_DIFF").is_ok() {
+    if std::env::var("MARKDONE_SHELL_DIFF").is_ok() {
         editor.set_head_base(DEMO_BASE);
     }
-    // WRIT_SHELL_OUTLINE reserves the right outline strip so the golden frame shows the
+    // MARKDONE_SHELL_OUTLINE reserves the right outline strip so the golden frame shows the
     // reflowed document beside the placeholder panel.
-    if std::env::var("WRIT_SHELL_OUTLINE").is_ok() {
+    if std::env::var("MARKDONE_SHELL_OUTLINE").is_ok() {
         editor.set_outline_open(true);
     }
     // Optional GitHub golden-image check: wire a client from GITHUB_TOKEN +
-    // WRIT_SHELL_GITHUB_REPO, then *synchronously* validate every ref so the single
+    // MARKDONE_SHELL_GITHUB_REPO, then *synchronously* validate every ref so the single
     // frame shows final ref colors (the GUI does this asynchronously).
     if let Ok(token) = std::env::var("GITHUB_TOKEN")
-        && std::env::var("WRIT_SHELL_GITHUB").is_ok()
+        && std::env::var("MARKDONE_SHELL_GITHUB").is_ok()
     {
-        if let Some(ctx) = std::env::var("WRIT_SHELL_GITHUB_REPO")
+        if let Some(ctx) = std::env::var("MARKDONE_SHELL_GITHUB_REPO")
             .ok()
             .and_then(|s| parse_github_repo_string(&s))
         {
@@ -4541,8 +4548,8 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         editor.set_github_client(GitHubClient::new(token));
         editor.refresh_detection(0..usize::MAX);
         validate_all_blocking(&mut editor);
-        // WRIT_SHELL_AUTOCOMPLETE opens the popup at the caret (WRIT_SHELL_CURSOR).
-        if std::env::var("WRIT_SHELL_AUTOCOMPLETE").is_ok() {
+        // MARKDONE_SHELL_AUTOCOMPLETE opens the popup at the caret (MARKDONE_SHELL_CURSOR).
+        if std::env::var("MARKDONE_SHELL_AUTOCOMPLETE").is_ok() {
             editor.update_autocomplete_from_cursor();
             if editor.autocomplete().is_some() {
                 fetch_autocomplete_blocking(&mut editor);
@@ -4603,9 +4610,9 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         None,
     );
 
-    // Optional hover-popover golden image: WRIT_SHELL_HOVER=<byte offset> anchors the
+    // Optional hover-popover golden image: MARKDONE_SHELL_HOVER=<byte offset> anchors the
     // popover on the ref containing that offset.
-    if let Some(off) = std::env::var("WRIT_SHELL_HOVER")
+    if let Some(off) = std::env::var("MARKDONE_SHELL_HOVER")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         && let Some(t) = hover_target_at_offset(&de.editor, &doc, off)
@@ -4622,7 +4629,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         );
     }
 
-    // Optional autocomplete golden image (see WRIT_SHELL_AUTOCOMPLETE above).
+    // Optional autocomplete golden image (see MARKDONE_SHELL_AUTOCOMPLETE above).
     if let Some(ac) = de
         .editor
         .autocomplete()
@@ -4648,7 +4655,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         peniko_color(de.theme.background),
         path,
     )?;
-    eprintln!("[writ] wrote snapshot: {path} ({width}x{height})");
+    eprintln!("[markdone] wrote snapshot: {path} ({width}x{height})");
     Ok(())
 }
 

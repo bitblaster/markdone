@@ -22,10 +22,10 @@ use crate::math::MathBlock;
 use crate::mermaid::MermaidBlock;
 use crate::parser::{MarkdownParser, MarkdownTree};
 
-/// `WRIT_PROFILE=1`: per-edit timing of the parse and cache passes on stderr.
+/// `MARKDONE_PROFILE=1`: per-edit timing of the parse and cache passes on stderr.
 fn edit_profile_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("WRIT_PROFILE").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("MARKDONE_PROFILE").is_some_and(|v| v != "0"))
 }
 use crate::table::{RowKind, TableInfo, row_kind_at_line};
 
@@ -490,7 +490,7 @@ impl BufferContent {
         });
         if edit_profile_enabled() {
             eprintln!(
-                "[writ-edit] collect_node_infos {:6.2} ms | inline_styles {:6.2} ms",
+                "[markdone-edit] collect_node_infos {:6.2} ms | inline_styles {:6.2} ms",
                 (t1 - t0).as_secs_f64() * 1e3,
                 t1.elapsed().as_secs_f64() * 1e3
             );
@@ -540,7 +540,7 @@ impl BufferContent {
         }
         self.tree = self.parser.parse_rope(&self.text, self.tree.as_ref());
         if edit_profile_enabled() {
-            eprintln!("[writ-edit] parse {:6.2} ms", t_parse.elapsed().as_secs_f64() * 1e3);
+            eprintln!("[markdone-edit] parse {:6.2} ms", t_parse.elapsed().as_secs_f64() * 1e3);
         }
 
         // Renumbering only matters when the edit lands inside an ordered list, which

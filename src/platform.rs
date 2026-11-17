@@ -13,7 +13,7 @@ pub fn reveal_in_file_manager(path: &Path) {
     if let Some(parent) = path.parent()
         && let Err(e) = open::that_detached(parent)
     {
-        eprintln!("[writ] cannot open {}: {e}", parent.display());
+        eprintln!("[markdone] cannot open {}: {e}", parent.display());
     }
 }
 

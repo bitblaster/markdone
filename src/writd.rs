@@ -16,7 +16,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-use writ::config::GITHUB_TOKEN_ENV;
+use markdone::config::GITHUB_TOKEN_ENV;
 
 const DEFAULT_PORT: u16 = 4001;
 
@@ -273,7 +273,7 @@ async fn handle_websocket(
     watcher.watch(&temp_file, RecursiveMode::NonRecursive)?;
 
     // Build writ command with optional GitHub context
-    let mut cmd = Command::new("writ");
+    let mut cmd = Command::new("markdone");
     cmd.arg("--file").arg(&temp_file).arg("--autosave");
 
     // Pass GitHub repo context if URL is a GitHub page or title contains repo info

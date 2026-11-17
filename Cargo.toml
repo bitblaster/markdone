@@ -1,13 +1,11 @@
 [package]
-name = "writ"
-version = "0.19.3"
-description = "A hybrid markdown editor combining raw text editing with live inline rendering"
+name = "markdone"
+version = "0.1.0"
+description = "A fast, lightweight Markdown editor with live inline rendering (forked from writ)"
+# Forked from writ by Wilfred Denton (MIT), https://github.com/wilfreddenton/writ
 authors = ["Wilfred Denton <wilfred@hey.com>"]
 license = "MIT"
 edition = "2024"
-repository = "https://github.com/wilfreddenton/writ"
-homepage = "https://github.com/wilfreddenton/writ"
-documentation = "https://docs.rs/writ"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -16,13 +14,13 @@ all-features = true
 too_many_arguments = "allow"
 
 [lib]
-name = "writ"
+name = "markdone"
 path = "src/lib.rs"
 
 # The editor: winit + wgpu + Vello + Parley shell (formerly the gpui app).
 [[bin]]
-name = "writ"
-path = "src/bin/writ_next.rs"
+name = "markdone"
+path = "src/bin/markdone.rs"
 required-features = ["app"]
 
 [[bin]]

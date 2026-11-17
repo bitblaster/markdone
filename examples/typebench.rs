@@ -1,7 +1,7 @@
 //! Headless typing benchmark: open a file, put the caret mid-document, type N chars and
 //! time each keystroke through the editor core (no window, no layout).
 use std::time::Instant;
-use writ::core::Editor;
+use markdone::core::Editor;
 
 fn main() {
     let path = std::env::args().nth(1).expect("usage: typebench <file.md> [n]");

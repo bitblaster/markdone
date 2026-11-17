@@ -8,7 +8,7 @@
 
 use vello::Scene;
 
-use writ::{MarkdownView, rasterize_scene_to_png};
+use markdone::{MarkdownView, rasterize_scene_to_png};
 
 /// The demo document, split into the chunks a streaming producer would emit.
 const CHUNKS: &[&str] = &[

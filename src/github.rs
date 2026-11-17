@@ -213,7 +213,7 @@ impl GitHubClient {
             .client
             .post(GITHUB_GRAPHQL_URL)
             .header("Authorization", format!("Bearer {}", self.token))
-            .header("User-Agent", "writ")
+            .header("User-Agent", "markdone")
             .json(&request)
             .send()
             .await

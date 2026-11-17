@@ -43,11 +43,11 @@ pub struct Config {
 
     /// GitHub repository (owner/repo) for autolink detection.
     /// If not specified, will try to detect from .git/config.
-    #[arg(long, env = "WRIT_GITHUB_REPO")]
+    #[arg(long, env = "MARKDONE_GITHUB_REPO")]
     pub github_repo: Option<String>,
 
     /// Path to a TOML config file (theme + font). Defaults to the platform config dir,
-    /// e.g. `~/.config/writ/config.toml`.
+    /// e.g. `~/.config/markdone/config.toml`.
     #[arg(long)]
     pub config: Option<PathBuf>,
 }
@@ -131,7 +131,7 @@ impl Palette {
             if let Some(hex) = field {
                 match parse_hex(hex) {
                     Ok(c) => *slot = c,
-                    Err(e) => eprintln!("[writ] config: {name}: {e}"),
+                    Err(e) => eprintln!("[markdone] config: {name}: {e}"),
                 }
             }
         };
@@ -178,7 +178,7 @@ fn parse_hex(s: &str) -> Result<Color, String> {
 /// The default config path: `<platform config dir>/writ/config.toml`.
 #[cfg(feature = "app")]
 fn default_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("writ").join("config.toml"))
+    dirs::config_dir().map(|d| d.join("markdone").join("config.toml"))
 }
 
 /// Load and resolve the config. `explicit` is the `--config` path (else the default
@@ -193,19 +193,19 @@ pub fn load(explicit: Option<&Path>) -> ResolvedConfig {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if explicit.is_some() {
-                eprintln!("[writ] config: {} not found", path.display());
+                eprintln!("[markdone] config: {} not found", path.display());
             }
             return ResolvedConfig::default();
         }
         Err(e) => {
-            eprintln!("[writ] config: cannot read {}: {e}", path.display());
+            eprintln!("[markdone] config: cannot read {}: {e}", path.display());
             return ResolvedConfig::default();
         }
     };
     match toml::from_str::<FileConfig>(&text) {
         Ok(file) => resolve(file),
         Err(e) => {
-            eprintln!("[writ] config: {} parse error: {e}", path.display());
+            eprintln!("[markdone] config: {} parse error: {e}", path.display());
             ResolvedConfig::default()
         }
     }
@@ -226,7 +226,7 @@ fn resolve(file: FileConfig) -> ResolvedConfig {
             } else if let Some(builtin) = EditorTheme::by_name(name) {
                 cfg.theme = builtin;
             } else {
-                eprintln!("[writ] config: unknown theme '{name}', using dracula");
+                eprintln!("[markdone] config: unknown theme '{name}', using dracula");
             }
         }
         if let Some(overrides) = &theme.overrides {
@@ -245,7 +245,7 @@ fn resolve(file: FileConfig) -> ResolvedConfig {
                 cfg.font_size = size;
             } else {
                 eprintln!(
-                    "[writ] config: font.size {size} out of range (6–96), using {}",
+                    "[markdone] config: font.size {size} out of range (6–96), using {}",
                     cfg.font_size
                 );
             }

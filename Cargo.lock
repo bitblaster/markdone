@@ -2757,6 +2757,56 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "markdone"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "clap",
+ "dirs",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "fontique",
+ "futures",
+ "gix",
+ "image",
+ "imara-diff",
+ "mermaid-rs-renderer",
+ "notify",
+ "notify-debouncer-full",
+ "open",
+ "parley",
+ "pollster 0.4.0",
+ "ratex-layout",
+ "ratex-parser",
+ "ratex-render",
+ "ratex-types",
+ "regex",
+ "reqwest",
+ "resvg",
+ "rfd",
+ "ropey",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "toml",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-highlight",
+ "tree-sitter-javascript",
+ "tree-sitter-md",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+ "undo",
+ "unicode-segmentation",
+ "vello",
+ "winit",
+]
+
+[[package]]
 name = "maybe-async"
 version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6357,56 +6407,6 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-wlr",
-]
-
-[[package]]
-name = "writ"
-version = "0.19.3"
-dependencies = [
- "anyhow",
- "arboard",
- "clap",
- "dirs",
- "egui",
- "egui-wgpu",
- "egui-winit",
- "fontique",
- "futures",
- "gix",
- "image",
- "imara-diff",
- "mermaid-rs-renderer",
- "notify",
- "notify-debouncer-full",
- "open",
- "parley",
- "pollster 0.4.0",
- "ratex-layout",
- "ratex-parser",
- "ratex-render",
- "ratex-types",
- "regex",
- "reqwest",
- "resvg",
- "rfd",
- "ropey",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "toml",
- "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-highlight",
- "tree-sitter-javascript",
- "tree-sitter-md",
- "tree-sitter-rust",
- "tree-sitter-typescript",
- "undo",
- "unicode-segmentation",
- "vello",
- "winit",
 ]
 
 [[package]]

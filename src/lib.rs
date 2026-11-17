@@ -16,7 +16,7 @@
 //!
 //! ```ignore
 //! // `writ --file notes.md` — the shell reads the path from the CLI and runs the app.
-//! writ::shell::run()?;
+//! markdone::shell::run()?;
 //! ```
 //!
 //! # Using writ as a library
@@ -29,7 +29,7 @@
 //!
 //! ```ignore
 //! use vello::Scene;
-//! use writ::MarkdownView;
+//! use markdone::MarkdownView;
 //!
 //! let mut view = MarkdownView::new();
 //! view.push_str("# Streaming\n\n");

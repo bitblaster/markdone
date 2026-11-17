@@ -1,26 +1,27 @@
-# writ
+# Markdone
 
-[![CI](https://github.com/wilfreddenton/writ/actions/workflows/ci.yml/badge.svg)](https://github.com/wilfreddenton/writ/actions/workflows/ci.yml)
-[![Crates.io](https://img.shields.io/crates/v/writ.svg)](https://crates.io/crates/writ)
-[![docs.rs](https://docs.rs/writ/badge.svg)](https://docs.rs/writ)
+A fast, lightweight Markdown editor with live inline rendering: a native alternative
+to Electron editors such as Zettlr, at a fraction of the memory.
 
-A hybrid markdown editor combining raw text editing with live inline rendering.
+Markdone is a fork of [writ](https://github.com/wilfreddenton/writ) by Wilfred Denton
+(MIT license). It adds an application UI (menus, tabs, dialogs, preferences) drawn with
+egui on top of writ's Vello document renderer.
 
-![writ rendering Markdown inline — a clean heading, styled prose, and a syntax-highlighted Rust code block](https://raw.githubusercontent.com/wilfreddenton/writ/main/assets/hero.png)
+![Markdown rendered inline: a clean heading, styled prose, and a syntax-highlighted Rust code block](assets/hero.png)
 
 ## Install
 
 ```bash
-cargo install writ --locked
+cargo install --path . --locked
 ```
 
 ## Usage
 
 ```bash
-writ --file path/to/document.md
+markdone --file path/to/document.md
 ```
 
-Run `writ --demo` (or with no arguments) to open a built-in showcase document with a synthetic git-`HEAD` diff, so you can see the inline diff, rendering, and code-fence highlighting without setting anything up.
+Run `markdone --demo` (or with no arguments) to open a built-in showcase document with a synthetic git-`HEAD` diff, so you can see the inline diff, rendering, and code-fence highlighting without setting anything up.
 
 Flags:
 
@@ -31,13 +32,13 @@ Flags:
 | `--autosave` | Save on every edit (used by the GhostText daemon) |
 | `--github-repo <owner/repo>` | GitHub context for ref validation (else auto-detected from the git remote) |
 | `--github-token <token>` | GitHub API token (or the `GITHUB_TOKEN` env var) for ref validation, hover cards, and autocomplete |
-| `--config <path>` | Config file location (default `~/.config/writ/config.toml`) |
+| `--config <path>` | Config file location (default `~/.config/markdone/config.toml`) |
 
-writ is rendered on [winit](https://github.com/rust-windowing/winit) + [wgpu](https://wgpu.rs) + [Vello](https://github.com/linebender/vello) + [Parley](https://github.com/linebender/parley) (GPU 2D rendering and text layout). On Linux/Mesa (including Asahi) select the Vulkan backend with `WGPU_BACKEND=vulkan`. Fonts are resolved via [Fontique](https://github.com/linebender/parley) with fontconfig loaded at runtime — no `-dev` headers needed.
+Markdone is rendered on [winit](https://github.com/rust-windowing/winit) + [wgpu](https://wgpu.rs) + [Vello](https://github.com/linebender/vello) + [Parley](https://github.com/linebender/parley) (GPU 2D rendering and text layout). On Linux/Mesa (including Asahi) select the Vulkan backend with `WGPU_BACKEND=vulkan`. Fonts are resolved via [Fontique](https://github.com/linebender/parley) with fontconfig loaded at runtime — no `-dev` headers needed.
 
 ### Configuration
 
-writ reads an optional TOML config from `~/.config/writ/config.toml` (platform config dir, overridable with `--config <path>`). It sets the theme and the document font; a missing or malformed file just falls back to the built-in defaults. See [`config.example.toml`](config.example.toml) for a fully commented example.
+writ reads an optional TOML config from `~/.config/markdone/config.toml` (platform config dir, overridable with `--config <path>`). It sets the theme and the document font; a missing or malformed file just falls back to the built-in defaults. See [`config.example.toml`](config.example.toml) for a fully commented example.
 
 ```toml
 [font]
@@ -85,7 +86,7 @@ The daemon listens on port 4001. When you activate GhostText on a textarea, `wri
 The `--autosave` flag can also be used standalone to save on every edit:
 
 ```bash
-writ --file doc.md --autosave
+markdone --file doc.md --autosave
 ```
 
 ## Development

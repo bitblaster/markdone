@@ -288,7 +288,7 @@ mod tests {
 | Col A | Col B |\n|---|---|\n| uno *x* | due |\n| tre | quattro `q` |\n\n\
 > citazione con _enfasi_\n> seconda riga\n\n- voce **uno**\n- voce due\n  continua\n\n\
 ```rust\nfn main() {}\n```\n\nUltimo paragrafo\nsu due righe.\n";
-        let mut text = std::env::var("WRIT_PARSE_TEST_FILE")
+        let mut text = std::env::var("MARKDONE_PARSE_TEST_FILE")
             .ok()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .unwrap_or_else(|| base.repeat(4));
