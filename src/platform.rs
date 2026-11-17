@@ -63,9 +63,21 @@ fn reveal_selected(path: &Path) -> bool {
         .is_ok()
 }
 
+/// A `file://` URL for an absolute path (percent-encoded).
+pub fn file_url(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        // C:\dir\x.md → file:///C:/dir/x.md
+        let slashed = text.replace('\\', "/");
+        let (drive, rest) = slashed.split_at(slashed.find(':').map_or(0, |i| i + 1));
+        format!("file:///{drive}{}", percent_encode_path(rest))
+    } else {
+        format!("file://{}", percent_encode_path(&text))
+    }
+}
+
 /// Percent-encode a filesystem path for a `file://` URI (keeps `/` and unreserved
 /// characters; encodes spaces, non-ASCII bytes and everything else).
-#[cfg_attr(any(target_os = "windows", target_os = "macos"), allow(dead_code))]
 fn percent_encode_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for b in path.bytes() {

@@ -33,7 +33,8 @@ pub fn menu_bar(ui: &mut egui::Ui, state: &MenuState) -> Option<Command> {
                                 ui.add_enabled(false, egui::Button::new("No Recent Files"));
                             }
                             for (i, (name, dir)) in state.recent.iter().enumerate() {
-                                let button = egui::Button::new(name.as_str()).shortcut_text(dir.as_str());
+                                let button =
+                                    egui::Button::new(name.as_str()).shortcut_text(dir.as_str());
                                 if ui.add(button).clicked() {
                                     picked = Some(Command::OpenRecent(i));
                                     ui.close();
@@ -46,6 +47,7 @@ pub fn menu_bar(ui: &mut egui::Ui, state: &MenuState) -> Option<Command> {
                         ui.separator();
                         item(ui, "Save", Command::Save, true, &mut picked);
                         item(ui, "Save As…", Command::SaveAs, true, &mut picked);
+                        item(ui, "Export as PDF…", Command::ExportPdf, true, &mut picked);
                         ui.separator();
                         item(ui, "Close Tab", Command::CloseTab, true, &mut picked);
                         item(ui, "Quit", Command::Quit, true, &mut picked);
@@ -71,7 +73,8 @@ pub fn menu_bar(ui: &mut egui::Ui, state: &MenuState) -> Option<Command> {
                             picked = Some(Command::ToggleOutline);
                             ui.close();
                         }
-                        let numbers = egui::Button::selectable(state.line_numbers, "Show Line Numbers");
+                        let numbers =
+                            egui::Button::selectable(state.line_numbers, "Show Line Numbers");
                         if ui.add(numbers).clicked() {
                             picked = Some(Command::ToggleLineNumbers);
                             ui.close();

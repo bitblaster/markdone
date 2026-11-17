@@ -59,7 +59,13 @@ pub fn tab_strip(ui: &mut egui::Ui, tabs: &[TabInfo], active: usize) -> Option<C
 #[derive(Clone, Copy)]
 struct DraggedTab(usize);
 
-fn tab_ui(ui: &mut egui::Ui, tab: &TabInfo, i: usize, active: bool, count: usize) -> Option<Command> {
+fn tab_ui(
+    ui: &mut egui::Ui,
+    tab: &TabInfo,
+    i: usize,
+    active: bool,
+    count: usize,
+) -> Option<Command> {
     let mut picked = None;
     let visuals = ui.visuals().clone();
     let font = egui::TextStyle::Button.resolve(ui.style());
@@ -77,10 +83,8 @@ fn tab_ui(ui: &mut egui::Ui, tab: &TabInfo, i: usize, active: bool, count: usize
     let dot_w = if tab.dirty { DOT_W } else { 0.0 };
     let height = TAB_STRIP_H - 6.0;
     let width = (galley.size().x + 2.0 * pad + dot_w + CLOSE_W + 4.0).clamp(MIN_W, MAX_W);
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(width, height),
-        egui::Sense::click_and_drag(),
-    );
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
     let response = response.on_hover_text(
         tab.path
             .as_ref()
@@ -91,11 +95,16 @@ fn tab_ui(ui: &mut egui::Ui, tab: &TabInfo, i: usize, active: bool, count: usize
     if response.drag_started() {
         response.dnd_set_drag_payload(DraggedTab(i));
     }
-    let hovered_by_drag = response.dnd_hover_payload::<DraggedTab>().is_some_and(|d| d.0 != i);
+    let hovered_by_drag = response
+        .dnd_hover_payload::<DraggedTab>()
+        .is_some_and(|d| d.0 != i);
     if let Some(from) = response.dnd_release_payload::<DraggedTab>()
         && from.0 != i
     {
-        picked = Some(Command::MoveTab { from: from.0, to: i });
+        picked = Some(Command::MoveTab {
+            from: from.0,
+            to: i,
+        });
     }
 
     // Background: active tab = document background with an accent underline; hovered
@@ -115,7 +124,11 @@ fn tab_ui(ui: &mut egui::Ui, tab: &TabInfo, i: usize, active: bool, count: usize
         );
         painter.rect_filled(underline, 1.0, visuals.widgets.active.bg_fill);
     } else if response.hovered() || hovered_by_drag {
-        painter.rect_filled(rect, radius, visuals.widgets.hovered.weak_bg_fill.gamma_multiply(0.6));
+        painter.rect_filled(
+            rect,
+            radius,
+            visuals.widgets.hovered.weak_bg_fill.gamma_multiply(0.6),
+        );
     }
     if response.dragged() {
         drag_ghost(ui, rect, &galley, tab.dirty, &visuals);
@@ -144,7 +157,11 @@ fn tab_ui(ui: &mut egui::Ui, tab: &TabInfo, i: usize, active: bool, count: usize
             egui::pos2(text_rect.right() - 18.0, rect.top()),
             egui::pos2(text_rect.right(), rect.bottom() - 2.0),
         );
-        let bg = if active { visuals.panel_fill } else { visuals.extreme_bg_color };
+        let bg = if active {
+            visuals.panel_fill
+        } else {
+            visuals.extreme_bg_color
+        };
         painter.rect_filled(fade, 0.0, bg.gamma_multiply(0.85));
         painter.text(
             egui::pos2(text_rect.right() - 2.0, rect.center().y),
@@ -180,7 +197,10 @@ fn tab_ui(ui: &mut egui::Ui, tab: &TabInfo, i: usize, active: bool, count: usize
     response.context_menu(|ui| {
         ui.set_min_width(220.0);
         let has_path = tab.path.is_some();
-        if ui.add_enabled(has_path, egui::Button::new("Copy Location")).clicked() {
+        if ui
+            .add_enabled(has_path, egui::Button::new("Copy Location"))
+            .clicked()
+        {
             picked = Some(Command::CopyPath(i));
             ui.close();
         }
@@ -196,7 +216,10 @@ fn tab_ui(ui: &mut egui::Ui, tab: &TabInfo, i: usize, active: bool, count: usize
             picked = Some(Command::CloseTabAt(i));
             ui.close();
         }
-        if ui.add_enabled(count > 1, egui::Button::new("Close Others")).clicked() {
+        if ui
+            .add_enabled(count > 1, egui::Button::new("Close Others"))
+            .clicked()
+        {
             picked = Some(Command::CloseOtherTabs(i));
             ui.close();
         }
@@ -217,7 +240,8 @@ fn drag_ghost(
     dirty: bool,
     visuals: &egui::Visuals,
 ) {
-    let (Some(pointer), Some(origin)) = ui.input(|i| (i.pointer.hover_pos(), i.pointer.press_origin()))
+    let (Some(pointer), Some(origin)) =
+        ui.input(|i| (i.pointer.hover_pos(), i.pointer.press_origin()))
     else {
         return;
     };
@@ -246,9 +270,11 @@ fn drag_ghost(
         egui::pos2(x, ghost.top()),
         egui::pos2(ghost.right() - pad, ghost.bottom()),
     );
-    painter.with_clip_rect(text_clip).galley_with_override_text_color(
-        egui::pos2(x, ghost.center().y - galley.size().y / 2.0),
-        galley.clone(),
-        visuals.strong_text_color().gamma_multiply(alpha),
-    );
+    painter
+        .with_clip_rect(text_clip)
+        .galley_with_override_text_color(
+            egui::pos2(x, ghost.center().y - galley.size().y / 2.0),
+            galley.clone(),
+            visuals.strong_text_color().gamma_multiply(alpha),
+        );
 }

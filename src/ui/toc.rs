@@ -74,30 +74,36 @@ pub fn toc_panel(
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
     (|ui: &mut egui::Ui| {
-            ui.set_clip_rect(inner);
+        ui.set_clip_rect(inner);
+        ui.horizontal(|ui| {
+            ui.add_space(PAD_X);
+            ui.label(egui::RichText::new("Contents").small().weak());
+        });
+        ui.add_space(2.0);
+        if entries.is_empty() {
             ui.horizontal(|ui| {
                 ui.add_space(PAD_X);
-                ui.label(egui::RichText::new("Contents").small().weak());
+                ui.label(egui::RichText::new("No headings").weak());
             });
-            ui.add_space(2.0);
-            if entries.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.add_space(PAD_X);
-                    ui.label(egui::RichText::new("No headings").weak());
-                });
-                return;
-            }
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for (i, entry) in entries.iter().enumerate() {
-                        let is_current = current == Some(i);
-                        if row(ui, entry, is_current, &visuals, reveal_current && is_current) {
-                            clicked = Some(i);
-                        }
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for (i, entry) in entries.iter().enumerate() {
+                    let is_current = current == Some(i);
+                    if row(
+                        ui,
+                        entry,
+                        is_current,
+                        &visuals,
+                        reveal_current && is_current,
+                    ) {
+                        clicked = Some(i);
                     }
-                });
+                }
+            });
     })(&mut child);
     TocResponse {
         clicked,
@@ -125,7 +131,11 @@ fn row(
     if current {
         painter.rect_filled(rect, 0.0, visuals.selection.bg_fill);
     } else if response.hovered() {
-        painter.rect_filled(rect, 0.0, visuals.widgets.hovered.weak_bg_fill.gamma_multiply(0.6));
+        painter.rect_filled(
+            rect,
+            0.0,
+            visuals.widgets.hovered.weak_bg_fill.gamma_multiply(0.6),
+        );
     }
 
     let indent = f32::from(entry.level.saturating_sub(1)) * INDENT;
@@ -161,7 +171,11 @@ fn row(
     job.wrap = egui::text::TextWrapping::truncate_at_width((rect.right() - PAD_X - x).max(10.0));
     let galley = painter.layout_job(job);
     let elided = galley.elided;
-    painter.galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley, color);
+    painter.galley(
+        egui::pos2(x, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
     let response = if elided {
         response.on_hover_text(&entry.text)
     } else {

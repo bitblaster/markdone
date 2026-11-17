@@ -47,6 +47,20 @@ fn render_to_image(source: &str) -> Result<LoadedImage, Option<String>> {
     }
 }
 
+/// Render a diagram to SVG markup for printing (PDF export): mermaid's light theme,
+/// for a white page. `Err` carries the parse/render error message.
+pub fn render_svg_for_print(source: &str) -> Result<String, String> {
+    let opts = RenderOptions {
+        theme: Theme::modern(),
+        ..Default::default()
+    };
+    match catch_unwind(AssertUnwindSafe(|| render_with_options(source, opts))) {
+        Ok(Ok(svg)) => Ok(svg),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("the diagram renderer failed on this input".to_string()),
+    }
+}
+
 /// For each `(key, source)` with no cache entry, mark it loading and render on a worker
 /// thread (mermaid layout is CPU-heavy — never on the render thread), then `notify()` so
 /// the event-driven shell rebuilds around the now-known diagram size. Mirrors

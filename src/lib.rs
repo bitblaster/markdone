@@ -114,6 +114,8 @@ pub mod session;
 pub mod single_instance;
 #[cfg(feature = "app")]
 pub mod links;
+#[cfg(feature = "app")]
+pub mod export;
 pub mod paste;
 pub mod raster;
 pub mod render;

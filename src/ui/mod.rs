@@ -27,8 +27,8 @@ use crate::editor::EditorTheme;
 pub mod dialogs;
 pub mod menu;
 pub mod preferences;
-pub mod toc;
 pub mod tabs;
+pub mod toc;
 
 /// Height of the top menu bar, in logical px.
 pub const MENU_BAR_H: f32 = 30.0;
@@ -342,27 +342,29 @@ fn color32(c: vello::peniko::Color) -> egui::Color32 {
 fn style_from_theme(theme: &EditorTheme) -> egui::Style {
     use egui::{CornerRadius, FontFamily, FontId, Margin, Shadow, Stroke, TextStyle, vec2};
 
-    let mut style = egui::Style::default();
-    style.text_styles = [
-        (
-            TextStyle::Small,
-            FontId::new(11.5, FontFamily::Proportional),
-        ),
-        (TextStyle::Body, FontId::new(14.0, FontFamily::Proportional)),
-        (
-            TextStyle::Button,
-            FontId::new(14.0, FontFamily::Proportional),
-        ),
-        (
-            TextStyle::Heading,
-            FontId::new(18.0, FontFamily::Proportional),
-        ),
-        (
-            TextStyle::Monospace,
-            FontId::new(13.0, FontFamily::Monospace),
-        ),
-    ]
-    .into();
+    let mut style = egui::Style {
+        text_styles: [
+            (
+                TextStyle::Small,
+                FontId::new(11.5, FontFamily::Proportional),
+            ),
+            (TextStyle::Body, FontId::new(14.0, FontFamily::Proportional)),
+            (
+                TextStyle::Button,
+                FontId::new(14.0, FontFamily::Proportional),
+            ),
+            (
+                TextStyle::Heading,
+                FontId::new(18.0, FontFamily::Proportional),
+            ),
+            (
+                TextStyle::Monospace,
+                FontId::new(13.0, FontFamily::Monospace),
+            ),
+        ]
+        .into(),
+        ..Default::default()
+    };
 
     let s = &mut style.spacing;
     s.item_spacing = vec2(8.0, 2.0);
@@ -471,10 +473,12 @@ fn ui_fonts(
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         "NotoEmoji-Regular".to_owned(),
-        std::sync::Arc::new(egui::FontData::from_static(NOTO_EMOJI).tweak(egui::FontTweak {
-            scale: EMOJI_SCALE,
-            ..Default::default()
-        })),
+        std::sync::Arc::new(
+            egui::FontData::from_static(NOTO_EMOJI).tweak(egui::FontTweak {
+                scale: EMOJI_SCALE,
+                ..Default::default()
+            }),
+        ),
     );
     let mut add = |name: String, (data, index): (Vec<u8>, u32)| {
         let mut font = egui::FontData::from_owned(data);
@@ -645,8 +649,16 @@ mod tests {
     /// instead of rendering as boxes. Skipped where no such font is installed.
     #[test]
     fn baseline_shift_aligns_fallback_baselines() {
-        let noto_sans = VMetrics { ascent: 1.069, descent: -0.293, gap: 0.0 };
-        let symbols2 = VMetrics { ascent: 1.069, descent: -0.630, gap: 0.0 };
+        let noto_sans = VMetrics {
+            ascent: 1.069,
+            descent: -0.293,
+            gap: 0.0,
+        };
+        let symbols2 = VMetrics {
+            ascent: 1.069,
+            descent: -0.630,
+            gap: 0.0,
+        };
         assert!(baseline_shift(noto_sans, noto_sans, 1.0).abs() < 1e-6);
         // Symbols2 would sit (1.699 − 1.362) / 2 ≈ 0.17 em too high: shift it down.
         assert!((baseline_shift(noto_sans, symbols2, 1.0) - 0.1685).abs() < 1e-3);
@@ -699,7 +711,10 @@ mod tests {
         for ctx in [&bare, &with] {
             frame(ctx, false);
         }
-        assert!(!bare.fonts_mut(|f| f.has_glyph(&font, '⯑')), "egui alone lacks it");
+        assert!(
+            !bare.fonts_mut(|f| f.has_glyph(&font, '⯑')),
+            "egui alone lacks it"
+        );
         assert!(with.fonts_mut(|f| f.has_glyph(&font, '⯑')));
     }
 }

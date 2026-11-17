@@ -211,6 +211,24 @@ fn outline_width(editor: &Editor, scale: f32) -> f32 {
     }
 }
 
+/// A small "Exporting…" card with a spinner at the bottom right, above the status bar.
+fn export_indicator(ctx: &egui::Context, name: &str, status_bar_h: f32) {
+    let corner = ctx.content_rect().right_bottom() - egui::vec2(12.0, status_bar_h + 10.0);
+    egui::Area::new(egui::Id::new("markdone-export"))
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::RIGHT_BOTTOM)
+        .fixed_pos(corner)
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new());
+                    ui.label(format!("Exporting “{name}”…"));
+                });
+            });
+        });
+}
+
 /// Extra left padding (logical px) for the line numbers: room for the widest number in
 /// a monospace digit at the numbers' size, plus a gap.
 fn line_number_gutter(font_size: f32, line_count: usize) -> f32 {
@@ -442,6 +460,10 @@ pub(crate) enum WritEvent {
     OpenPicked(Vec<PathBuf>),
     /// Another launch handed over these files (empty: just raise the window).
     InstanceOpen(Vec<PathBuf>),
+    /// The export dialog for tab `id` closed (`None`: cancelled).
+    ExportPicked { id: u64, path: Option<PathBuf> },
+    /// A PDF export finished: the file, or an error for the user.
+    ExportDone(Result<PathBuf, String>),
 }
 
 /// Tabs to close (by id), and whether the application quits once they are closed.
@@ -456,6 +478,8 @@ enum PendingModal {
     /// Some tabs of `req` have unsaved changes (`dirty`, by id in tab order).
     Unsaved { req: CloseRequest, dirty: Vec<u64> },
     Message { title: String, text: String },
+    /// A PDF export finished.
+    Exported { path: PathBuf },
 }
 
 /// A tab's file changed on disk and the user must choose between the disk version
@@ -766,6 +790,8 @@ struct App {
     modal: Option<PendingModal>,
     /// A native Open / Save As dialog is open (at most one at a time).
     file_dialog_open: bool,
+    /// A PDF export is running: the output file name (shown with a spinner).
+    export_running: Option<String>,
     /// Recent files (its `open`/`active` are recomputed from the tabs when saved).
     session: Session,
     /// Where the session is saved; `None` = not saved (`--demo`).
@@ -956,6 +982,7 @@ impl App {
             github,
             modal: missing_files_notice(&missing),
             file_dialog_open: false,
+            export_running: None,
             modifiers: ModifiersState::empty(),
             mouse_pos: (0.0, 0.0),
             selection_drag: None,
@@ -1212,6 +1239,77 @@ impl App {
             let path = dialog.save_file();
             let _ = proxy.send_event(WritEvent::SaveAsPicked { id, path, then });
         });
+    }
+
+    /// Ask where to export tab `i` as PDF (answer comes back as `ExportPicked`).
+    fn start_export(&mut self, i: usize) {
+        if self.file_dialog_open {
+            return;
+        }
+        if let Some(name) = &self.export_running {
+            self.show_message(
+                "Export in progress",
+                format!("“{name}” is still being exported; try again when it is done."),
+            );
+            return;
+        }
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let editor = self.tab_editor(i);
+        let stem = editor
+            .file_path()
+            .and_then(Path::file_stem)
+            .map_or_else(|| "untitled".to_string(), |s| s.to_string_lossy().into_owned());
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Export as PDF")
+            .add_filter("PDF", &["pdf"])
+            .set_file_name(format!("{stem}.pdf"))
+            .set_parent(&*state.window);
+        if let Some(dir) = self.dialog_dir(i) {
+            dialog = dialog.set_directory(dir);
+        }
+        let id = self.tabs[i].id;
+        let proxy = self.proxy.clone();
+        self.file_dialog_open = true;
+        std::thread::spawn(move || {
+            let path = dialog.save_file();
+            let _ = proxy.send_event(WritEvent::ExportPicked { id, path });
+        });
+    }
+
+    /// Export tab `id` (its current text, unsaved changes included) to `path` on a
+    /// worker thread; the result comes back as `ExportDone`.
+    fn run_export(&mut self, id: u64, mut path: PathBuf) {
+        let Some(i) = self.tab_index(id) else {
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("pdf");
+        }
+        let editor = self.tab_editor(i);
+        let job = crate::export::ExportJob {
+            markdown: editor.text(),
+            base_dir: editor
+                .file_path()
+                .and_then(|p| std::path::absolute(p).ok())
+                .and_then(|p| p.parent().map(Path::to_path_buf)),
+            title: editor
+                .file_path()
+                .and_then(Path::file_stem)
+                .map_or_else(|| "Untitled".to_string(), |s| s.to_string_lossy().into_owned()),
+            output: path.clone(),
+        };
+        self.export_running = Some(
+            path.file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+        );
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let result = crate::export::export_pdf(&job).map(|()| job.output);
+            let _ = proxy.send_event(WritEvent::ExportDone(result));
+        });
+        self.redraw();
     }
 
     /// Ask for files to open (answer comes back as `OpenPicked`).
@@ -1568,6 +1666,11 @@ impl App {
                 title: title.clone(),
                 text: text.clone(),
             },
+            PendingModal::Exported { path } => DialogView::Exported {
+                name: path
+                    .file_name()
+                    .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()),
+            },
         })
     }
 
@@ -1601,6 +1704,15 @@ impl App {
                 _ => {}
             },
             PendingModal::Message { .. } => {}
+            PendingModal::Exported { path } => match answer {
+                Answer::OpenFile => {
+                    if let Err(e) = open::that_detached(&path) {
+                        eprintln!("[markdone] failed to open {}: {e}", path.display());
+                    }
+                }
+                Answer::Reveal => crate::platform::reveal_in_file_manager(&path),
+                _ => {}
+            },
         }
         self.redraw();
     }
@@ -1773,6 +1885,10 @@ impl App {
             }
             Command::SaveAs => {
                 self.start_save_as(self.active_tab, None);
+                return;
+            }
+            Command::ExportPdf => {
+                self.start_export(self.active_tab);
                 return;
             }
             Command::CloseTab => {
@@ -3097,6 +3213,24 @@ impl ApplicationHandler<WritEvent> for App {
             self.open_paths(paths);
             return;
         }
+        if let WritEvent::ExportPicked { id, path } = event {
+            self.file_dialog_open = false;
+            if let Some(path) = path {
+                self.run_export(id, path);
+            }
+            return;
+        }
+        if let WritEvent::ExportDone(result) = event {
+            self.export_running = None;
+            match result {
+                Ok(path) => {
+                    self.modal = Some(PendingModal::Exported { path });
+                    self.redraw();
+                }
+                Err(e) => self.show_message("Export failed", e),
+            }
+            return;
+        }
         if let WritEvent::InstanceOpen(paths) = event {
             self.open_paths(paths);
             if let Some(state) = self.state.as_ref() {
@@ -3884,6 +4018,7 @@ impl ApplicationHandler<WritEvent> for App {
                         "n" if !shift => Some(Command::New),
                         "o" if !shift => Some(Command::Open),
                         "s" if shift => Some(Command::SaveAs),
+                        "e" if !shift => Some(Command::ExportPdf),
                         "s" => Some(Command::Save),
                         "w" => Some(Command::CloseTab),
                         "q" => Some(Command::Quit),
@@ -4546,6 +4681,8 @@ impl ApplicationHandler<WritEvent> for App {
                         r
                     }));
                 }
+                let exporting = self.export_running.clone();
+                let status_points = STATUS_BAR_H;
                 let mut prefs_edit = self.prefs_open.then(|| self.prefs.clone());
                 let mut prefs_changed = false;
                 let mut prefs_open = self.prefs_open;
@@ -4556,6 +4693,9 @@ impl ApplicationHandler<WritEvent> for App {
                         let menu = menu_bar(ui, &menu_state);
                         let tab = tab_strip(ui, &tab_infos, active_tab);
                         picked = menu.or(tab);
+                        if let Some(name) = &exporting {
+                            export_indicator(ui.ctx(), name, status_points);
+                        }
                         if let Some((entries, current, rect)) = &toc {
                             toc_response =
                                 Some(toc::toc_panel(ui, *rect, entries, *current, toc_reveal));

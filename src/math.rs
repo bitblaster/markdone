@@ -115,6 +115,48 @@ fn render_to_image(job: &MathJob) -> Result<LoadedImage, Option<String>> {
     }
 }
 
+/// A formula rasterized for printing (PDF export): PNG bytes plus its size in CSS px
+/// and how far it extends below the text baseline (for inline alignment).
+pub struct MathPng {
+    pub png: Vec<u8>,
+    pub width: f32,
+    pub height: f32,
+    pub depth: f32,
+}
+
+/// Render `latex` in black on transparent at `font_px`, rasterized at `dpr` × for print
+/// sharpness. `Err` carries a LaTeX error message.
+pub fn render_png_for_print(latex: &str, display: bool, font_px: f32, dpr: f32) -> Result<MathPng, String> {
+    let out = catch_unwind(AssertUnwindSafe(|| -> Result<MathPng, String> {
+        let nodes = parse(latex).map_err(|e| e.to_string())?;
+        let opts = LayoutOptions {
+            style: if display { MathStyle::Display } else { MathStyle::Text },
+            color: Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+            ..Default::default()
+        };
+        let dl = to_display_list(&layout(&nodes, &opts));
+        let total_h = (dl.height + dl.depth) as f32;
+        if dl.width <= 0.0 || total_h <= 0.0 {
+            return Err("empty formula".into());
+        }
+        let width = dl.width as f32 * font_px + 2.0 * PAD;
+        let height = total_h * font_px + 2.0 * PAD;
+        // Keep huge formulas under a sane raster size.
+        let dpr = dpr.min(4000.0 / width.max(height)).max(0.01);
+        let ropts = RenderOptions {
+            font_size: font_px,
+            padding: PAD,
+            background_color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+            font_dir: String::new(),
+            device_pixel_ratio: dpr,
+        };
+        let png = render_to_png(&dl, &ropts).map_err(|e| format!("{e:?}"))?;
+        let baseline = dl.height as f32 * font_px + PAD;
+        Ok(MathPng { png, width, height, depth: height - baseline })
+    }));
+    out.unwrap_or_else(|_| Err("the formula renderer failed on this input".into()))
+}
+
 /// For each `(key, job)` with no cache entry, mark it loading and render on a worker thread
 /// (parse+layout is CPU-heavy), then `notify()` so the shell relays out around the image.
 /// Mirrors `mermaid::spawn_mermaid_renders`.

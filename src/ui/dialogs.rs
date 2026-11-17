@@ -8,8 +8,18 @@
 /// What a dialog shows.
 pub enum DialogView {
     /// Documents with unsaved changes are about to be closed (file names, in tab order).
-    Unsaved { names: Vec<String>, quitting: bool },
-    Message { title: String, text: String },
+    Unsaved {
+        names: Vec<String>,
+        quitting: bool,
+    },
+    Message {
+        title: String,
+        text: String,
+    },
+    /// A PDF export finished (`name`: the file name).
+    Exported {
+        name: String,
+    },
 }
 
 /// The user's choice.
@@ -27,6 +37,10 @@ pub enum Answer {
     KeepMine,
     /// Dismiss a message.
     Ok,
+    /// Open the exported file with the default application.
+    OpenFile,
+    /// Show the exported file in the file manager.
+    Reveal,
 }
 
 const WIDTH: f32 = 420.0;
@@ -46,11 +60,13 @@ pub fn show(ctx: &egui::Context, view: &DialogView) -> Option<Answer> {
                 };
                 heading(ui, &title);
                 if names.len() > 1 {
-                    egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
-                        for name in names {
-                            ui.label(format!("•  {name}"));
-                        }
-                    });
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            for name in names {
+                                ui.label(format!("•  {name}"));
+                            }
+                        });
                 }
                 ui.label(if *quitting {
                     "Your changes will be lost if you quit without saving."
@@ -58,7 +74,11 @@ pub fn show(ctx: &egui::Context, view: &DialogView) -> Option<Answer> {
                     "Your changes will be lost if you close without saving."
                 });
                 let save = if names.len() == 1 { "Save" } else { "Save All" };
-                let discard = if *quitting { "Quit Without Saving" } else { "Don't Save" };
+                let discard = if *quitting {
+                    "Quit Without Saving"
+                } else {
+                    "Don't Save"
+                };
                 answer = buttons(
                     ui,
                     &[(discard, Answer::Discard)],
@@ -70,6 +90,15 @@ pub fn show(ctx: &egui::Context, view: &DialogView) -> Option<Answer> {
                 ui.label(text);
                 answer = buttons(ui, &[], &[("OK", Answer::Ok)]);
             }
+            DialogView::Exported { name } => {
+                heading(ui, "PDF exported");
+                ui.label(format!("“{name}” is ready."));
+                answer = buttons(
+                    ui,
+                    &[("Show in Folder", Answer::Reveal)],
+                    &[("Close", Answer::Ok), ("Open", Answer::OpenFile)],
+                );
+            }
         }
     });
     // Escape takes the choice that loses nothing. A click outside does nothing: the
@@ -80,7 +109,7 @@ pub fn show(ctx: &egui::Context, view: &DialogView) -> Option<Answer> {
     {
         answer = Some(match view {
             DialogView::Unsaved { .. } => Answer::Cancel,
-            DialogView::Message { .. } => Answer::Ok,
+            DialogView::Message { .. } | DialogView::Exported { .. } => Answer::Ok,
         });
     }
     answer
@@ -137,7 +166,10 @@ pub fn disk_conflict(
                     answer = buttons(
                         ui,
                         &[],
-                        &[("Keep Current Version", Answer::KeepMine), ("Reload", Answer::Reload)],
+                        &[
+                            ("Keep Current Version", Answer::KeepMine),
+                            ("Reload", Answer::Reload),
+                        ],
                     );
                 }
             });
@@ -151,11 +183,7 @@ fn heading(ui: &mut egui::Ui, text: &str) {
 
 /// A button row: `left` aligned left, `right` aligned right. The last right button is
 /// the default one: highlighted and focused, so Enter picks it.
-fn buttons(
-    ui: &mut egui::Ui,
-    left: &[(&str, Answer)],
-    right: &[(&str, Answer)],
-) -> Option<Answer> {
+fn buttons(ui: &mut egui::Ui, left: &[(&str, Answer)], right: &[(&str, Answer)]) -> Option<Answer> {
     let mut answer = None;
     ui.add_space(6.0);
     ui.horizontal(|ui| {
