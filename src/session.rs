@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// How many recent files File → Open Recent keeps.
 pub const MAX_RECENT: usize = 10;
 
-#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq)]
 pub struct Session {
     /// Documents open at exit, in tab order (untitled documents are not kept).
     #[serde(default)]
@@ -24,6 +24,12 @@ pub struct Session {
     /// Recently opened files, most recent first.
     #[serde(default)]
     pub recent: Vec<PathBuf>,
+    /// The table of contents panel is open.
+    #[serde(default)]
+    pub toc_open: bool,
+    /// Its width, logical px (`None` = default).
+    #[serde(default)]
+    pub toc_width: Option<f32>,
 }
 
 impl Session {
@@ -102,6 +108,8 @@ mod tests {
             open: vec!["/a/x.md".into(), "/b/y.md".into()],
             active: 1,
             recent: vec!["/b/y.md".into()],
+            toc_open: true,
+            toc_width: Some(300.0),
         };
         s.save(&path).unwrap();
         assert_eq!(Session::load(&path), s);
@@ -123,7 +131,7 @@ mod tests {
         let s = Session {
             open: vec![a.clone(), dir.join("gone.md"), c.clone()],
             active: 2,
-            recent: Vec::new(),
+            ..Session::default()
         };
         assert_eq!(s.restorable(), (vec![a.clone(), c.clone()], 1));
         // The active document is gone: the first remaining one is active.

@@ -91,6 +91,8 @@ pub struct Preferences {
     pub full_width: bool,
     /// Maximum text width (logical px) when not `full_width`.
     pub max_width: f32,
+    /// Show line numbers in the left margin.
+    pub line_numbers: bool,
     /// Theme name: a built-in or a `[themes.<name>]` of the config file.
     pub theme: String,
     pub external_change: ExternalChange,
@@ -109,6 +111,7 @@ impl Default for Preferences {
             font_size: FONT_SIZE,
             full_width: false,
             max_width: crate::consts::MAX_CONTENT_WIDTH,
+            line_numbers: false,
             theme: "dracula".to_string(),
             external_change: ExternalChange::Reload,
             check_on_focus: true,
@@ -174,6 +177,7 @@ struct FontSpec {
 struct EditorSpec {
     full_width: Option<bool>,
     max_width: Option<f32>,
+    line_numbers: Option<bool>,
 }
 
 #[cfg(feature = "app")]
@@ -362,6 +366,9 @@ fn resolve(file: FileConfig) -> ResolvedConfig {
         if let Some(full) = editor.full_width {
             cfg.prefs.full_width = full;
         }
+        if let Some(numbers) = editor.line_numbers {
+            cfg.prefs.line_numbers = numbers;
+        }
         if let Some(w) = editor.max_width {
             if w.is_finite() && MAX_WIDTH_RANGE.contains(&w) {
                 cfg.prefs.max_width = w;
@@ -427,6 +434,7 @@ pub fn save_preferences(path: &Path, prefs: &Preferences) -> std::io::Result<()>
     set("theme", "name", value(prefs.theme.as_str()));
     set("editor", "full_width", value(prefs.full_width));
     set("editor", "max_width", number(prefs.max_width));
+    set("editor", "line_numbers", value(prefs.line_numbers));
     set("files", "on_external_change", value(prefs.external_change.key()));
     set("files", "check_on_focus", value(prefs.check_on_focus));
     set("network", "github", value(prefs.github));
@@ -573,6 +581,7 @@ mod tests {
             font_size: 20.0,
             full_width: true,
             max_width: 960.0,
+            line_numbers: true,
             theme: "mine".into(),
             external_change: ExternalChange::Ask,
             check_on_focus: false,

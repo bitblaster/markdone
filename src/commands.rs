@@ -23,6 +23,9 @@ pub enum Command {
     Find,
     Replace,
     ToggleOutline,
+    ToggleLineNumbers,
+    /// Jump to heading `i` of the active document (table of contents).
+    GoToHeading(usize),
     ZoomIn,
     ZoomOut,
     ResetZoom,

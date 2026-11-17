@@ -113,6 +113,30 @@ impl TextEngine {
         None
     }
 
+    /// Installed symbol fonts with outline glyphs, as raw bytes and face index, for the
+    /// egui chrome's fallback chain: egui cannot draw color emoji fonts, and its own
+    /// bundled emoji font misses newer symbols (e.g. 🟢 U+1F7E2, Unicode 12). Those then
+    /// render as monochrome shapes instead of empty boxes. Missing families are skipped.
+    pub fn ui_fallback_fonts(&mut self) -> Vec<(Vec<u8>, u32)> {
+        const FAMILIES: [&str; 4] = [
+            "Noto Sans Symbols2",
+            "Noto Sans Symbols",
+            // Windows equivalents.
+            "Segoe UI Symbol",
+            "Segoe UI Emoji",
+        ];
+        let mut fonts = Vec::new();
+        for name in FAMILIES {
+            if let Some(family) = self.fcx.collection.family_by_name(name)
+                && let Some(font) = family.default_font()
+                && let Some(blob) = font.load(None)
+            {
+                fonts.push((blob.data().to_vec(), font.index()));
+            }
+        }
+        fonts
+    }
+
     /// The default font for a line: the configured family with a monospace fallback, or
     /// system monospace when unset. Owned (`'static`) so it borrows nothing from `self`.
     fn body_family(&self) -> FontFamily<'static> {

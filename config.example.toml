@@ -13,6 +13,8 @@ size = 18.0
 # Text spans the whole window (true) or at most `max_width` logical pixels (default).
 full_width = false
 max_width = 880
+# Line numbers in the left margin (also View → Show Line Numbers).
+line_numbers = false
 
 [files]
 # When an open file changes on disk and has no unsaved changes: "reload" (default) or

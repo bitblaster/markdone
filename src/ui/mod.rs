@@ -27,6 +27,7 @@ use crate::editor::EditorTheme;
 pub mod dialogs;
 pub mod menu;
 pub mod preferences;
+pub mod toc;
 pub mod tabs;
 
 /// Height of the top menu bar, in logical px.
@@ -57,6 +58,8 @@ pub struct UiLayer {
     cursor_released: bool,
     /// The pointer is over egui (bars, a menu, a dialog) as of its last move.
     pointer_over: bool,
+    /// The table of contents panel (points), when shown: egui owns the pointer there.
+    side_panel: Option<egui::Rect>,
 }
 
 impl UiLayer {
@@ -66,11 +69,10 @@ impl UiLayer {
         format: wgpu::TextureFormat,
         theme: &EditorTheme,
         ui_font: Option<(Vec<u8>, u32)>,
+        fallback_fonts: Vec<(Vec<u8>, u32)>,
     ) -> Self {
         let ctx = egui::Context::default();
-        if let Some((data, index)) = ui_font {
-            ctx.set_fonts(fonts_with_ui_font(data, index));
-        }
+        ctx.set_fonts(ui_fonts(ui_font, fallback_fonts));
         let max_texture_side = device.limits().max_texture_dimension_2d as usize;
         let winit = egui_winit::State::new(
             ctx.clone(),
@@ -91,6 +93,7 @@ impl UiLayer {
             repaint_at: None,
             cursor_released: false,
             pointer_over: false,
+            side_panel: None,
         }
     }
 
@@ -126,7 +129,8 @@ impl UiLayer {
             let ppp = self.ctx.pixels_per_point();
             let pos = egui::pos2(position.x as f32 / ppp, position.y as f32 / ppp);
             let over = (position.y as f32) < Self::top_inset(window.scale_factor() as f32)
-                || area_at(&self.ctx, pos);
+                || area_at(&self.ctx, pos)
+                || self.side_panel.is_some_and(|r| r.contains(pos));
             if over && !self.pointer_over {
                 // egui-winit sets the cursor only when its own icon changes, and it does
                 // not know what the editor set: start from the default arrow.
@@ -139,6 +143,17 @@ impl UiLayer {
                 window.request_redraw();
                 return true;
             }
+        }
+        // Buttons and wheel over egui are egui's too (egui itself does not claim them
+        // over plain background content such as the table of contents).
+        if self.pointer_over
+            && matches!(
+                event,
+                WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }
+            )
+        {
+            window.request_redraw();
+            return true;
         }
         if let WindowEvent::CursorLeft { .. } = event {
             self.pointer_over = false;
@@ -156,6 +171,11 @@ impl UiLayer {
             window.request_redraw();
         }
         response.consumed
+    }
+
+    /// Set the area of the table of contents panel (points), `None` when closed.
+    pub fn set_side_panel(&mut self, rect: Option<egui::Rect>) {
+        self.side_panel = rect;
     }
 
     /// Whether egui is using the pointer or has a menu/popup open. A click on the
@@ -433,20 +453,115 @@ pub fn menu_entry_style(style: &mut egui::Style) {
     style.spacing.button_padding = egui::vec2(10.0, 5.0);
 }
 
-/// egui's default fonts with the system UI font first for proportional text.
-fn fonts_with_ui_font(data: Vec<u8>, index: u32) -> egui::FontDefinitions {
+/// The current monochrome Noto Emoji (Google Fonts, SIL OFL 1.1, see
+/// `assets/fonts/NotoEmoji-OFL.txt`; variable weight, drawn at its default 400). It
+/// replaces the older "blob" design egui bundles, and covers newer emoji (🟢 U+1F7E2).
+/// egui cannot draw color emoji, so the chrome shows them in the text color.
+const NOTO_EMOJI: &[u8] = include_bytes!("../../assets/fonts/NotoEmoji-wght.ttf");
+/// Emoji are drawn slightly smaller than the text, as egui does with its own.
+const EMOJI_SCALE: f32 = 0.85;
+
+/// egui's fonts for the chrome: the system UI font first for proportional text, egui's
+/// own fonts (with the current Noto Emoji), then the system symbol fonts for what those
+/// lack. Every fallback font's baseline is aligned with the primary font's.
+fn ui_fonts(
+    ui_font: Option<(Vec<u8>, u32)>,
+    fallbacks: Vec<(Vec<u8>, u32)>,
+) -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
-    let mut font = egui::FontData::from_owned(data);
-    font.index = index;
+    fonts.font_data.insert(
+        "NotoEmoji-Regular".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(NOTO_EMOJI).tweak(egui::FontTweak {
+            scale: EMOJI_SCALE,
+            ..Default::default()
+        })),
+    );
+    let mut add = |name: String, (data, index): (Vec<u8>, u32)| {
+        let mut font = egui::FontData::from_owned(data);
+        font.index = index;
+        fonts.font_data.insert(name, std::sync::Arc::new(font));
+    };
+    let fallback_names: Vec<String> = (0..fallbacks.len())
+        .map(|i| format!("system-symbols-{i}"))
+        .collect();
+    for (name, font) in fallback_names.iter().zip(fallbacks) {
+        add(name.clone(), font);
+    }
+    let has_ui_font = ui_font.is_some();
+    if let Some(font) = ui_font {
+        add("system-ui".to_owned(), font);
+    }
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        let list = fonts.families.entry(family.clone()).or_default();
+        if has_ui_font && family == egui::FontFamily::Proportional {
+            list.insert(0, "system-ui".to_owned());
+        }
+        list.extend(fallback_names.iter().cloned());
+    }
+
+    // Baselines: align every font but the families' primaries with the proportional
+    // primary (the chrome is proportional text; monospace barely appears).
+    let primaries: Vec<String> = [egui::FontFamily::Proportional, egui::FontFamily::Monospace]
+        .iter()
+        .filter_map(|f| fonts.families.get(f).and_then(|l| l.first().cloned()))
+        .collect();
+    let primary = primaries
+        .first()
+        .and_then(|name| fonts.font_data.get(name))
+        .and_then(|data| face_metrics(data));
+    if let Some(primary) = primary {
+        for (name, data) in fonts.font_data.iter_mut() {
+            if primaries.contains(name) {
+                continue;
+            }
+            if let Some(face) = face_metrics(data) {
+                let mut tweaked = (**data).clone();
+                tweaked.tweak.y_offset_factor = baseline_shift(primary, face, tweaked.tweak.scale);
+                *data = std::sync::Arc::new(tweaked);
+            }
+        }
+    }
     fonts
-        .font_data
-        .insert("system-ui".to_owned(), std::sync::Arc::new(font));
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, "system-ui".to_owned());
-    fonts
+}
+
+/// A font's vertical metrics, in em (`descent` negative, as in the font).
+#[derive(Clone, Copy, Debug)]
+struct VMetrics {
+    ascent: f32,
+    descent: f32,
+    gap: f32,
+}
+
+impl VMetrics {
+    fn height(self) -> f32 {
+        self.ascent - self.descent + self.gap
+    }
+}
+
+/// The vertical metrics epaint uses for a font (default instance of a variable font).
+fn face_metrics(data: &egui::FontData) -> Option<VMetrics> {
+    use skrifa::MetadataProvider;
+    use skrifa::instance::{LocationRef, Size};
+
+    let font = skrifa::FontRef::from_index(&data.font, data.index).ok()?;
+    let m = font.metrics(Size::unscaled(), LocationRef::default());
+    let upm = f32::from(m.units_per_em.max(1));
+    Some(VMetrics {
+        ascent: m.ascent / upm,
+        descent: m.descent / upm,
+        gap: m.leading / upm,
+    })
+}
+
+/// The downward shift (fraction of the font size, for `FontTweak::y_offset_factor`)
+/// that puts a fallback face's baseline on the primary font's. epaint places a
+/// fallback glyph's baseline at `face ascent + (font height − face height) / 2`: it
+/// centers the difference in line height, which is off whenever the two fonts split
+/// their height differently between ascent and descent (e.g. Noto Sans Symbols2's long
+/// descent drew its symbols ~0.17 em too high).
+fn baseline_shift(primary: VMetrics, face: VMetrics, scale: f32) -> f32 {
+    let baseline = scale * face.ascent + 0.5 * (primary.height() - scale * face.height());
+    primary.ascent - baseline
 }
 
 #[cfg(test)]
@@ -454,17 +569,35 @@ mod tests {
     use super::*;
 
     fn frame(ctx: &egui::Context, popup: bool) {
+        frame_with(ctx, popup, None, Vec::new());
+    }
+
+    fn frame_with(
+        ctx: &egui::Context,
+        popup: bool,
+        toc_rect: Option<egui::Rect>,
+        events: Vec<egui::Event>,
+    ) {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(1000.0, 800.0),
             )),
+            events,
             ..Default::default()
         };
         let _ = ctx.run_ui(input, |ui| {
             egui::Panel::top("bar").exact_size(30.0).show(ui, |ui| {
                 ui.label("menu");
             });
+            if let Some(rect) = toc_rect {
+                let entries = [toc::TocEntry {
+                    level: 1,
+                    text: "Heading".into(),
+                    folded: false,
+                }];
+                toc::toc_panel(ui, rect, &entries, Some(0), false);
+            }
             if popup {
                 egui::Area::new(egui::Id::new("popup"))
                     .order(egui::Order::Foreground)
@@ -491,5 +624,82 @@ mod tests {
             frame(&ctx, false);
         }
         assert!(!area_at(&ctx, egui::pos2(150.0, 150.0)), "popup closed");
+    }
+
+    /// With the table of contents open, egui must not claim the pointer over the
+    /// document (regression: the panel shrank the root's free area, so egui took the
+    /// mouse wheel everywhere and the document no longer scrolled).
+    #[test]
+    fn toc_panel_leaves_the_document_to_the_editor() {
+        let ctx = egui::Context::default();
+        let toc = egui::Rect::from_min_max(egui::pos2(760.0, 30.0), egui::pos2(1000.0, 780.0));
+        let over_doc = vec![egui::Event::PointerMoved(egui::pos2(300.0, 400.0))];
+        for _ in 0..3 {
+            frame_with(&ctx, false, Some(toc), over_doc.clone());
+        }
+        assert!(!ctx.is_pointer_over_egui(), "document area claimed by egui");
+        assert!(!ctx.egui_wants_pointer_input());
+    }
+
+    /// Symbols missing from the bundled fonts come from the installed symbol fonts
+    /// instead of rendering as boxes. Skipped where no such font is installed.
+    #[test]
+    fn baseline_shift_aligns_fallback_baselines() {
+        let noto_sans = VMetrics { ascent: 1.069, descent: -0.293, gap: 0.0 };
+        let symbols2 = VMetrics { ascent: 1.069, descent: -0.630, gap: 0.0 };
+        assert!(baseline_shift(noto_sans, noto_sans, 1.0).abs() < 1e-6);
+        // Symbols2 would sit (1.699 − 1.362) / 2 ≈ 0.17 em too high: shift it down.
+        assert!((baseline_shift(noto_sans, symbols2, 1.0) - 0.1685).abs() < 1e-3);
+        // The shifted baseline lands on the primary's, at any scale.
+        for scale in [0.85, 1.0, 1.2] {
+            let shift = baseline_shift(noto_sans, symbols2, scale);
+            let baseline = scale * symbols2.ascent
+                + 0.5 * (noto_sans.height() - scale * symbols2.height())
+                + shift;
+            assert!((baseline - noto_sans.ascent).abs() < 1e-6);
+        }
+    }
+
+    /// The bundled Noto Emoji is the one egui uses for emoji, and it covers the emoji
+    /// found in headings (round faces, not the older "blob" design). Checked on the
+    /// font's own character map: egui's `has_glyph` reports false for any character
+    /// served by the face that also serves its replacement character (an emoji font).
+    #[test]
+    fn bundled_noto_emoji_covers_newer_emoji() {
+        use skrifa::MetadataProvider;
+
+        let fonts = ui_fonts(None, Vec::new());
+        let emoji = &fonts.font_data["NotoEmoji-Regular"];
+        assert_eq!(emoji.font.as_ref(), NOTO_EMOJI);
+        assert_eq!(emoji.tweak.scale, EMOJI_SCALE);
+        let font = skrifa::FontRef::new(NOTO_EMOJI).unwrap();
+        let charmap = font.charmap();
+        for c in "😅🟢✅🚀⚠".chars() {
+            assert!(charmap.map(c).is_some(), "{c} U+{:X}", c as u32);
+        }
+        // Ahead of egui's other emoji font, so it is the one picked.
+        let list = &fonts.families[&egui::FontFamily::Proportional];
+        let pos = |n: &str| list.iter().position(|x| x == n).unwrap();
+        assert!(pos("NotoEmoji-Regular") < pos("emoji-icon-font"));
+    }
+
+    #[test]
+    fn system_symbol_fonts_cover_newer_emoji() {
+        let fallbacks = crate::text_engine::TextEngine::new().ui_fallback_fonts();
+        if fallbacks.is_empty() {
+            eprintln!("no system symbol font installed; skipping");
+            return;
+        }
+        let font = egui::FontId::proportional(14.0);
+        // A symbol outside every emoji font (Noto Sans Symbols2: ⯑ U+2BD1).
+        let bare = egui::Context::default();
+        bare.set_fonts(ui_fonts(None, Vec::new()));
+        let with = egui::Context::default();
+        with.set_fonts(ui_fonts(None, fallbacks));
+        for ctx in [&bare, &with] {
+            frame(ctx, false);
+        }
+        assert!(!bare.fonts_mut(|f| f.has_glyph(&font, '⯑')), "egui alone lacks it");
+        assert!(with.fonts_mut(|f| f.has_glyph(&font, '⯑')));
     }
 }

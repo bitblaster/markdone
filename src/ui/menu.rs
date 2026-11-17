@@ -7,6 +7,7 @@ use super::MENU_BAR_H;
 /// State the menu needs to enable/check its entries.
 pub struct MenuState {
     pub outline_open: bool,
+    pub line_numbers: bool,
     pub tab_count: usize,
     /// Recent files: (file name, shortened folder), most recent first.
     pub recent: Vec<(String, String)>,
@@ -68,6 +69,11 @@ pub fn menu_bar(ui: &mut egui::Ui, state: &MenuState) -> Option<Command> {
                             .shortcut_text(Command::ToggleOutline.shortcut());
                         if ui.add(toc).clicked() {
                             picked = Some(Command::ToggleOutline);
+                            ui.close();
+                        }
+                        let numbers = egui::Button::selectable(state.line_numbers, "Show Line Numbers");
+                        if ui.add(numbers).clicked() {
+                            picked = Some(Command::ToggleLineNumbers);
                             ui.close();
                         }
                         ui.separator();

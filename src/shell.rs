@@ -18,7 +18,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -62,7 +62,7 @@ use crate::inline::{GitHubContext, GitHubRef};
 use crate::math;
 #[cfg(feature = "mermaid")]
 use crate::mermaid;
-use crate::outline::{current_heading_index, draw_outline};
+use crate::outline::current_heading_index;
 use crate::overlay::{
     HoverTarget, draw_autocomplete, draw_hover_popover, find_hover_target, hover_target_at_offset,
 };
@@ -171,6 +171,7 @@ use crate::session::Session;
 use crate::ui::UiLayer;
 use crate::ui::dialogs::{self, Answer, DialogView};
 use crate::ui::preferences;
+use crate::ui::toc::{self, TocEntry};
 use crate::ui::menu::{MenuState, menu_bar};
 use crate::ui::tabs::{TabInfo, tab_strip};
 use crate::validation::{GitHubValidationCache, IssueOrPr, MentionableUser, ValidatedRefData};
@@ -186,14 +187,38 @@ fn chrome_metrics(scale: f32, height_dev: f32, find_h: f32) -> (f32, f32) {
     (content_top, editor_h)
 }
 
-/// Device-px width of the right-docked outline panel (0 when closed). Mirrors
+/// Width of the table of contents panel, logical px (f32 bits). Global because every
+/// layout path reads it through [`outline_width`]; changed by dragging the panel edge.
+static TOC_WIDTH: AtomicU32 = AtomicU32::new(OUTLINE_WIDTH.to_bits());
+
+fn toc_width() -> f32 {
+    f32::from_bits(TOC_WIDTH.load(Ordering::Relaxed))
+}
+
+fn set_toc_width(width: f32) {
+    TOC_WIDTH.store(width.clamp(toc::MIN_W, toc::MAX_W).to_bits(), Ordering::Relaxed);
+}
+
+/// Device-px width of the right-docked table of contents (0 when closed). Mirrors
 /// `find_bar_height`: the document region insets by this so it never draws under the panel.
 fn outline_width(editor: &Editor, scale: f32) -> f32 {
     if editor.outline_open() {
-        OUTLINE_WIDTH * scale
+        (toc_width() * scale).round()
     } else {
         0.0
     }
+}
+
+/// Extra left padding (logical px) for the line numbers: room for the widest number in
+/// a monospace digit at the numbers' size, plus a gap.
+fn line_number_gutter(font_size: f32, line_count: usize) -> f32 {
+    let digits = line_count.max(1).ilog10() as f32 + 1.0;
+    digits * line_number_size(font_size) * 0.62 + 8.0
+}
+
+/// Font size of the line numbers for a document font size.
+fn line_number_size(font_size: f32) -> f32 {
+    (font_size * 0.8).max(9.0)
 }
 
 /// Device-px height of the bottom find bar for the current find state (0 when closed):
@@ -615,6 +640,8 @@ struct DocEngine {
     font_size: f32,
     /// Maximum body width (logical px); `None` = full window width.
     max_content_width: Option<f32>,
+    /// Line numbers are shown (the left padding makes room for them).
+    line_numbers: bool,
     editor: Editor,
     doc: Option<DocLayout>,
     /// Shared cache of decoded standalone images, threaded into `DocLayout::build`.
@@ -804,10 +831,11 @@ struct App {
     hovered: Option<HoverTarget>,
     /// Screen rects of the currently-drawn autocomplete rows (for click routing).
     ac_row_rects: Vec<ScreenRect>,
-    /// Screen rects of the currently-drawn outline rows (for click-to-scroll routing).
-    outline_row_rects: Vec<ScreenRect>,
-    /// Outline row under the pointer, if any (drives the hover tint).
-    outline_hover: Option<usize>,
+    /// Table of contents: its width (logical px) as saved in the session (updated when
+    /// a resize drag ends), and the current heading last frame (a change scrolls the
+    /// list to it).
+    toc_width: f32,
+    toc_current: Option<usize>,
     /// Fold chevron hit rects (heading byte offset → gutter rect) from the last paint.
     fold_chevron_rects: Vec<(usize, ScreenRect)>,
     /// Heading (by byte offset) whose gutter chevron is under the pointer, if any. Drives
@@ -864,7 +892,11 @@ impl App {
                 conflict: None,
             });
         }
-        let editor = editor.expect("at least one document");
+        let mut editor = editor.expect("at least one document");
+        editor.set_outline_open(session.toc_open);
+        if let Some(width) = session.toc_width {
+            set_toc_width(width);
+        }
         let next_tab_id = tabs.len() as u64;
         let title = window_title(&editor);
         // Apply the configured font family, but only if it renders fixed-pitch — a
@@ -893,6 +925,7 @@ impl App {
                 theme: config.theme,
                 font_size: config.font_size,
                 max_content_width: content_width(&config.prefs),
+                line_numbers: config.prefs.line_numbers,
                 editor,
                 doc: None,
                 images: ImageCache::new(),
@@ -935,8 +968,8 @@ impl App {
             title,
             hovered: None,
             ac_row_rects: Vec::new(),
-            outline_row_rects: Vec::new(),
-            outline_hover: None,
+            toc_width: toc_width(),
+            toc_current: None,
             fold_chevron_rects: Vec::new(),
             gutter_hover: None,
             find_btn_rects: None,
@@ -971,7 +1004,10 @@ impl App {
             .doc
             .as_ref()
             .map_or((0, 0.0), |d| d.scroll_anchor());
+        // The table of contents is a window-wide panel: it stays as it was.
+        let toc_open = self.doc_engine.editor.outline_open();
         incoming.swap_with(&mut self.doc_engine);
+        self.doc_engine.editor.set_outline_open(toc_open);
         incoming.park();
         self.doc_engine.images.unpark();
         self.tabs[old].state = Some(incoming);
@@ -984,8 +1020,6 @@ impl App {
         self.scrollbar_pending = false;
         self.wheel_pending_dy = 0.0;
         self.drag_scroll_dy = 0.0;
-        self.outline_row_rects.clear();
-        self.outline_hover = None;
         self.fold_chevron_rects.clear();
         self.gutter_hover = None;
         self.find_btn_rects = None;
@@ -1286,6 +1320,10 @@ impl App {
             self.doc_engine.font_size = self.prefs.font_size;
             relayout = true;
         }
+        if old.line_numbers != self.prefs.line_numbers {
+            self.doc_engine.line_numbers = self.prefs.line_numbers;
+            relayout = true;
+        }
         if old.full_width != self.prefs.full_width || old.max_width != self.prefs.max_width {
             self.doc_engine.max_content_width = content_width(&self.prefs);
             relayout = true;
@@ -1363,6 +1401,46 @@ impl App {
         self.apply_preferences(prefs);
     }
 
+    /// Jump to heading `i` of the active document (table of contents click): caret on
+    /// the heading, unfolded if needed, pinned to the top of the view.
+    fn go_to_heading(&mut self, i: usize) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let (w, vh, scale) = state.viewport();
+        let Some(off) = self
+            .doc_engine
+            .editor
+            .state
+            .buffer
+            .headings()
+            .get(i)
+            .map(|h| h.byte_offset)
+        else {
+            return;
+        };
+        self.doc_engine.editor.set_cursor(off);
+        // The heading may sit inside a folded ancestor; reveal it and relayout so its
+        // geometry exists before pinning it.
+        if self.doc_engine.editor.reveal_cursor() {
+            self.doc_engine.rebuild_preserving_scroll(w, scale, vh);
+        }
+        let mut remeasure = false;
+        if let Some(doc) = self.doc_engine.doc.as_mut() {
+            doc.scroll_line_to_top(doc.line_of(off), vh);
+            remeasure = doc.needs_remeasure(vh);
+        }
+        // Outside the materialized band: rebuild around the new anchor, then re-pin.
+        if remeasure {
+            self.doc_engine.rebuild_preserving_scroll(w, scale, vh);
+            if let Some(doc) = self.doc_engine.doc.as_mut() {
+                doc.scroll_line_to_top(doc.line_of(off), vh);
+            }
+        }
+        sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
+        self.redraw();
+    }
+
     /// With "check on focus" on, compare the active document with its file on disk
     /// (a stat) and reload / ask if it changed.
     fn check_active_on_disk(&mut self) {
@@ -1388,6 +1466,8 @@ impl App {
             open,
             active,
             recent: self.session.recent.clone(),
+            toc_open: self.doc_engine.editor.outline_open(),
+            toc_width: Some(self.toc_width),
         }
     }
 
@@ -1552,6 +1632,16 @@ impl App {
         match cmd {
             Command::New => self.open_blank_tab(),
             Command::Preferences => self.prefs_open = true,
+            Command::GoToHeading(i) => {
+                self.go_to_heading(i);
+                return;
+            }
+            Command::ToggleLineNumbers => {
+                let mut prefs = self.prefs.clone();
+                prefs.line_numbers = !prefs.line_numbers;
+                self.apply_preferences(prefs);
+                return;
+            }
             Command::ZoomIn => {
                 self.zoom(Some(1.0));
                 return;
@@ -2383,7 +2473,11 @@ impl DocEngine {
             content_x0: 0.0,
             content_w: (device_width - outline_w).max(1.0),
             scale,
-            pad_x: PADDING,
+            pad_x: if self.line_numbers {
+                PADDING + line_number_gutter(self.font_size, snapshot.line_count())
+            } else {
+                PADDING
+            },
             pad_top: PADDING,
             pad_bottom: PADDING * 2.0,
             base_font_size: self.font_size,
@@ -2668,13 +2762,10 @@ fn paint_document(
     width: f32,
     height: f32,
     scale: f32,
-    outline_hover: Option<usize>,
     gutter_hover: Option<usize>,
-) -> (
-    Option<FindButtonRects>,
-    Vec<ScreenRect>,
-    Vec<(usize, ScreenRect)>,
-) {
+    // Line numbers: the document font size (numbers are drawn smaller), or `None`.
+    line_numbers: Option<f32>,
+) -> (Option<FindButtonRects>, Vec<(usize, ScreenRect)>) {
     // The outline panel (when open) reserves a right strip; clip the document body to the
     // reduced region so glyphs/backgrounds never draw under the panel.
     let outline_w = outline_width(editor, scale);
@@ -2760,39 +2851,10 @@ fn paint_document(
         );
     }
     let fold_rects = draw_fold_chevrons(scene, theme, editor, doc, editor_h, gutter_hover, scale);
+    if let Some(font_size) = line_numbers {
+        draw_line_numbers(scene, engine, theme, editor, doc, editor_h, font_size, scale);
+    }
     scene.pop_layer();
-
-    // The right-docked outline panel: the document's heading list with the current
-    // section highlighted. Rects (one per row) route clicks back to a scroll.
-    let outline_rects = if outline_w > 0.0 {
-        let panel = BarRect {
-            x0: (width - outline_w) as f64,
-            y0: content_top as f64,
-            x1: width as f64,
-            y1: (content_top + editor_h) as f64,
-        };
-        let buffer = &editor.state.buffer;
-        let headings = buffer.headings();
-        let cursor_line = buffer.byte_to_line(editor.cursor_position());
-        let current = current_heading_index(headings, cursor_line);
-        let folded: Vec<bool> = headings
-            .iter()
-            .map(|h| editor.is_heading_folded(h.byte_offset))
-            .collect();
-        draw_outline(
-            engine,
-            scene,
-            theme,
-            headings,
-            current,
-            outline_hover,
-            &folded,
-            &panel,
-            scale,
-        )
-    } else {
-        Vec::new()
-    };
 
     // Chrome (bottom, above the OS-native title bar): the find bar sits in the gap
     // between the document and the status bar, so the status bar starts below it.
@@ -2831,7 +2893,48 @@ fn paint_document(
         &info,
         scale,
     );
-    (btn_rects, outline_rects, fold_rects)
+    (btn_rects, fold_rects)
+}
+
+/// Draw the source line numbers in the left margin, right-aligned just left of the fold
+/// chevrons: one per visible buffer line (folded-away lines are skipped), at the top of
+/// its first row. The cursor's line is drawn brighter.
+#[allow(clippy::too_many_arguments)]
+fn draw_line_numbers(
+    scene: &mut Scene,
+    engine: &mut TextEngine,
+    theme: &EditorTheme,
+    editor: &Editor,
+    doc: &DocLayout,
+    editor_h: f32,
+    font_size: f32,
+    scale: f32,
+) {
+    let (first, last) = doc.visible_range(editor_h);
+    let hidden = editor.hidden_line_ranges();
+    let cursor_line = editor.line_of(editor.cursor_position());
+    let size = line_number_size(font_size);
+    let right = doc.body_left() - 22.0 * scale;
+    // Vertically, center the number on the document's first text row.
+    let row_h = font_size * LINE_HEIGHT * scale;
+    for line in first..last {
+        if hidden.iter().any(|r| r.contains(&line)) {
+            continue;
+        }
+        let Some(top) = doc.line_top_screen(line) else {
+            continue;
+        };
+        let color = if line == cursor_line {
+            peniko_color(theme.foreground)
+        } else {
+            peniko_color(theme.comment)
+        };
+        let label = (line + 1).to_string();
+        let layout = engine.build_line(&label, scale, size, LINE_HEIGHT, color, None, &[]);
+        let first_row = row_h.min(doc.line_text_height(line).max(layout.height()));
+        let y = top + (first_row - layout.height()) / 2.0;
+        engine.draw_line(scene, &layout, (right - layout.width(), y));
+    }
 }
 
 /// Heading depth for a `Ctrl+Shift+<n>` fold-to-level shortcut, from the physical digit
@@ -3114,12 +3217,14 @@ impl ApplicationHandler<WritEvent> for App {
         window.request_redraw();
         self.ui = menu_bar.then(|| {
             let ui_font = self.doc_engine.text_engine.system_ui_font();
+            let fallbacks = self.doc_engine.text_engine.ui_fallback_fonts();
             UiLayer::new(
                 &window,
                 &dev.device,
                 surface.config.format,
                 &self.doc_engine.theme,
                 ui_font,
+                fallbacks,
             )
         });
         self.state = Some(ActiveSurface {
@@ -3397,19 +3502,6 @@ impl ApplicationHandler<WritEvent> for App {
                     self.scrollbar_hover = sb_hover;
                     state.window.request_redraw();
                 }
-                // Outline panel hover: highlight the row under the pointer (independent of
-                // the document/autocomplete hover machinery below).
-                let panel_left = state.surface.config.width as f32 - OUTLINE_WIDTH * state.scale;
-                let new_outline_hover =
-                    if self.doc_engine.editor.outline_open() && self.mouse_pos.0 >= panel_left {
-                        ac_row_at(&self.outline_row_rects, self.mouse_pos)
-                    } else {
-                        None
-                    };
-                if new_outline_hover != self.outline_hover {
-                    self.outline_hover = new_outline_hover;
-                    state.window.request_redraw();
-                }
                 // Fold-gutter hover: reveal the expanded (▾) chevron under the pointer.
                 let new_gutter_hover = self
                     .fold_chevron_rects
@@ -3608,50 +3700,6 @@ impl ApplicationHandler<WritEvent> for App {
                     self.doc_engine.editor.apply_fold_gesture(off, ctrl, shift);
                     self.doc_engine
                         .rebuild_preserving_scroll(w, state.scale, vh);
-                    state.window.request_redraw();
-                    return;
-                }
-
-                // Outline panel click: jump to the clicked heading (pin it to the top).
-                // A click anywhere in the strip returns without placing the doc caret,
-                // even if it missed a row (the strip isn't part of the document).
-                if self.doc_engine.editor.outline_open()
-                    && self.mouse_pos.0 >= w - OUTLINE_WIDTH * state.scale
-                {
-                    if let Some(i) = ac_row_at(&self.outline_row_rects, self.mouse_pos) {
-                        let off = self
-                            .doc_engine
-                            .editor
-                            .state
-                            .buffer
-                            .headings()
-                            .get(i)
-                            .map(|h| h.byte_offset);
-                        if let Some(off) = off {
-                            self.doc_engine.editor.set_cursor(off);
-                            // The clicked heading may sit inside a folded ancestor; reveal
-                            // it and relayout so its geometry exists before we pin it.
-                            if self.doc_engine.editor.reveal_cursor() {
-                                self.doc_engine
-                                    .rebuild_preserving_scroll(w, state.scale, vh);
-                            }
-                            let mut remeasure = false;
-                            if let Some(doc) = self.doc_engine.doc.as_mut() {
-                                doc.scroll_line_to_top(doc.line_of(off), vh);
-                                remeasure = doc.needs_remeasure(vh);
-                            }
-                            // If the heading sits outside the materialized band, rebuild
-                            // around the new scroll anchor so it lays out, then re-pin.
-                            if remeasure {
-                                self.doc_engine
-                                    .rebuild_preserving_scroll(w, state.scale, vh);
-                                if let Some(doc) = self.doc_engine.doc.as_mut() {
-                                    doc.scroll_line_to_top(doc.line_of(off), vh);
-                                }
-                            }
-                            sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
-                        }
-                    }
                     state.window.request_redraw();
                     return;
                 }
@@ -4295,7 +4343,7 @@ impl ApplicationHandler<WritEvent> for App {
                 }
 
                 if let Some(doc) = self.doc_engine.doc.as_ref() {
-                    let (btn_rects, outline_rects, fold_rects) = paint_document(
+                    let (btn_rects, fold_rects) = paint_document(
                         &mut self.scene,
                         &mut self.doc_engine.text_engine,
                         &self.doc_engine.theme,
@@ -4307,11 +4355,12 @@ impl ApplicationHandler<WritEvent> for App {
                         width,
                         height,
                         state.scale,
-                        self.outline_hover,
                         self.gutter_hover,
+                        self.doc_engine
+                            .line_numbers
+                            .then_some(self.doc_engine.font_size),
                     );
                     self.find_btn_rects = btn_rects;
-                    self.outline_row_rects = outline_rects;
                     self.fold_chevron_rects = fold_rects;
 
                     if let Some(geo) = scrollbar::geometry(
@@ -4376,6 +4425,7 @@ impl ApplicationHandler<WritEvent> for App {
                 // egui chrome frame (menu bar). Picked commands run after present.
                 let menu_state = MenuState {
                     outline_open: self.doc_engine.editor.outline_open(),
+                    line_numbers: self.prefs.line_numbers,
                     tab_count: self.tabs.len(),
                     recent: self.session.recent.iter().map(|p| recent_label(p)).collect(),
                 };
@@ -4405,6 +4455,38 @@ impl ApplicationHandler<WritEvent> for App {
                 });
                 let modal_shown = dialog_view.is_some() || self.prefs_open || conflict.is_some();
                 let top_points = UiLayer::top_inset(state.scale) / state.scale;
+                // Table of contents (egui side panel over the strip the layout reserves).
+                let toc_w_dev = outline_width(&self.doc_engine.editor, state.scale);
+                let toc = (toc_w_dev > 0.0).then(|| {
+                    let buffer = &self.doc_engine.editor.state.buffer;
+                    let headings = buffer.headings();
+                    let cursor_line = buffer.byte_to_line(self.doc_engine.editor.cursor_position());
+                    let current = current_heading_index(headings, cursor_line);
+                    let entries: Vec<TocEntry> = headings
+                        .iter()
+                        .map(|h| TocEntry {
+                            level: h.level,
+                            text: h.text.clone(),
+                            folded: self.doc_engine.editor.is_heading_folded(h.byte_offset),
+                        })
+                        .collect();
+                    let s = state.scale;
+                    let rect = egui::Rect::from_min_max(
+                        egui::pos2((width - toc_w_dev) / s, top_points + content_top / s),
+                        egui::pos2(width / s, top_points + (content_top + editor_h) / s),
+                    );
+                    (entries, current, rect)
+                });
+                let toc_reveal = toc.as_ref().is_some_and(|t| t.1 != self.toc_current);
+                self.toc_current = toc.as_ref().and_then(|t| t.1);
+                let mut toc_response = None;
+                if let Some(ui) = self.ui.as_mut() {
+                    ui.set_side_panel(toc.as_ref().map(|t| {
+                        let mut r = t.2;
+                        r.min.x -= toc::GRIP_W / 2.0;
+                        r
+                    }));
+                }
                 let mut prefs_edit = self.prefs_open.then(|| self.prefs.clone());
                 let mut prefs_changed = false;
                 let mut prefs_open = self.prefs_open;
@@ -4415,6 +4497,10 @@ impl ApplicationHandler<WritEvent> for App {
                         let menu = menu_bar(ui, &menu_state);
                         let tab = tab_strip(ui, &tab_infos, active_tab);
                         picked = menu.or(tab);
+                        if let Some((entries, current, rect)) = &toc {
+                            toc_response =
+                                Some(toc::toc_panel(ui, *rect, entries, *current, toc_reveal));
+                        }
                         if let Some(prefs) = prefs_edit.as_mut() {
                             prefs_changed = preferences::show(
                                 ui.ctx(),
@@ -4494,6 +4580,20 @@ impl ApplicationHandler<WritEvent> for App {
                 surface_texture.present();
                 self.frame_retry = FrameRetry::default();
                 self.prefs_open = prefs_open;
+                if let Some(r) = toc_response {
+                    if let Some(i) = r.clicked {
+                        picked = Some(Command::GoToHeading(i));
+                    }
+                    if (r.width - toc_width()).abs() >= 1.0 {
+                        set_toc_width(r.width);
+                        let (w, vh, scale) = state.viewport();
+                        self.doc_engine.rebuild_preserving_scroll(w, scale, vh);
+                        state.window.request_redraw();
+                    }
+                    if !r.resizing {
+                        self.toc_width = toc_width();
+                    }
+                }
                 if prefs_changed && let Some(prefs) = prefs_edit {
                     self.apply_preferences(prefs);
                 }
@@ -4981,6 +5081,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         theme: EditorTheme::dracula(),
         font_size: FONT_SIZE,
         max_content_width: Some(MAX_CONTENT_WIDTH),
+        line_numbers: false,
         editor,
         doc: None,
         images: ImageCache::new(),
@@ -5152,6 +5253,7 @@ mod tests {
             theme: EditorTheme::dracula(),
             font_size: FONT_SIZE,
             max_content_width: Some(MAX_CONTENT_WIDTH),
+            line_numbers: false,
             editor: Editor::new(text),
             doc: None,
             images: ImageCache::new(),
@@ -5393,6 +5495,18 @@ mod tests {
             retry.control_flow(Some(now + Duration::from_secs(1))),
             ControlFlow::WaitUntil(now + Duration::from_millis(100))
         );
+    }
+
+    /// The line-number margin grows with the number of digits of the last line.
+    #[test]
+    fn line_number_gutter_fits_the_widest_number() {
+        let one = line_number_gutter(18.0, 9);
+        let three = line_number_gutter(18.0, 999);
+        let four = line_number_gutter(18.0, 1000);
+        assert!(one < three && three < four);
+        assert_eq!(line_number_gutter(18.0, 0), one);
+        // Each digit is about 0.62 em of the numbers' size.
+        assert!((four - three - line_number_size(18.0) * 0.62).abs() < 1e-3);
     }
 
     #[test]
