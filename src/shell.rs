@@ -167,6 +167,7 @@ mod profile {
 use crate::commands::Command;
 use crate::text_engine::{TextEngine, peniko_color, peniko_color_alpha};
 use crate::text_input;
+use crate::session::Session;
 use crate::ui::UiLayer;
 use crate::ui::dialogs::{self, Answer, DialogView};
 use crate::ui::menu::{MenuState, menu_bar};
@@ -724,6 +725,12 @@ struct App {
     modal: Option<PendingModal>,
     /// A native Open / Save As dialog is open (at most one at a time).
     file_dialog_open: bool,
+    /// Recent files (its `open`/`active` are recomputed from the tabs when saved).
+    session: Session,
+    /// Where the session is saved; `None` = not saved (`--demo`).
+    session_path: Option<PathBuf>,
+    /// The session as last written, to rewrite the file only when it changes.
+    session_saved: Option<Session>,
     modifiers: ModifiersState,
     mouse_pos: (f32, f32),
     selection_drag: Option<SelectionDrag>,
@@ -798,32 +805,40 @@ struct App {
 
 impl App {
     fn new(
-        editors: Vec<Editor>,
-        missing: Vec<PathBuf>,
-        config: ResolvedConfig,
+        startup: Startup,
         proxy: EventLoopProxy<WritEvent>,
         runtime: tokio::runtime::Handle,
     ) -> Self {
-        let mut editors = editors.into_iter();
-        let mut editor = editors.next().expect("at least one document");
-        let mut tabs = vec![Tab {
-            id: 0,
-            state: None,
-            anchor: (0, 0.0),
-            file_stale: false,
-            base_stale: false,
-        }];
-        for (i, mut background) in editors.enumerate() {
-            let id = i as u64 + 1;
-            forward_file_watch(&mut background, id, &proxy);
+        let Startup {
+            editors,
+            active,
+            missing,
+            config,
+            session,
+            session_path,
+        } = startup;
+        let active = active.min(editors.len() - 1);
+        let mut editor = None;
+        let mut tabs = Vec::with_capacity(editors.len());
+        for (i, mut doc) in editors.into_iter().enumerate() {
+            let id = i as u64;
+            forward_file_watch(&mut doc, id, &proxy);
+            // The active document lives in `doc_engine`; the others are parked.
+            let state = if i == active {
+                editor = Some(doc);
+                None
+            } else {
+                Some(DocState::new(doc))
+            };
             tabs.push(Tab {
                 id,
-                state: Some(DocState::new(background)),
+                state,
                 anchor: (0, 0.0),
                 file_stale: false,
                 base_stale: false,
             });
         }
+        let editor = editor.expect("at least one document");
         let next_tab_id = tabs.len() as u64;
         let title = window_title(&editor);
         // Apply the configured font family, but only if it renders fixed-pitch — a
@@ -836,7 +851,6 @@ impl App {
                 text_engine.set_font_family(None);
             }
         }
-        forward_file_watch(&mut editor, 0, &proxy);
         Self {
             context: RenderContext::new(),
             renderer: None,
@@ -858,8 +872,11 @@ impl App {
                 preedit: None,
             },
             tabs,
-            active_tab: 0,
+            active_tab: active,
             next_tab_id,
+            session,
+            session_path,
+            session_saved: None,
             modal: missing_files_notice(&missing),
             file_dialog_open: false,
             modifiers: ModifiersState::empty(),
@@ -1168,6 +1185,7 @@ impl App {
             eprintln!("[markdone] file watch failed: {e}");
         }
         forward_file_watch(editor, id, &proxy);
+        self.session.touch_recent(&path);
         self.redraw();
         if let Some(req) = then {
             self.request_close(req, event_loop);
@@ -1185,6 +1203,7 @@ impl App {
         let mut last = None;
         for path in paths {
             let path = std::path::absolute(&path).unwrap_or(path);
+            self.session.touch_recent(&path);
             let key = path.canonicalize().ok();
             let open = (0..self.tabs.len()).find(|&i| {
                 key.is_some()
@@ -1196,11 +1215,7 @@ impl App {
             }
             let id = self.next_tab_id;
             self.next_tab_id += 1;
-            let mut editor = Editor::open(&path);
-            editor.refresh_detection(0..usize::MAX);
-            if let Err(e) = editor.watch_file() {
-                eprintln!("[markdone] file watch failed: {e}");
-            }
+            let mut editor = open_document(&path);
             forward_file_watch(&mut editor, id, &self.proxy);
             self.tabs.push(Tab {
                 id,
@@ -1221,6 +1236,57 @@ impl App {
             self.remove_tabs(&[blank]);
         }
         self.redraw();
+    }
+
+    /// The session as it stands: the open documents (with a file) and the recent list.
+    fn current_session(&self) -> Session {
+        let mut open = Vec::new();
+        let mut active = 0;
+        for i in 0..self.tabs.len() {
+            if let Some(path) = self.tab_editor(i).file_path() {
+                if i == self.active_tab {
+                    active = open.len();
+                }
+                open.push(path.to_path_buf());
+            }
+        }
+        Session {
+            open,
+            active,
+            recent: self.session.recent.clone(),
+        }
+    }
+
+    /// Write the session file if the session changed since the last write.
+    fn persist_session(&mut self) {
+        let Some(path) = self.session_path.clone() else {
+            return;
+        };
+        let current = self.current_session();
+        if self.session_saved.as_ref() == Some(&current) {
+            return;
+        }
+        if let Err(e) = current.save(&path) {
+            eprintln!("[markdone] failed to save the session to {}: {e}", path.display());
+        }
+        self.session_saved = Some(current);
+    }
+
+    /// Open entry `i` of the recent files (a file that no longer exists is dropped from
+    /// the list, with a message).
+    fn open_recent(&mut self, i: usize) {
+        let Some(path) = self.session.recent.get(i).cloned() else {
+            return;
+        };
+        if path.is_file() {
+            self.open_paths(vec![path]);
+        } else {
+            self.session.recent.remove(i);
+            self.show_message(
+                "File not found",
+                format!("“{}” no longer exists; it was removed from the recent files.", path.display()),
+            );
+        }
     }
 
     /// What the pending dialog shows.
@@ -1360,6 +1426,63 @@ impl App {
         };
         match cmd {
             Command::New => self.open_blank_tab(),
+            Command::OpenRecent(i) => {
+                self.open_recent(i);
+                return;
+            }
+            Command::ClearRecent => {
+                self.session.recent.clear();
+                return;
+            }
+            Command::Cut | Command::Copy => {
+                let cut = cmd == Command::Cut;
+                let clipboard = &mut self.clipboard;
+                let copied = clipboard_copy_or_cut(&mut self.doc_engine.editor, cut, |selection| {
+                    clipboard
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("clipboard unavailable"))?
+                        .set_text(selection)?;
+                    Ok(())
+                });
+                if let Err(error) = &copied {
+                    eprintln!("[markdone] failed to copy selection: {error}");
+                }
+                if cut && matches!(copied, Ok(true)) {
+                    let (w, vh, scale) = state.viewport();
+                    apply_edit_effects(
+                        &mut self.doc_engine,
+                        &mut self.hovered,
+                        &self.runtime,
+                        &self.proxy,
+                        None,
+                        &state.window,
+                        w,
+                        scale,
+                        vh,
+                    );
+                }
+            }
+            Command::Paste => {
+                if let Some(cb) = self.clipboard.as_mut()
+                    && let Ok(text) = cb.get_text()
+                    && !text.is_empty()
+                {
+                    self.doc_engine.editor.paste(&text);
+                    let (w, vh, scale) = state.viewport();
+                    apply_edit_effects(
+                        &mut self.doc_engine,
+                        &mut self.hovered,
+                        &self.runtime,
+                        &self.proxy,
+                        None,
+                        &state.window,
+                        w,
+                        scale,
+                        vh,
+                    );
+                }
+            }
+            Command::SelectAll => self.doc_engine.editor.select_all(),
             Command::Open => {
                 self.start_open();
                 return;
@@ -4108,6 +4231,7 @@ impl ApplicationHandler<WritEvent> for App {
                 let menu_state = MenuState {
                     outline_open: self.doc_engine.editor.outline_open(),
                     tab_count: self.tabs.len(),
+                    recent: self.session.recent.iter().map(|p| recent_label(p)).collect(),
                 };
                 let tab_infos: Vec<TabInfo> = self
                     .tabs
@@ -4228,7 +4352,12 @@ impl ApplicationHandler<WritEvent> for App {
     /// `WritEvent::FileChanged` (forwarded from the watcher thread), so there's no
     /// need to poll except to retry a skipped frame or auto-scroll a selection while
     /// the pointer is held still in an edge hot zone.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.persist_session();
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.persist_session();
         // MARKDONE_DROPTEST: attribution baseline — once the first frame is up, report memory
         // with all documents loaded, then drop the parked ones and report again.
         if std::env::var_os("MARKDONE_DROPTEST").is_some()
@@ -4386,41 +4515,115 @@ pub fn run() -> Result<()> {
         return snapshot(&path, w, h, scroll);
     }
 
-    let (editors, missing, app_config) = load_editor_from_cli();
+    let startup = startup_from_cli();
     let event_loop = EventLoop::<WritEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
-    let mut app = App::new(editors, missing, app_config, proxy, runtime.handle().clone());
+    let mut app = App::new(startup, proxy, runtime.handle().clone());
     event_loop.run_app(&mut app)?;
     Ok(())
 }
 
-/// Build the editor from CLI args: open the `--file`, set GitHub context, and start
-/// watching the file for external edits (the pivot use case — an agent edits the
-/// file, writ shows the live diff). With no args, falls back to the sample doc. Also
-/// loads the user config (theme + font) from `--config` or the default location.
-/// Also returns the paths that do not exist: they open as new, empty documents (created
-/// on save) and the user is told about them.
-fn load_editor_from_cli() -> (Vec<Editor>, Vec<PathBuf>, ResolvedConfig) {
-    use clap::Parser;
+/// What the application starts with.
+struct Startup {
+    editors: Vec<Editor>,
+    /// Index of the active document.
+    active: usize,
+    /// Files given on the command line that do not exist (opened as new documents).
+    missing: Vec<PathBuf>,
+    config: ResolvedConfig,
+    session: Session,
+    /// Where the session is saved; `None` = not saved.
+    session_path: Option<PathBuf>,
+}
 
-    // No args → the demo showcase with default config.
-    if std::env::args().len() <= 1 {
-        return (vec![demo_editor()], Vec::new(), ResolvedConfig::default());
-    }
+/// Build the startup state from the command line. Files given there open one tab each
+/// (watched for external edits). Without files the previous session is restored, or an
+/// empty document opens. `--demo` opens the showcase document (no session).
+fn startup_from_cli() -> Startup {
+    use clap::Parser;
 
     let config = Config::parse();
     let app_config = config::load(config.config.as_deref());
     // `--demo`: showcase doc with a synthetic HEAD diff (no file needed).
     if config.demo {
-        return (vec![demo_editor()], Vec::new(), app_config);
+        return Startup {
+            editors: vec![demo_editor()],
+            active: 0,
+            missing: Vec::new(),
+            config: app_config,
+            session: Session::default(),
+            session_path: None,
+        };
     }
-    let paths: Vec<PathBuf> = config.file.iter().chain(&config.files).cloned().collect();
+    let session_path = Session::default_path();
+    let mut session = session_path.as_deref().map(Session::load).unwrap_or_default();
+    let paths: Vec<PathBuf> = config
+        .file
+        .iter()
+        .chain(&config.files)
+        .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone()))
+        .collect();
     if paths.is_empty() {
-        return (vec![demo_editor()], Vec::new(), app_config);
+        let (restore, active) = session.restorable();
+        let mut editors: Vec<Editor> = restore.iter().map(|p| open_document(p)).collect();
+        if editors.is_empty() {
+            editors.push(Editor::new(""));
+        }
+        return Startup {
+            editors,
+            active,
+            missing: Vec::new(),
+            config: app_config,
+            session,
+            session_path,
+        };
     }
     let missing = paths.iter().filter(|p| !p.exists()).cloned().collect();
+    for path in paths.iter().filter(|p| p.exists()) {
+        session.touch_recent(path);
+    }
     let editors = paths.iter().map(|p| open_editor(p, &config)).collect();
-    (editors, missing, app_config)
+    Startup {
+        editors,
+        active: 0,
+        missing,
+        config: app_config,
+        session,
+        session_path,
+    }
+}
+
+/// Open a document from the UI (Open dialog, recent files, restored session): load it,
+/// detect links and watch the file. No GitHub context: these documents make no network
+/// calls (a GitHub setting will come with the preferences).
+fn open_document(path: &Path) -> Editor {
+    let mut editor = Editor::open(path);
+    editor.refresh_detection(0..usize::MAX);
+    if let Err(e) = editor.watch_file() {
+        eprintln!("[markdone] file watch failed for {}: {e}", path.display());
+    }
+    editor
+}
+
+/// Label of a recent file in the menu: the file name, and its folder shortened (home as
+/// `~`, long paths cut to their last two folders).
+fn recent_label(path: &Path) -> (String, String) {
+    let name = path
+        .file_name()
+        .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let dir = path.parent().unwrap_or(Path::new(""));
+    let home = dirs::home_dir();
+    let dir_text = match home.as_deref().and_then(|h| dir.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => dir.display().to_string(),
+    };
+    if dir_text.chars().count() <= 40 {
+        return (name, dir_text);
+    }
+    let tail: Vec<_> = dir.components().rev().take(2).collect();
+    let tail: PathBuf = tail.into_iter().rev().collect();
+    (name, format!("…/{}", tail.display()))
 }
 
 /// The startup notice for files given on the command line that do not exist.

@@ -108,6 +108,8 @@ pub mod overlay;
 pub mod parser;
 #[cfg(feature = "app")]
 pub mod platform;
+#[cfg(feature = "app")]
+pub mod session;
 pub mod paste;
 pub mod raster;
 pub mod render;

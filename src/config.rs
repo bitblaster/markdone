@@ -22,8 +22,9 @@ pub const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 pub struct Config {
-    /// Document to open (the first tab).
-    #[arg(short, long, required_unless_present_any = ["demo", "files"])]
+    /// Document to open (the first tab). Without any file, the previous session is
+    /// restored.
+    #[arg(short, long)]
     pub file: Option<PathBuf>,
 
     /// More documents to open, one tab each (after `--file`, if given).

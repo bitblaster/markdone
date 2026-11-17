@@ -8,6 +8,8 @@ use super::MENU_BAR_H;
 pub struct MenuState {
     pub outline_open: bool,
     pub tab_count: usize,
+    /// Recent files: (file name, shortened folder), most recent first.
+    pub recent: Vec<(String, String)>,
 }
 
 /// Lay out the menu bar in a top panel; returns the command picked this frame, if any.
@@ -25,6 +27,21 @@ pub fn menu_bar(ui: &mut egui::Ui, state: &MenuState) -> Option<Command> {
                     ui.menu_button("File", |ui| {
                         item(ui, "New", Command::New, true, &mut picked);
                         item(ui, "Open…", Command::Open, true, &mut picked);
+                        ui.menu_button("Open Recent", |ui| {
+                            if state.recent.is_empty() {
+                                ui.add_enabled(false, egui::Button::new("No Recent Files"));
+                            }
+                            for (i, (name, dir)) in state.recent.iter().enumerate() {
+                                let button = egui::Button::new(name.as_str()).shortcut_text(dir.as_str());
+                                if ui.add(button).clicked() {
+                                    picked = Some(Command::OpenRecent(i));
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            let any = !state.recent.is_empty();
+                            item(ui, "Clear Recent", Command::ClearRecent, any, &mut picked);
+                        });
                         ui.separator();
                         item(ui, "Save", Command::Save, true, &mut picked);
                         item(ui, "Save As…", Command::SaveAs, true, &mut picked);
@@ -35,6 +52,11 @@ pub fn menu_bar(ui: &mut egui::Ui, state: &MenuState) -> Option<Command> {
                     ui.menu_button("Edit", |ui| {
                         item(ui, "Undo", Command::Undo, true, &mut picked);
                         item(ui, "Redo", Command::Redo, true, &mut picked);
+                        ui.separator();
+                        item(ui, "Cut", Command::Cut, true, &mut picked);
+                        item(ui, "Copy", Command::Copy, true, &mut picked);
+                        item(ui, "Paste", Command::Paste, true, &mut picked);
+                        item(ui, "Select All", Command::SelectAll, true, &mut picked);
                         ui.separator();
                         item(ui, "Find…", Command::Find, true, &mut picked);
                         item(ui, "Replace…", Command::Replace, true, &mut picked);
