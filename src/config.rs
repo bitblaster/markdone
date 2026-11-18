@@ -95,8 +95,10 @@ pub struct Preferences {
     pub full_width: bool,
     /// Maximum text width (logical px) when not `full_width`.
     pub max_width: f32,
-    /// Show line numbers in the left margin.
+    /// Show line numbers in the left margin (View menu).
     pub line_numbers: bool,
+    /// Show the differences from the last git commit (View menu).
+    pub git_diff: bool,
     /// Theme name: a built-in or a `[themes.<name>]` of the config file.
     pub theme: String,
     pub external_change: ExternalChange,
@@ -116,6 +118,7 @@ impl Default for Preferences {
             full_width: false,
             max_width: crate::consts::MAX_CONTENT_WIDTH,
             line_numbers: false,
+            git_diff: true,
             theme: "dracula".to_string(),
             external_change: ExternalChange::Reload,
             check_on_focus: true,
@@ -182,6 +185,7 @@ struct EditorSpec {
     full_width: Option<bool>,
     max_width: Option<f32>,
     line_numbers: Option<bool>,
+    git_diff: Option<bool>,
 }
 
 #[cfg(feature = "app")]
@@ -373,6 +377,9 @@ fn resolve(file: FileConfig) -> ResolvedConfig {
         if let Some(numbers) = editor.line_numbers {
             cfg.prefs.line_numbers = numbers;
         }
+        if let Some(diff) = editor.git_diff {
+            cfg.prefs.git_diff = diff;
+        }
         if let Some(w) = editor.max_width {
             if w.is_finite() && MAX_WIDTH_RANGE.contains(&w) {
                 cfg.prefs.max_width = w;
@@ -439,6 +446,7 @@ pub fn save_preferences(path: &Path, prefs: &Preferences) -> std::io::Result<()>
     set("editor", "full_width", value(prefs.full_width));
     set("editor", "max_width", number(prefs.max_width));
     set("editor", "line_numbers", value(prefs.line_numbers));
+    set("editor", "git_diff", value(prefs.git_diff));
     set("files", "on_external_change", value(prefs.external_change.key()));
     set("files", "check_on_focus", value(prefs.check_on_focus));
     set("network", "github", value(prefs.github));
@@ -586,6 +594,7 @@ mod tests {
             full_width: true,
             max_width: 960.0,
             line_numbers: true,
+            git_diff: false,
             theme: "mine".into(),
             external_change: ExternalChange::Ask,
             check_on_focus: false,

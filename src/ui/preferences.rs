@@ -65,9 +65,6 @@ pub fn show(
                 });
                 ui.end_row();
 
-                ui.label("Line numbers");
-                ui.checkbox(&mut prefs.line_numbers, "Show line numbers");
-                ui.end_row();
             });
 
         section(ui, "Files");

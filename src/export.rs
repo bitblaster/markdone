@@ -164,6 +164,32 @@ pub fn markdown_to_html(markdown: &str, base_dir: Option<&Path>, title: &str) ->
     )
 }
 
+/// Rich clipboard content (HTML from a browser or an office suite) as Markdown in the
+/// editor's own style: `#` headings, `-` bullets, fenced code. `None` if it converts to
+/// nothing.
+pub fn html_to_markdown(html: &str) -> Option<String> {
+    use htmd::options::{BulletListMarker, CodeBlockStyle, HeadingStyle, Options};
+    let converter = htmd::HtmlToMarkdown::builder()
+        .options(Options {
+            heading_style: HeadingStyle::Atx,
+            code_block_style: CodeBlockStyle::Fenced,
+            bullet_list_marker: BulletListMarker::Dash,
+            ul_bullet_spacing: 1,
+            ol_number_spacing: 1,
+            ..Default::default()
+        })
+        .build();
+    converter
+        .convert(html)
+        .ok()
+        .filter(|md| !md.trim().is_empty())
+}
+
+/// The HTML of a Markdown fragment (no page around it), e.g. for copying as HTML.
+pub fn markdown_fragment(markdown: &str, base_dir: Option<&Path>) -> String {
+    render_body(markdown, base_dir)
+}
+
 fn render_body(markdown: &str, base_dir: Option<&Path>) -> String {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
@@ -474,6 +500,20 @@ hr { border: 0; border-top: 1px solid #d0d7de; margin: 1.5em 0; }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rich_paste_becomes_editor_style_markdown() {
+        let md = html_to_markdown(
+            "<h2>Titolo</h2><p>Testo <b>forte</b> e <a href=\"https://e.com\">link</a>.</p>\
+             <ul><li>uno</li><li>due</li></ul><pre><code>let x = 1;</code></pre>",
+        )
+        .unwrap();
+        assert!(md.contains("## Titolo"), "{md}");
+        assert!(md.contains("**forte**") && md.contains("[link](https://e.com)"), "{md}");
+        assert!(md.contains("- uno\n- due"), "{md}");
+        assert!(md.contains("```\nlet x = 1;\n```"), "{md}");
+        assert_eq!(html_to_markdown("<p> </p>"), None);
+    }
 
     #[test]
     fn base64_matches_rfc4648() {

@@ -20,6 +20,8 @@ pub enum DialogView {
     Exported {
         name: String,
     },
+    /// Reloading would discard the document's unsaved changes.
+    ConfirmReload { name: String },
 }
 
 /// The user's choice.
@@ -90,6 +92,15 @@ pub fn show(ctx: &egui::Context, view: &DialogView) -> Option<Answer> {
                 ui.label(text);
                 answer = buttons(ui, &[], &[("OK", Answer::Ok)]);
             }
+            DialogView::ConfirmReload { name } => {
+                heading(ui, &format!("Reload “{name}”?"));
+                ui.label("The unsaved changes in this document will be lost.");
+                answer = buttons(
+                    ui,
+                    &[],
+                    &[("Cancel", Answer::Cancel), ("Discard and Reload", Answer::Reload)],
+                );
+            }
             DialogView::Exported { name } => {
                 heading(ui, "PDF exported");
                 ui.label(format!("“{name}” is ready."));
@@ -108,7 +119,7 @@ pub fn show(ctx: &egui::Context, view: &DialogView) -> Option<Answer> {
         && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
     {
         answer = Some(match view {
-            DialogView::Unsaved { .. } => Answer::Cancel,
+            DialogView::Unsaved { .. } | DialogView::ConfirmReload { .. } => Answer::Cancel,
             DialogView::Message { .. } | DialogView::Exported { .. } => Answer::Ok,
         });
     }

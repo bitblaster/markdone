@@ -58,6 +58,8 @@ pub struct UiLayer {
     cursor_released: bool,
     /// The pointer is over egui (bars, a menu, a dialog) as of its last move.
     pointer_over: bool,
+    /// A menu or popup was open at the end of the last frame.
+    popup_open: bool,
     /// The table of contents panel (points), when shown: egui owns the pointer there.
     side_panel: Option<egui::Rect>,
 }
@@ -93,6 +95,7 @@ impl UiLayer {
             repaint_at: None,
             cursor_released: false,
             pointer_over: false,
+            popup_open: false,
             side_panel: None,
         }
     }
@@ -178,6 +181,11 @@ impl UiLayer {
         self.side_panel = rect;
     }
 
+    /// Whether a menu or popup is open (a click outside it only closes it).
+    pub fn menu_open(&self) -> bool {
+        self.popup_open
+    }
+
     /// Whether egui is using the pointer or has a menu/popup open. A click on the
     /// document while a menu is open only closes the menu.
     pub fn is_active(&self) -> bool {
@@ -198,9 +206,14 @@ impl UiLayer {
         let output = self.ctx.run_ui(raw_input, |ui| build(ui));
 
         let popup_open = egui::Popup::is_any_open(&self.ctx);
+        self.popup_open = popup_open;
         let was_active = self.active;
+        // `pointer_over` also covers chrome egui does not count as its own (the table of
+        // contents, drawn in the background layer): its hover cursor (the resize grip)
+        // must reach the window too.
         self.active = modal
             || popup_open
+            || self.pointer_over
             || self.ctx.is_pointer_over_egui()
             || self.ctx.egui_is_using_pointer();
         // A clicked menu button keeps keyboard focus, and egui would then claim every key
@@ -370,6 +383,9 @@ fn style_from_theme(theme: &EditorTheme) -> egui::Style {
     s.item_spacing = vec2(8.0, 2.0);
     s.button_padding = vec2(10.0, 5.0);
     s.interact_size = vec2(40.0, 26.0);
+    // No hover slack around widgets: on a desktop it only blurs edges (the table of
+    // contents' resize grip would reach into the document's scrollbar).
+    style.interaction.interact_radius = 0.0;
     s.menu_margin = Margin::same(6);
     s.menu_width = 260.0;
     s.menu_spacing = 4.0;

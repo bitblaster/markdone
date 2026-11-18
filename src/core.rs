@@ -334,6 +334,16 @@ impl Editor {
         self.state.buffer.mark_clean();
     }
 
+    /// Apply a formatting edit (see [`crate::format`]) as one undo step, then select its
+    /// resulting selection.
+    pub fn apply_text_edit(&mut self, e: &crate::format::TextEdit) {
+        self.edit(|s| {
+            let cursor = s.cursor().offset;
+            s.buffer.replace(e.range.clone(), &e.text, cursor);
+            s.selection = Selection::new(e.selection.start, e.selection.end);
+        });
+    }
+
     /// Mark the document as unsaved without editing it (see `Buffer::mark_dirty`).
     pub fn mark_dirty(&mut self) {
         self.state.buffer.mark_dirty();
@@ -469,6 +479,89 @@ impl Editor {
         } else {
             self.state.selection = Selection::new(new_cursor.offset, new_cursor.offset);
         }
+    }
+
+    /// Put the caret at `offset`, extending the selection from its anchor if `extend`.
+    pub fn move_to(&mut self, offset: usize, extend: bool) {
+        let offset = offset.min(self.len());
+        self.state.selection = if extend {
+            self.state.selection.extend_to(offset)
+        } else {
+            Selection::new(offset, offset)
+        };
+    }
+
+    /// Ctrl+←/→: move to the start of the previous word / the end of the next one
+    /// (punctuation runs count as words, whitespace and line breaks are skipped).
+    pub fn move_word(&mut self, forward: bool, extend: bool) {
+        let head = self.state.selection.head;
+        let target = self.word_boundary(head, forward);
+        self.move_to(target, extend);
+    }
+
+    /// Ctrl+Backspace / Ctrl+Delete: delete to the previous / next word boundary (or the
+    /// selection, if any).
+    pub fn delete_word(&mut self, forward: bool) {
+        if self.selection_range().is_some() {
+            self.backspace();
+            return;
+        }
+        let head = self.state.selection.head;
+        let target = self.word_boundary(head, forward);
+        let range = if forward { head..target } else { target..head };
+        if range.is_empty() {
+            return;
+        }
+        let start = range.start;
+        self.apply_text_edit(&crate::format::TextEdit {
+            range,
+            text: String::new(),
+            selection: start..start,
+        });
+    }
+
+    /// The word boundary from byte offset `pos` in a direction.
+    fn word_boundary(&self, pos: usize, forward: bool) -> usize {
+        #[derive(PartialEq)]
+        enum Class {
+            Space,
+            Word,
+            Punct,
+        }
+        let class = |c: char| {
+            if c.is_whitespace() {
+                Class::Space
+            } else if c.is_alphanumeric() || c == '_' {
+                Class::Word
+            } else {
+                Class::Punct
+            }
+        };
+        let rope = self.state.buffer.rope();
+        let mut ci = rope.byte_to_char(pos.min(rope.len_bytes()));
+        let n = rope.len_chars();
+        if forward {
+            while ci < n && class(rope.char(ci)) == Class::Space {
+                ci += 1;
+            }
+            if ci < n {
+                let k = class(rope.char(ci));
+                while ci < n && class(rope.char(ci)) == k {
+                    ci += 1;
+                }
+            }
+        } else {
+            while ci > 0 && class(rope.char(ci - 1)) == Class::Space {
+                ci -= 1;
+            }
+            if ci > 0 {
+                let k = class(rope.char(ci - 1));
+                while ci > 0 && class(rope.char(ci - 1)) == k {
+                    ci -= 1;
+                }
+            }
+        }
+        rope.char_to_byte(ci)
     }
 
     pub fn select_all(&mut self) {
@@ -2125,6 +2218,35 @@ let code = target(); // fenced block line
                 "scan {line_count} lines for {query:?}: {count} hits in {ms:.3} ms (text()+match_indices)",
             );
         }
+    }
+
+    /// Ctrl+←/→ stop at word starts / ends, treating punctuation runs as words and
+    /// skipping spaces and line breaks; Shift extends; Ctrl+Backspace/Delete delete to
+    /// the same boundaries as one undo step.
+    #[test]
+    fn word_movement_and_deletion() {
+        let mut e = Editor::new("let x = foo_bar(1);\nnext line");
+        e.set_cursor(0);
+        let mut stops = Vec::new();
+        for _ in 0..8 {
+            e.move_word(true, false);
+            stops.push(e.cursor_position());
+        }
+        //            let x =  foo_bar ( 1 ) ;  next line
+        assert_eq!(stops, vec![3, 5, 7, 15, 16, 17, 19, 24]);
+        e.move_word(false, false);
+        assert_eq!(e.cursor_position(), 20, "start of `next`");
+        e.move_word(false, true);
+        assert_eq!(e.selection_range(), Some(17..20), "back over `);` + newline");
+
+        let mut e = Editor::new("alpha beta gamma");
+        e.set_cursor(10);
+        e.delete_word(false);
+        assert_eq!(e.text(), "alpha  gamma");
+        e.delete_word(true);
+        assert_eq!(e.text(), "alpha ");
+        e.undo();
+        assert_eq!(e.text(), "alpha  gamma");
     }
 
     /// Keeping the buffer over a newer disk version marks it unsaved, and no undo / redo

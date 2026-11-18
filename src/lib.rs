@@ -116,6 +116,9 @@ pub mod single_instance;
 pub mod links;
 #[cfg(feature = "app")]
 pub mod export;
+pub mod format;
+#[cfg(all(feature = "app", unix, not(target_os = "macos")))]
+pub mod wayland_dnd;
 pub mod paste;
 pub mod raster;
 pub mod render;

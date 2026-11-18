@@ -5,8 +5,9 @@
 /// Panel width bounds, logical px.
 pub const MIN_W: f32 = 160.0;
 pub const MAX_W: f32 = 560.0;
-/// Width of the grab zone on the panel's left edge (half of it overlaps the document).
-pub const GRIP_W: f32 = 8.0;
+/// Width of the grab zone along the panel's left edge, inside the panel: it must not
+/// reach into the document, whose scrollbar sits right next to it.
+pub const GRIP_W: f32 = 6.0;
 
 const ROW_H: f32 = 24.0;
 const INDENT: f32 = 14.0;
@@ -49,8 +50,8 @@ pub fn toc_panel(
 
     // Resize grip on the left edge.
     let grip = egui::Rect::from_min_max(
-        egui::pos2(rect.left() - GRIP_W / 2.0, rect.top()),
-        egui::pos2(rect.left() + GRIP_W / 2.0, rect.bottom()),
+        egui::pos2(rect.left() - 1.0, rect.top()),
+        egui::pos2(rect.left() + GRIP_W, rect.bottom()),
     );
     let grip_response = ui.interact(grip, egui::Id::new("writ-toc-grip"), egui::Sense::drag());
     if grip_response.hovered() || grip_response.dragged() {

@@ -229,6 +229,58 @@ fn export_indicator(ctx: &egui::Context, name: &str, status_bar_h: f32) {
         });
 }
 
+/// Where Up/Down should put the caret: the next/previous visual row at the remembered
+/// x. Within a wrapped paragraph that is its next/previous row; past its first/last row,
+/// the adjacent visible line's first/last row. `None` = no layout to go by (the caller
+/// falls back to moving by source line).
+fn visual_vertical_target(
+    engine: &DocEngine,
+    goal: &mut Option<(f32, usize)>,
+    down: bool,
+    scale: f32,
+) -> Option<usize> {
+    let editor = &engine.editor;
+    let doc = engine.doc.as_ref()?;
+    let caret = editor.state.selection.head;
+    let rect = doc.caret_rect(caret, CARET_WIDTH * scale)?;
+    let x = match *goal {
+        Some((x, at)) if at == caret => x,
+        _ => rect.0 as f32,
+    };
+    *goal = Some((x, caret));
+    let (top, bottom) = (rect.1 as f32, rect.3 as f32);
+    let line = editor.line_of(caret);
+
+    // Another row of the same source line?
+    let probe = if down { bottom + 1.0 } else { top - 1.0 };
+    if let Some(off) = doc.hit_test(x, probe)
+        && editor.line_of(off) == line
+        && let Some(r) = doc.caret_rect(off, CARET_WIDTH * scale)
+        && (r.1 as f32 - top).abs() > 0.5
+    {
+        return Some(off);
+    }
+    // The adjacent visible line, entering at its first (down) or last (up) row.
+    let hidden = editor.hidden_line_ranges();
+    let visible = |l: usize| !hidden.iter().any(|r| r.contains(&l));
+    let count = editor.line_count();
+    let next = if down {
+        (line + 1..count).find(|&l| visible(l))?
+    } else {
+        (0..line).rev().find(|&l| visible(l))?
+    };
+    let line_top = doc.line_top_screen(next)?;
+    let y = if down {
+        line_top + 1.0
+    } else {
+        line_top + (doc.line_text_height(next) - 1.0).max(1.0)
+    };
+    let off = doc.hit_test(x, y)?;
+    // Only trust a hit on the intended line (estimated, not yet laid out lines may not
+    // map); otherwise fall back.
+    (editor.line_of(off) == next).then_some(off)
+}
+
 /// Extra left padding (logical px) for the line numbers: room for the widest number in
 /// a monospace digit at the numbers' size, plus a gap.
 fn line_number_gutter(font_size: f32, line_count: usize) -> f32 {
@@ -460,6 +512,10 @@ pub(crate) enum WritEvent {
     OpenPicked(Vec<PathBuf>),
     /// Another launch handed over these files (empty: just raise the window).
     InstanceOpen(Vec<PathBuf>),
+    /// Files dropped on the window (Wayland; winit reports them itself elsewhere).
+    FilesDropped(Vec<PathBuf>),
+    /// The Insert → Image dialog for tab `id` closed (`None`: cancelled).
+    ImagePicked { id: u64, path: Option<PathBuf> },
     /// The export dialog for tab `id` closed (`None`: cancelled).
     ExportPicked { id: u64, path: Option<PathBuf> },
     /// A PDF export finished: the file, or an error for the user.
@@ -480,6 +536,8 @@ enum PendingModal {
     Message { title: String, text: String },
     /// A PDF export finished.
     Exported { path: PathBuf },
+    /// Reloading tab `id` would discard its unsaved changes.
+    ConfirmReload { id: u64 },
 }
 
 /// A tab's file changed on disk and the user must choose between the disk version
@@ -670,6 +728,8 @@ struct DocEngine {
     max_content_width: Option<f32>,
     /// Line numbers are shown (the left padding makes room for them).
     line_numbers: bool,
+    /// The git differences are shown (when the file is in a repository).
+    git_diff: bool,
     editor: Editor,
     doc: Option<DocLayout>,
     /// Shared cache of decoded standalone images, threaded into `DocLayout::build`.
@@ -861,6 +921,18 @@ struct App {
     hovered: Option<HoverTarget>,
     /// Screen rects of the currently-drawn autocomplete rows (for click routing).
     ac_row_rects: Vec<ScreenRect>,
+    /// The document's right-click menu: where it opens (points), and whether it must
+    /// open on the next frame.
+    context_menu: Option<egui::Pos2>,
+    context_menu_open: bool,
+    /// A right button press on the document waits for its release to open the menu.
+    context_menu_pending: bool,
+    /// Wayland file drag-and-drop listener (stopped in `exiting`).
+    #[cfg(all(unix, not(target_os = "macos")))]
+    dnd: Option<crate::wayland_dnd::Listener>,
+    /// Up/Down column memory: the x (device px) to aim for, valid while the caret is
+    /// still at the offset the last vertical move left it.
+    visual_goal: Option<(f32, usize)>,
     /// Table of contents: its width (logical px) as saved in the session (updated when
     /// a resize drag ends), and the current heading last frame (a change scrolls the
     /// list to it).
@@ -963,6 +1035,7 @@ impl App {
                 font_size: config.font_size,
                 max_content_width: content_width(&config.prefs),
                 line_numbers: config.prefs.line_numbers,
+                git_diff: config.prefs.git_diff,
                 editor,
                 doc: None,
                 images: ImageCache::new(),
@@ -1006,6 +1079,12 @@ impl App {
             title,
             hovered: None,
             ac_row_rects: Vec::new(),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            dnd: None,
+            visual_goal: None,
+            context_menu: None,
+            context_menu_open: false,
+            context_menu_pending: false,
             toc_width: toc_width(),
             toc_current: None,
             fold_chevron_rects: Vec::new(),
@@ -1241,6 +1320,31 @@ impl App {
         });
     }
 
+    /// Re-read tab `id` (the active one) from disk, discarding its unsaved changes.
+    fn reload_tab(&mut self, id: u64) {
+        if self.tabs[self.active_tab].id != id {
+            return;
+        }
+        let Some(path) = self.doc_engine.editor.file_path().map(Path::to_path_buf) else {
+            return;
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                let editor = &mut self.doc_engine.editor;
+                editor.apply_file_content(content);
+                editor.mark_clean();
+                editor.note_disk_state();
+                editor.refresh_git_base();
+                self.tabs[self.active_tab].conflict = None;
+                self.after_reload();
+            }
+            Err(e) => self.show_message(
+                "Could not reload",
+                format!("Reading {} failed: {e}", path.display()),
+            ),
+        }
+    }
+
     /// Ask where to export tab `i` as PDF (answer comes back as `ExportPicked`).
     fn start_export(&mut self, i: usize) {
         if self.file_dialog_open {
@@ -1433,6 +1537,10 @@ impl App {
             self.doc_engine.line_numbers = self.prefs.line_numbers;
             relayout = true;
         }
+        if old.git_diff != self.prefs.git_diff {
+            self.doc_engine.git_diff = self.prefs.git_diff;
+            relayout = true;
+        }
         if old.full_width != self.prefs.full_width || old.max_width != self.prefs.max_width {
             self.doc_engine.max_content_width = content_width(&self.prefs);
             relayout = true;
@@ -1548,6 +1656,194 @@ impl App {
         }
         sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
         self.redraw();
+    }
+
+    /// Listen for files dropped on the window when running on Wayland, where winit does
+    /// not report them.
+    fn start_wayland_dnd(&mut self, window: &Window) {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+            let Ok(handle) = window.display_handle() else {
+                return;
+            };
+            if let RawDisplayHandle::Wayland(wayland) = handle.as_raw() {
+                let proxy = self.proxy.clone();
+                // SAFETY: winit's display lives as long as the event loop, i.e. the app.
+                // The listener is stopped in `exiting`, before winit disconnects.
+                let started = unsafe {
+                    crate::wayland_dnd::start(wayland.display.as_ptr(), move |paths| {
+                        let _ = proxy.send_event(WritEvent::FilesDropped(paths));
+                    })
+                };
+                match started {
+                    Ok(listener) => self.dnd = Some(listener),
+                    Err(e) => eprintln!("[markdone] file drag-and-drop unavailable: {e}"),
+                }
+            }
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        let _ = window;
+    }
+
+    /// Files dropped on the window: images go into the document as image links (at the
+    /// caret), everything else opens in tabs.
+    fn files_dropped(&mut self, paths: Vec<PathBuf>) {
+        let (images, docs): (Vec<PathBuf>, Vec<PathBuf>) =
+            paths.into_iter().partition(|p| crate::format::is_image(p));
+        if !images.is_empty() {
+            let doc_dir = self
+                .doc_engine
+                .editor
+                .file_path()
+                .and_then(|p| std::path::absolute(p).ok())
+                .and_then(|p| p.parent().map(Path::to_path_buf));
+            let links: Vec<String> = images
+                .iter()
+                .map(|p| crate::format::image_markdown(p, doc_dir.as_deref()))
+                .collect();
+            let selection = self
+                .doc_engine
+                .editor
+                .selection_range()
+                .unwrap_or_else(|| {
+                    let c = self.doc_engine.editor.cursor_position();
+                    c..c
+                });
+            let text = links.join("\n");
+            let end = selection.start + text.len();
+            self.apply_format(crate::format::TextEdit {
+                range: selection,
+                text,
+                selection: end..end,
+            });
+        }
+        if !docs.is_empty() {
+            self.open_paths(docs);
+            if let Some(state) = self.state.as_ref() {
+                state.window.focus_window();
+            }
+        }
+    }
+
+    /// The active document's text and selection (the caret as an empty range).
+    fn text_and_selection(&self) -> (String, std::ops::Range<usize>) {
+        let editor = &self.doc_engine.editor;
+        let sel = editor.selection_range().unwrap_or_else(|| {
+            let c = editor.cursor_position();
+            c..c
+        });
+        (editor.text(), sel)
+    }
+
+    /// The folder of the active document's file (absolute), if it has one.
+    fn active_doc_dir(&self) -> Option<PathBuf> {
+        self.doc_engine
+            .editor
+            .file_path()
+            .and_then(|p| std::path::absolute(p).ok())
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+    }
+
+    /// Paste from the clipboard. `rich`: HTML content (from a browser, an office suite)
+    /// is converted to Markdown; plain text is pasted as is. Without `rich`, or when
+    /// the HTML adds nothing to the text (e.g. a terminal's styled copy), the plain
+    /// text is used.
+    fn paste(&mut self, rich: bool) {
+        let Some(cb) = self.clipboard.as_mut() else {
+            return;
+        };
+        let plain = cb.get_text().ok().filter(|t| !t.is_empty());
+        let converted = if rich {
+            cb.get()
+                .html()
+                .ok()
+                .and_then(|h| crate::export::html_to_markdown(&h))
+        } else {
+            None
+        };
+        let text = match (converted, plain) {
+            (Some(md), Some(plain)) if md.replace('\\', "").trim() == plain.trim() => plain,
+            (Some(md), _) => md,
+            (None, Some(plain)) => plain,
+            (None, None) => return,
+        };
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        self.doc_engine.editor.paste(&text);
+        let (w, vh, scale) = state.viewport();
+        let window = state.window.clone();
+        apply_edit_effects(
+            &mut self.doc_engine,
+            &mut self.hovered,
+            &self.runtime,
+            &self.proxy,
+            Some((&self.ac_gen, &self.ac_slot)),
+            &window,
+            w,
+            scale,
+            vh,
+        );
+    }
+
+    /// Copy the selection rendered as HTML, with its Markdown as the plain-text
+    /// alternative (pasting into a text editor gives the Markdown).
+    fn copy_as_html(&mut self) {
+        let Some(markdown) = self.doc_engine.editor.selected_text() else {
+            return;
+        };
+        let html = crate::export::markdown_fragment(&markdown, self.active_doc_dir().as_deref());
+        if let Some(cb) = self.clipboard.as_mut()
+            && let Err(e) = cb.set_html(html, Some(markdown))
+        {
+            eprintln!("[markdone] failed to copy as HTML: {e}");
+        }
+    }
+
+    /// Ask for an image to insert at the caret (answer comes back as `ImagePicked`).
+    fn start_insert_image(&mut self) {
+        if self.file_dialog_open {
+            return;
+        }
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Insert Image")
+            .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"])
+            .set_parent(&*state.window);
+        if let Some(dir) = self.dialog_dir(self.active_tab) {
+            dialog = dialog.set_directory(dir);
+        }
+        let id = self.tabs[self.active_tab].id;
+        let proxy = self.proxy.clone();
+        self.file_dialog_open = true;
+        std::thread::spawn(move || {
+            let path = dialog.pick_file();
+            let _ = proxy.send_event(WritEvent::ImagePicked { id, path });
+        });
+    }
+
+    /// Apply a formatting edit to the active document and refresh like after typing.
+    fn apply_format(&mut self, edit: crate::format::TextEdit) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        self.doc_engine.editor.apply_text_edit(&edit);
+        let (w, vh, scale) = state.viewport();
+        let window = state.window.clone();
+        apply_edit_effects(
+            &mut self.doc_engine,
+            &mut self.hovered,
+            &self.runtime,
+            &self.proxy,
+            None,
+            &window,
+            w,
+            scale,
+            vh,
+        );
     }
 
     /// Follow a Ctrl+clicked link: a heading of this document, another Markdown file
@@ -1666,6 +1962,9 @@ impl App {
                 title: title.clone(),
                 text: text.clone(),
             },
+            PendingModal::ConfirmReload { id } => DialogView::ConfirmReload {
+                name: name(*id).unwrap_or_default(),
+            },
             PendingModal::Exported { path } => DialogView::Exported {
                 name: path
                     .file_name()
@@ -1704,6 +2003,11 @@ impl App {
                 _ => {}
             },
             PendingModal::Message { .. } => {}
+            PendingModal::ConfirmReload { id } => {
+                if answer == Answer::Reload {
+                    self.reload_tab(id);
+                }
+            }
             PendingModal::Exported { path } => match answer {
                 Answer::OpenFile => {
                     if let Err(e) = open::that_detached(&path) {
@@ -1801,6 +2105,12 @@ impl App {
                 self.go_to_heading(i);
                 return;
             }
+            Command::ToggleGitDiff => {
+                let mut prefs = self.prefs.clone();
+                prefs.git_diff = !prefs.git_diff;
+                self.apply_preferences(prefs);
+                return;
+            }
             Command::ToggleLineNumbers => {
                 let mut prefs = self.prefs.clone();
                 prefs.line_numbers = !prefs.line_numbers;
@@ -1855,25 +2165,37 @@ impl App {
                     );
                 }
             }
-            Command::Paste => {
-                if let Some(cb) = self.clipboard.as_mut()
-                    && let Ok(text) = cb.get_text()
-                    && !text.is_empty()
-                {
-                    self.doc_engine.editor.paste(&text);
-                    let (w, vh, scale) = state.viewport();
-                    apply_edit_effects(
-                        &mut self.doc_engine,
-                        &mut self.hovered,
-                        &self.runtime,
-                        &self.proxy,
-                        None,
-                        &state.window,
-                        w,
-                        scale,
-                        vh,
-                    );
-                }
+            Command::Paste | Command::PasteWithoutStyle => {
+                self.paste(cmd == Command::Paste);
+                return;
+            }
+            Command::CopyAsHtml => {
+                self.copy_as_html();
+                return;
+            }
+            Command::Inline(style) => {
+                let (text, sel) = self.text_and_selection();
+                self.apply_format(crate::format::toggle_inline(&text, sel, style));
+                return;
+            }
+            Command::Block(block) => {
+                let (text, sel) = self.text_and_selection();
+                self.apply_format(crate::format::set_block(&text, sel, block));
+                return;
+            }
+            Command::InsertLink => {
+                let (text, sel) = self.text_and_selection();
+                self.apply_format(crate::format::insert_link(&text, sel));
+                return;
+            }
+            Command::InsertCodeBlock => {
+                let (text, sel) = self.text_and_selection();
+                self.apply_format(crate::format::insert_code_block(&text, sel));
+                return;
+            }
+            Command::InsertImage => {
+                self.start_insert_image();
+                return;
             }
             Command::SelectAll => self.doc_engine.editor.select_all(),
             Command::Open => {
@@ -1889,6 +2211,19 @@ impl App {
             }
             Command::ExportPdf => {
                 self.start_export(self.active_tab);
+                return;
+            }
+            Command::Reload => {
+                let id = self.tabs[self.active_tab].id;
+                if self.doc_engine.editor.file_path().is_none() {
+                    return;
+                }
+                if self.doc_engine.editor.is_dirty() && self.ui.is_some() {
+                    self.modal = Some(PendingModal::ConfirmReload { id });
+                    self.redraw();
+                } else {
+                    self.reload_tab(id);
+                }
                 return;
             }
             Command::CloseTab => {
@@ -2390,6 +2725,14 @@ fn apply_key(
             }
             true
         }
+        Key::Named(NamedKey::Backspace) if ctrl => {
+            editor.delete_word(false);
+            true
+        }
+        Key::Named(NamedKey::Delete) if ctrl => {
+            editor.delete_word(true);
+            true
+        }
         Key::Named(NamedKey::Backspace) => {
             editor.backspace();
             true
@@ -2413,6 +2756,14 @@ fn apply_key(
             // Smart space: try_insert_space suppresses the space at a line's
             // start / blockquote-content start (returns false) — no fallback insert.
             editor.try_insert_space();
+            true
+        }
+        Key::Named(NamedKey::ArrowLeft) if ctrl => {
+            editor.move_word(false, shift);
+            true
+        }
+        Key::Named(NamedKey::ArrowRight) if ctrl => {
+            editor.move_word(true, shift);
             true
         }
         Key::Named(NamedKey::ArrowLeft) => {
@@ -2624,7 +2975,11 @@ impl DocEngine {
         let cursor_offset = self.editor.cursor_position();
         let version = self.editor.state.buffer.version();
         // Clone the diff before borrowing the buffer mutably for the snapshot.
-        let diff = self.editor.diff_state().cloned();
+        let diff = if self.git_diff {
+            self.editor.diff_state().cloned()
+        } else {
+            None
+        };
         let snapshot = self.editor.state.buffer.render_snapshot();
         // The snapshot is owned, so the mutable borrow above is released — now gather
         // the GitHub autolink data (immutable borrows) to color validated refs.
@@ -3231,6 +3586,21 @@ impl ApplicationHandler<WritEvent> for App {
             }
             return;
         }
+        if let WritEvent::ImagePicked { id, path } = event {
+            self.file_dialog_open = false;
+            if let Some(path) = path
+                && self.tabs[self.active_tab].id == id
+            {
+                let doc_dir = self.active_doc_dir();
+                let (_, sel) = self.text_and_selection();
+                self.apply_format(crate::format::insert_image(sel, &path, doc_dir.as_deref()));
+            }
+            return;
+        }
+        if let WritEvent::FilesDropped(paths) = event {
+            self.files_dropped(paths);
+            return;
+        }
         if let WritEvent::InstanceOpen(paths) = event {
             self.open_paths(paths);
             if let Some(state) = self.state.as_ref() {
@@ -3368,6 +3738,7 @@ impl ApplicationHandler<WritEvent> for App {
                 .expect("failed to create window"),
         );
         window.set_ime_allowed(true);
+        self.start_wayland_dnd(&window);
         let size = window.inner_size();
 
         let surface = pollster::block_on(self.context.create_surface(
@@ -3456,7 +3827,7 @@ impl ApplicationHandler<WritEvent> for App {
             return;
         };
         if let Some(ui) = self.ui.as_mut() {
-            let menu_was_open = ui.is_active();
+            let menu_was_open = ui.menu_open();
             // A selection or scrollbar drag keeps following the pointer (and ends on
             // release) even over the bars at the top.
             let doc_drag = self.selection_drag.is_some() || self.scrollbar_drag.is_some();
@@ -3490,11 +3861,15 @@ impl ApplicationHandler<WritEvent> for App {
                 state.window.request_redraw();
                 return;
             }
-            // A click outside an open menu only closes the menu.
+            // A click outside an open menu only closes the menu. (Only the press: the
+            // release must still end a drag that began before.)
             if menu_was_open
                 && matches!(
                     event,
-                    WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }
+                    WindowEvent::MouseInput {
+                        state: ElementState::Pressed,
+                        ..
+                    } | WindowEvent::MouseWheel { .. }
                 )
             {
                 return;
@@ -3503,6 +3878,7 @@ impl ApplicationHandler<WritEvent> for App {
         match event {
             WindowEvent::CloseRequested => self.run_command(Command::Quit, event_loop),
             WindowEvent::Focused(true) => self.check_active_on_disk(),
+            WindowEvent::DroppedFile(path) => self.files_dropped(vec![path]),
             WindowEvent::Focused(false) => {
                 self.selection_drag = None;
                 self.drag_scroll_dy = 0.0;
@@ -3749,6 +4125,50 @@ impl ApplicationHandler<WritEvent> for App {
                         &self.ac_row_rects,
                         &mut self.cursor_icon,
                     );
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                let (w, vh, scale) = state.viewport();
+                if self.ui.is_none() || self.mouse_pos.1 < 0.0 || self.mouse_pos.1 >= vh {
+                    return;
+                }
+                // Outside the selection, the right click first moves the caret there.
+                if let Some(off) = self
+                    .doc_engine
+                    .doc
+                    .as_ref()
+                    .and_then(|d| d.hit_test(self.mouse_pos.0, self.mouse_pos.1))
+                    && !self
+                        .doc_engine
+                        .editor
+                        .selection_range()
+                        .is_some_and(|r| r.start <= off && off <= r.end)
+                {
+                    self.doc_engine.editor.set_cursor(off);
+                    self.doc_engine.rebuild_preserving_scroll(w, scale, vh);
+                }
+                self.context_menu_pending = true;
+                state.window.request_redraw();
+            }
+            // The menu opens on release, where the pointer is then (as egui's own context
+            // menus): opened on press, the release would read as a click outside it.
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Right,
+                ..
+            } => {
+                if std::mem::take(&mut self.context_menu_pending) {
+                    let top = state.top_inset();
+                    self.context_menu = Some(egui::pos2(
+                        self.mouse_pos.0 / state.scale,
+                        (self.mouse_pos.1 + top) / state.scale,
+                    ));
+                    self.context_menu_open = true;
+                    state.window.request_redraw();
                 }
             }
             WindowEvent::MouseInput {
@@ -4011,6 +4431,23 @@ impl ApplicationHandler<WritEvent> for App {
                 // Application commands: Ctrl+N new, Ctrl+O open, Ctrl+S save, Ctrl+Shift+S
                 // save as, Ctrl+W close tab, Ctrl+Q quit (the last two ask about unsaved
                 // changes).
+                if event.logical_key == Key::Named(NamedKey::F5) {
+                    self.run_command(Command::Reload, event_loop);
+                    return;
+                }
+                // Formatting and clipboard shortcuts (not while typing in the find bar).
+                if self.doc_engine.editor.find_state().is_none()
+                    && let Some(format_cmd) = crate::commands::format_shortcut(
+                        &event.logical_key,
+                        event.physical_key,
+                        self.modifiers.control_key() || self.modifiers.super_key(),
+                        self.modifiers.shift_key(),
+                        self.modifiers.alt_key(),
+                    )
+                {
+                    self.run_command(format_cmd, event_loop);
+                    return;
+                }
                 let cmd = self.modifiers.control_key() || self.modifiers.super_key();
                 if cmd && let Key::Character(c) = &event.logical_key {
                     let shift = self.modifiers.shift_key();
@@ -4402,6 +4839,35 @@ impl ApplicationHandler<WritEvent> for App {
                     }
                 }
 
+                // Up/Down move by visual row (a wrapped paragraph's rows, not its source
+                // line), keeping the column across moves.
+                if let Key::Named(key @ (NamedKey::ArrowUp | NamedKey::ArrowDown)) =
+                    &event.logical_key
+                    && !self.modifiers.control_key()
+                    && !self.modifiers.alt_key()
+                    && let Some(target) = visual_vertical_target(
+                        &self.doc_engine,
+                        &mut self.visual_goal,
+                        *key == NamedKey::ArrowDown,
+                        state.scale,
+                    )
+                {
+                    let extend = self.modifiers.shift_key();
+                    self.doc_engine.editor.move_to(target, extend);
+                    self.visual_goal = self.visual_goal.map(|(x, _)| (x, target));
+                    apply_edit_effects(
+                        &mut self.doc_engine,
+                        &mut self.hovered,
+                        &self.runtime,
+                        &self.proxy,
+                        None,
+                        &state.window,
+                        w,
+                        state.scale,
+                        vh,
+                    );
+                    return;
+                }
                 if apply_key(&mut self.doc_engine.editor, self.modifiers, &event) {
                     apply_edit_effects(
                         &mut self.doc_engine,
@@ -4620,6 +5086,9 @@ impl ApplicationHandler<WritEvent> for App {
                 let menu_state = MenuState {
                     outline_open: self.doc_engine.editor.outline_open(),
                     line_numbers: self.prefs.line_numbers,
+                    git_diff: self.prefs.git_diff,
+                    has_file: self.doc_engine.editor.file_path().is_some(),
+                    has_selection: self.doc_engine.editor.selection_range().is_some(),
                     tab_count: self.tabs.len(),
                     recent: self.session.recent.iter().map(|p| recent_label(p)).collect(),
                 };
@@ -4677,10 +5146,13 @@ impl ApplicationHandler<WritEvent> for App {
                 if let Some(ui) = self.ui.as_mut() {
                     ui.set_side_panel(toc.as_ref().map(|t| {
                         let mut r = t.2;
-                        r.min.x -= toc::GRIP_W / 2.0;
+                        r.min.x -= 1.0;
                         r
                     }));
                 }
+                let context_menu = self.context_menu;
+                let context_menu_open = std::mem::take(&mut self.context_menu_open);
+                let has_selection = menu_state.has_selection;
                 let exporting = self.export_running.clone();
                 let status_points = STATUS_BAR_H;
                 let mut prefs_edit = self.prefs_open.then(|| self.prefs.clone());
@@ -4695,6 +5167,16 @@ impl ApplicationHandler<WritEvent> for App {
                         picked = menu.or(tab);
                         if let Some(name) = &exporting {
                             export_indicator(ui.ctx(), name, status_points);
+                        }
+                        if let Some(pos) = context_menu
+                            && let Some(cmd) = crate::ui::menu::context_menu(
+                                ui.ctx(),
+                                pos,
+                                context_menu_open,
+                                has_selection,
+                            )
+                        {
+                            picked = Some(cmd);
                         }
                         if let Some((entries, current, rect)) = &toc {
                             toc_response =
@@ -4831,6 +5313,11 @@ impl ApplicationHandler<WritEvent> for App {
     /// need to poll except to retry a skipped frame or auto-scroll a selection while
     /// the pointer is held still in an edge hot zone.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Before winit disconnects (and frees) the display the listener reads.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if let Some(mut listener) = self.dnd.take() {
+            listener.stop();
+        }
         self.persist_session();
         if self.prefs_save_at.take().is_some() {
             self.save_preferences();
@@ -5299,6 +5786,7 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
         font_size: FONT_SIZE,
         max_content_width: Some(MAX_CONTENT_WIDTH),
         line_numbers: false,
+        git_diff: true,
         editor,
         doc: None,
         images: ImageCache::new(),
@@ -5471,6 +5959,7 @@ mod tests {
             font_size: FONT_SIZE,
             max_content_width: Some(MAX_CONTENT_WIDTH),
             line_numbers: false,
+            git_diff: true,
             editor: Editor::new(text),
             doc: None,
             images: ImageCache::new(),
