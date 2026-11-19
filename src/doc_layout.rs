@@ -554,6 +554,78 @@ fn build_table_layout(
     }
 }
 
+/// Estimated row heights (device px) of a grid table, without shaping: header first, then
+/// the body rows. Mirrors [`build_table_layout`] — natural column widths, the per-column
+/// cap, the proportional shrink to fit, each cell wrapped in its column, the tallest cell
+/// per row plus padding — with each text's width taken as `chars × k` (the calibrated
+/// average advance; the editor font is monospaced, so this is close). Off-screen table
+/// lines then count close to their real height, instead of the one-row text estimate a
+/// many-column table of long cells is far taller than.
+fn estimate_table_rows(
+    snapshot: &RenderSnapshot,
+    table: &TableInfo,
+    k: f32,
+    min_row: f32,
+    scale: f32,
+    max_advance: f32,
+) -> Vec<f32> {
+    let ncols = table.ncols.max(1);
+    let cell_pad_x = TABLE_CELL_PAD_X * scale;
+    let cell_pad_y = TABLE_CELL_PAD_Y * scale;
+    let border = TABLE_BORDER * scale;
+    let width_of = |cell: &crate::table::TableCell| {
+        let text = snapshot.rope.byte_slice(cell.content.clone());
+        text.len_chars() as f32 * k
+    };
+    let rows: Vec<&TableRow> = std::iter::once(&table.header)
+        .chain(table.body.iter())
+        .collect();
+    let mut natural = vec![0f32; ncols];
+    for row in &rows {
+        for (c, cell) in row.cells.iter().enumerate().take(ncols) {
+            natural[c] = natural[c].max(width_of(cell));
+        }
+    }
+    let overhead = ncols as f32 * 2.0 * cell_pad_x + (ncols as f32 + 1.0) * border;
+    let avail = (max_advance - overhead).max(1.0);
+    let col_cap = (avail / ncols as f32) * TABLE_COL_CAP_FACTOR;
+    let mut col_w: Vec<f32> = natural.iter().map(|&w| w.min(col_cap).max(1.0)).collect();
+    let sum: f32 = col_w.iter().sum();
+    if sum > avail {
+        let s = avail / sum;
+        for w in &mut col_w {
+            *w *= s;
+        }
+    }
+    rows.iter()
+        .map(|row| {
+            let lines = row
+                .cells
+                .iter()
+                .enumerate()
+                .take(ncols)
+                .map(|(c, cell)| wrapped_rows(width_of(cell), col_w[c], k))
+                .fold(1.0f32, f32::max);
+            lines * min_row + 2.0 * cell_pad_y
+        })
+        .collect()
+}
+
+/// Estimated visual rows of a text `text_w` px wide wrapped at `width`, without shaping.
+/// Wrapping breaks between words, so each row but the last ends short of `width` by about
+/// half a word: the usable width is shrunk by [`WRAP_SLACK_CHARS`] average advances `k`.
+fn wrapped_rows(text_w: f32, width: f32, k: f32) -> f32 {
+    if text_w <= width {
+        return 1.0;
+    }
+    let usable = (width - WRAP_SLACK_CHARS * k).max(width * 0.5);
+    (text_w / usable).ceil()
+}
+
+/// Average wasted width at the end of a word-wrapped row, in characters (see
+/// [`wrapped_rows`]).
+const WRAP_SLACK_CHARS: f32 = 1.5;
+
 /// Vertical padding (logical px) above and below an image block.
 const IMG_VPAD: f32 = 8.0;
 /// Block height (logical px) reserved for a loading/failed image placeholder.
@@ -1297,6 +1369,9 @@ impl DocLayout {
         let mut measured_start = n; // first materialized line (n = none materialized yet)
         let mut measured_count = n; // first estimated tail line (n = materialized to end)
         let mut fold_idx = 0usize; // moving cursor into the sorted `folds` ranges
+        // Estimated row heights per off-band grid table (keyed by block start), computed
+        // once per build on its first estimated line.
+        let mut table_estimates: HashMap<usize, Vec<f32>> = HashMap::new();
         let mut preedit_caret: Option<(usize, usize)> = None;
         // Bucket inline styles per line once (O(n + styles)) instead of the O(n²)
         // per-line `styles_in_range` scan — the dominant per-keystroke cost on large
@@ -1407,36 +1482,14 @@ impl DocLayout {
                 measured_start = i;
             }
             let estimate = i < measure_from_line || past_band;
-            if estimate {
-                let range = snapshot.line_byte_range(i);
-                // Prefer an exact height measured on a recent frame; fall back to the
-                // char-count soft-wrap estimate for never-seen lines.
-                let rkey = render_key(version, i, cursor_component(i, &range));
-                let h = height_cache.get(rkey).unwrap_or_else(|| {
-                    let byte_len = range.len().saturating_sub(1) as f32; // minus trailing '\n'
-                    let est_rows = (byte_len * k / max_advance).ceil().max(1.0);
-                    est_rows * min_row
-                });
-                // A deletion hunk anchored at this (off-screen) line still consumes height:
-                // estimate it (deleted-line count × row height) so the scroll extent stays
-                // stable instead of jumping when the line scrolls into the materialized band.
-                let gh = estimate_ghost_height(diff, i, min_row);
-                bands.heights.push(gh + h);
-                bands.layouts.push(empty_layout.clone());
-                bands.renders.push(empty_render.clone());
-                bands.line_ranges.push(range);
-                bands.line_diffs.push(LineDiff::default());
-                bands.ghosts.push(Vec::new());
-                bands.ghost_height.push(gh);
-                bands.quote_bars.push(Vec::new());
-                bands.image_blocks.push(None);
-                bands.inline_draws.push(Vec::new());
-                bands.table_lines.push(None);
-                continue;
-            }
-            // Mermaid anchor (materialized): draw the diagram (or placeholder) in place of
-            // the fence text, collect its source for off-thread rendering, and account its
-            // height in the band. Non-anchor fence lines were already zero-heighted above.
+            // Mermaid anchor: draw the diagram (or placeholder) in place of the fence
+            // text. Unlike text, a diagram line costs no shaping — just a cache lookup — so
+            // it is resolved even outside the band: every diagram's source is collected
+            // (all of them render once, at open, off-thread) and an off-screen diagram
+            // counts with its real height instead of a one-row text estimate, so the
+            // document extent (and the scrollbar thumb) doesn't shrink while scrolling.
+            // Band coverage counts it only inside the band. Non-anchor fence lines were
+            // already zero-heighted above.
             #[cfg(feature = "mermaid")]
             if let Some(m) = &mermaid {
                 let source = snapshot
@@ -1457,7 +1510,7 @@ impl DocLayout {
                 let (block, block_h) = build_image_block(images, &img, content_w, scale, img_vpad);
                 let range = snapshot.line_byte_range(i);
                 height_cache.set(render_key(version, i, cursor_component(i, &range)), block_h);
-                if i > anchor_line {
+                if !estimate && i > anchor_line {
                     band_y += block_h;
                     if band_y >= band_span {
                         past_band = true;
@@ -1465,6 +1518,45 @@ impl DocLayout {
                     }
                 }
                 bands.push_placeholder(block_h, range, Some(block));
+                continue;
+            }
+            if estimate {
+                let range = snapshot.line_byte_range(i);
+                // Prefer an exact height measured on a recent frame; fall back to the
+                // char-count soft-wrap estimate for never-seen lines.
+                let rkey = render_key(version, i, cursor_component(i, &range));
+                let h = height_cache.get(rkey).unwrap_or_else(|| {
+                    // A grid table row: estimate it as a grid row, not as one long text line.
+                    if let Some((t, kind)) =
+                        snapshot.table_row_at_line(i).filter(|(t, _)| table_grid_ok(t))
+                    {
+                        let rows = table_estimates.entry(t.block.start).or_insert_with(|| {
+                            estimate_table_rows(snapshot, t, k, min_row, scale, max_advance)
+                        });
+                        return match kind {
+                            RowKind::Header => rows[0],
+                            RowKind::Body(r) => rows.get(r + 1).copied().unwrap_or(min_row),
+                            RowKind::Delimiter => 0.0,
+                        };
+                    }
+                    let byte_len = range.len().saturating_sub(1) as f32; // minus trailing '\n'
+                    wrapped_rows(byte_len * k, max_advance, k) * min_row
+                });
+                // A deletion hunk anchored at this (off-screen) line still consumes height:
+                // estimate it (deleted-line count × row height) so the scroll extent stays
+                // stable instead of jumping when the line scrolls into the materialized band.
+                let gh = estimate_ghost_height(diff, i, min_row);
+                bands.heights.push(gh + h);
+                bands.layouts.push(empty_layout.clone());
+                bands.renders.push(empty_render.clone());
+                bands.line_ranges.push(range);
+                bands.line_diffs.push(LineDiff::default());
+                bands.ghosts.push(Vec::new());
+                bands.ghost_height.push(gh);
+                bands.quote_bars.push(Vec::new());
+                bands.image_blocks.push(None);
+                bands.inline_draws.push(Vec::new());
+                bands.table_lines.push(None);
                 continue;
             }
             // Display-math anchor (materialized): render the math and draw it centered in
