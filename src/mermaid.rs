@@ -1,7 +1,7 @@
 //! Mermaid diagram rendering: detect a ```` ```mermaid ```` fence, render its source to
 //! SVG with `merman`, and draw that SVG as *vectors*: the SVG is parsed once (usvg, text
-//! converted to outlines with the system fonts) and turned into a Vello scene fragment
-//! (`vello_svg`), which the standalone-image draw path appends to the frame scaled to its
+//! converted to outlines with the system fonts) and recorded into a Vello scene fragment
+//! (see [`encode_group`]), which the standalone-image draw path appends scaled to its
 //! destination. Crisp at any window scale or zoom, and nothing to re-render when either
 //! changes. The diagram is cached under a synthetic `mermaid:<hash>` key so it renders once
 //! per distinct source, not per frame; rendering runs off the UI thread.
@@ -25,7 +25,10 @@ use merman::{
     MermaidEngine, OperationControl, RenderOutput, RenderRequest, Renderer,
     SourcePresentationConfig, SvgRequest,
 };
+use vello::kurbo::{Affine, Rect};
+use vello::peniko::{BlendMode, Fill, Mix};
 use vello_svg::usvg;
+use vello_svg::util::{to_affine, to_bez_path, to_brush, to_stroke};
 
 use crate::image_cache::{ImageCache, ImagePaint, LoadedImage, decode, svg_fonts};
 
@@ -112,18 +115,21 @@ pub fn render_svg_for_print(source: &str) -> Result<String, String> {
 
 /// Turn SVG markup into a vector [`LoadedImage`]: parse it (text → outlines with the
 /// shared system-font database) and record its drawing commands into a Vello scene
-/// fragment, in the SVG's logical units. Elements `vello_svg` cannot draw (filters,
-/// masks, patterns — none in merman's resvg-safe output today) are skipped instead of
-/// being flagged with its default red box. `None` if the SVG doesn't parse or is empty.
+/// fragment, in the SVG's logical units (see [`encode_group`] for what is drawn and how).
+/// `None` if the SVG doesn't parse or is empty.
 pub fn svg_to_vector(svg: &str) -> Option<LoadedImage> {
-    let tree = text_as_outlines(svg)?;
+    let opt = usvg::Options {
+        fontdb: svg_fonts(),
+        ..Default::default()
+    };
+    let tree = usvg::Tree::from_str(svg, &opt).ok()?;
     let size = tree.size();
     let (w, h) = (size.width(), size.height());
     if w <= 0.0 || h <= 0.0 {
         return None;
     }
     let mut scene = vello::Scene::new();
-    vello_svg::append_tree_with(&mut scene, &tree, &mut |_, _| {});
+    encode_group(&mut scene, tree.root(), Affine::IDENTITY);
     Some(LoadedImage {
         paint: ImagePaint::Vector(Arc::new(scene)),
         width: w.round() as u32,
@@ -134,23 +140,127 @@ pub fn svg_to_vector(svg: &str) -> Option<LoadedImage> {
     })
 }
 
-/// Parse `svg` into a usvg tree whose text is already converted to outlines (no
-/// `Text` nodes left). `vello_svg` 0.11 draws a `Text` node's outlines with the text's
-/// absolute transform applied twice (`flattened()` children already carry it), which
-/// pushes every label outside its group's clip — so text never reaches it: usvg lays the
-/// text out with the system fonts, writes it back as plain paths, and the result is
-/// parsed again.
-fn text_as_outlines(svg: &str) -> Option<usvg::Tree> {
-    let opt = usvg::Options {
-        fontdb: svg_fonts(),
-        ..Default::default()
+/// Record a usvg group into `scene` (each node at `base` × its absolute transform).
+///
+/// Our own walk instead of `vello_svg::append_tree`, for two reasons:
+/// - `vello_svg` wraps *every* group in a clip layer. Mermaid SVGs nest groups deeply, and
+///   past a few nested layers Vello spills each covered 16×16 tile to a fixed-size GPU
+///   buffer; a tall diagram filling a large window overflowed it, and Vello then silently
+///   drops the whole frame (the screen froze while scrolling on a 2560×1274 window).
+///   Here a group opens a layer only when it needs one: opacity, a non-normal blend, or a
+///   clip/mask (masks are approximated by their bounds, like `vello_svg` does).
+/// - `vello_svg` 0.11 applies a text node's transform twice (its `flattened()` outlines
+///   already carry it), pushing labels off their place; here they get `base` only.
+///
+/// Filters are not drawn (none in merman's resvg-safe output), nor are raster images
+/// embedded in the SVG; nested SVG images are walked like groups.
+fn encode_group(scene: &mut vello::Scene, group: &usvg::Group, base: Affine) {
+    for node in group.children() {
+        let transform = base * to_affine(&node.abs_transform());
+        match node {
+            usvg::Node::Group(g) => {
+                let alpha = g.opacity().get();
+                if alpha <= 0.0 {
+                    continue; // fully transparent: nothing to draw (merman emits some)
+                }
+                let blend = blend_mode(g.blend_mode());
+                let needs_layer = alpha < 1.0
+                    || blend != Mix::Normal.into()
+                    || g.clip_path().is_some()
+                    || g.mask().is_some();
+                if !needs_layer {
+                    encode_group(scene, g, base);
+                    continue;
+                }
+                // A single-path clip is exact; anything else clips to the layer bounds.
+                match g.clip_path().and_then(|c| c.root().children().first()) {
+                    Some(usvg::Node::Path(clip)) => {
+                        scene.push_layer(Fill::NonZero, blend, alpha, transform, &to_bez_path(clip));
+                    }
+                    _ => {
+                        let b = g.layer_bounding_box();
+                        let rect = Rect::new(
+                            b.x() as f64,
+                            b.y() as f64,
+                            (b.x() + b.width()) as f64,
+                            (b.y() + b.height()) as f64,
+                        );
+                        scene.push_layer(Fill::NonZero, blend, alpha, transform, &rect);
+                    }
+                }
+                encode_group(scene, g, base);
+                scene.pop_layer();
+            }
+            usvg::Node::Path(path) => encode_path(scene, path, transform),
+            usvg::Node::Text(text) => encode_group(scene, text.flattened(), base),
+            usvg::Node::Image(img) => {
+                if let usvg::ImageKind::SVG(svg) = img.kind()
+                    && img.is_visible()
+                {
+                    encode_group(scene, svg.root(), transform);
+                }
+            }
+        }
+    }
+}
+
+/// Fill and/or stroke one usvg path, in the SVG's paint order.
+fn encode_path(scene: &mut vello::Scene, path: &usvg::Path, transform: Affine) {
+    if !path.is_visible() {
+        return;
+    }
+    let shape = to_bez_path(path);
+    let fill = |scene: &mut vello::Scene| {
+        if let Some(fill) = path.fill()
+            && let Some((brush, brush_transform)) = to_brush(fill.paint(), fill.opacity())
+        {
+            let rule = match fill.rule() {
+                usvg::FillRule::NonZero => Fill::NonZero,
+                usvg::FillRule::EvenOdd => Fill::EvenOdd,
+            };
+            scene.fill(rule, transform, &brush, Some(brush_transform), &shape);
+        }
     };
-    let tree = usvg::Tree::from_str(svg, &opt).ok()?;
-    let outlined = tree.to_string(&usvg::WriteOptions {
-        preserve_text: false,
-        ..Default::default()
-    });
-    usvg::Tree::from_str(&outlined, &opt).ok()
+    let stroke = |scene: &mut vello::Scene| {
+        if let Some(stroke) = path.stroke()
+            && let Some((brush, brush_transform)) = to_brush(stroke.paint(), stroke.opacity())
+        {
+            let style = to_stroke(stroke);
+            scene.stroke(&style, transform, &brush, Some(brush_transform), &shape);
+        }
+    };
+    match path.paint_order() {
+        usvg::PaintOrder::FillAndStroke => {
+            fill(scene);
+            stroke(scene);
+        }
+        usvg::PaintOrder::StrokeAndFill => {
+            stroke(scene);
+            fill(scene);
+        }
+    }
+}
+
+fn blend_mode(mode: usvg::BlendMode) -> BlendMode {
+    match mode {
+        usvg::BlendMode::Normal => Mix::Normal,
+        usvg::BlendMode::Multiply => Mix::Multiply,
+        usvg::BlendMode::Screen => Mix::Screen,
+        usvg::BlendMode::Overlay => Mix::Overlay,
+        usvg::BlendMode::Darken => Mix::Darken,
+        usvg::BlendMode::Lighten => Mix::Lighten,
+        usvg::BlendMode::ColorDodge => Mix::ColorDodge,
+        usvg::BlendMode::ColorBurn => Mix::ColorBurn,
+        usvg::BlendMode::HardLight => Mix::HardLight,
+        usvg::BlendMode::SoftLight => Mix::SoftLight,
+        usvg::BlendMode::Difference => Mix::Difference,
+        usvg::BlendMode::Exclusion => Mix::Exclusion,
+        usvg::BlendMode::Hue => Mix::Hue,
+        usvg::BlendMode::Saturation => Mix::Saturation,
+        usvg::BlendMode::Color => Mix::Color,
+        usvg::BlendMode::Luminosity => Mix::Luminosity,
+    }
+    .into()
 }
 
 /// Render mermaid source to a paintable image: source → SVG → vector scene (falling back
@@ -231,28 +341,63 @@ mod tests {
         }
     }
 
-    /// Labels must reach Vello as plain outlines: a `Text` node left in the tree would be
-    /// drawn misplaced by `vello_svg` (see `text_as_outlines`) and clipped away.
-    #[test]
-    fn labels_become_outlines_before_vello() {
-        fn has_text(g: &usvg::Group) -> bool {
-            g.children().iter().any(|n| match n {
-                usvg::Node::Text(_) => true,
-                usvg::Node::Group(g) => has_text(g),
-                _ => false,
-            })
+    fn vector_scene(svg: &str) -> Arc<vello::Scene> {
+        match svg_to_vector(svg).expect("SVG must convert").paint {
+            ImagePaint::Vector(scene) => scene,
+            ImagePaint::Raster(_) => unreachable!(),
         }
+    }
+
+    /// Labels are drawn as glyph outlines, placed inside the diagram.
+    #[test]
+    fn labels_are_drawn_as_outlines_inside_the_diagram() {
         let svg = render_svg_for_screen("flowchart LR\n  A[Uno] --> B[Due]").unwrap();
-        let tree = text_as_outlines(&svg).expect("screen SVG must parse");
-        assert!(!has_text(tree.root()), "text must be converted to paths");
-        // The outlines are really there: far more path segments than the bare shapes.
         let bare = svg.replace(">Uno<", "><").replace(">Due<", "><");
-        let count = |svg: &str| {
-            let mut s = vello::Scene::new();
-            vello_svg::append_tree(&mut s, &text_as_outlines(svg).unwrap());
-            s.encoding().path_data.len()
-        };
-        assert!(count(&svg) > count(&bare), "labels must add glyph outlines");
+        let with = vector_scene(&svg);
+        let without = vector_scene(&bare);
+        assert!(
+            with.encoding().path_data.len() > without.encoding().path_data.len(),
+            "labels must add glyph outlines"
+        );
+        // Transforms applied once: every transform keeps its translation within the
+        // diagram (vello_svg 0.11 doubled the text one, sending labels off-diagram).
+        let img = svg_to_vector(&svg).unwrap();
+        for t in &with.encoding().transforms {
+            let [tx, ty] = t.translation;
+            // A few px of slack for markers/arrowheads drawn just outside their anchor.
+            let m = 20.0;
+            assert!(
+                (-m..=img.display_w + m).contains(&tx) && (-m..=img.display_h + m).contains(&ty),
+                "transform translates outside the diagram: ({tx}, {ty})"
+            );
+        }
+    }
+
+    /// Plain mermaid groups must not become clip layers: nested layers make Vello spill
+    /// every covered tile to a fixed GPU buffer, and a tall diagram in a large window
+    /// overflowed it — Vello then drops the whole frame (a frozen screen while scrolling).
+    #[test]
+    fn plain_groups_open_no_layers() {
+        let src = "flowchart TB\n  subgraph X\n    A --> B --> C\n  end\n  subgraph Y\n    D --> E\n  end\n  A --> E";
+        let svg = render_svg_for_screen(src).unwrap();
+        let ours = vector_scene(&svg).encoding().n_clips;
+        // vello_svg's one-layer-per-group encoding of the same SVG, for scale.
+        let tree = usvg::Tree::from_str(
+            &svg,
+            &usvg::Options {
+                fontdb: svg_fonts(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut every_group = vello::Scene::new();
+        vello_svg::append_tree(&mut every_group, &tree);
+        let theirs = every_group.encoding().n_clips;
+        // Only genuine clip-path groups remain (a handful); invisible groups are skipped.
+        assert!(
+            ours * 10 <= theirs,
+            "expected far fewer layers than one per group: {ours} vs {theirs}"
+        );
     }
 
     #[test]

@@ -71,6 +71,42 @@ use crate::scrollbar;
 
 /// Frame profiling, enabled with `MARKDONE_PROFILE=1`: one stderr line per frame with the
 /// number/cost of layout rebuilds since the previous frame and the frame phase timings.
+/// `MARKDONE_SCROLL_TRACE=1`: log every wheel step, scrollbar drag and deferred rebuild
+/// with the viewport, scroll position, anchor and materialized band — enough to replay a
+/// scroll problem deterministically in a test.
+mod scroll_trace {
+    use std::sync::OnceLock;
+
+    use crate::doc_layout::DocLayout;
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("MARKDONE_SCROLL_TRACE").is_some_and(|v| v != "0"))
+    }
+
+    pub fn log(tag: &str, doc: Option<&DocLayout>, w: f32, vh: f32, scale: f32) {
+        if !enabled() {
+            return;
+        }
+        let Some(doc) = doc else {
+            eprintln!("[scroll] {tag} w={w} vh={vh} scale={scale} (no doc)");
+            return;
+        };
+        eprintln!(
+            "[scroll] {tag} w={w} vh={vh} scale={scale} lines={} scroll_y={:.1} max={:.1} \
+             content_h={:.1} anchor={:?} visible={:?} band={:?} remeasure={}",
+            doc.line_count(),
+            doc.scroll_y,
+            doc.max_scroll(vh),
+            doc.content_height(),
+            doc.scroll_anchor(),
+            doc.visible_range(vh),
+            doc.measured_band(),
+            doc.needs_remeasure(vh),
+        );
+    }
+}
+
 mod profile {
     use std::cell::Cell;
     use std::sync::OnceLock;
@@ -3189,14 +3225,23 @@ fn scrollbar_scroll_to(
             if (target - doc.scroll_y).abs() < 0.5 {
                 return false;
             }
+            scroll_trace::log(
+                &format!("thumb top={thumb_top:.1} target={target:.1} before"),
+                Some(doc),
+                w,
+                vh,
+                scale,
+            );
             doc.scroll_y = target;
             doc.clamp_scroll(vh);
             doc.needs_remeasure(vh)
         }
         None => return false,
     };
+    scroll_trace::log("thumb scrolled", doc_engine.doc.as_ref(), w, vh, scale);
     if remeasure {
         doc_engine.rebuild_preserving_scroll(w, scale, vh);
+        scroll_trace::log("thumb rebuilt", doc_engine.doc.as_ref(), w, vh, scale);
     }
     true
 }
@@ -3421,8 +3466,10 @@ fn paint_document(
 }
 
 /// Draw the source line numbers in the left margin, right-aligned just left of the fold
-/// chevrons: one per visible buffer line (folded-away lines are skipped), at the top of
-/// its first row. The cursor's line is drawn brighter.
+/// chevrons: one per visible buffer line, at the top of its first row. Lines with no
+/// height of their own (folded away, or collapsed inside a rendered mermaid/math block)
+/// are skipped — they all sit at the next line's y, so their numbers would pile up
+/// there. The cursor's line is drawn brighter.
 #[allow(clippy::too_many_arguments)]
 fn draw_line_numbers(
     scene: &mut Scene,
@@ -3442,7 +3489,7 @@ fn draw_line_numbers(
     // Vertically, center the number on the document's first text row.
     let row_h = font_size * LINE_HEIGHT * scale;
     for line in first..last {
-        if hidden.iter().any(|r| r.contains(&line)) {
+        if hidden.iter().any(|r| r.contains(&line)) || doc.line_is_collapsed(line) {
             continue;
         }
         let Some(top) = doc.line_top_screen(line) else {
@@ -4944,15 +4991,30 @@ impl ApplicationHandler<WritEvent> for App {
                 let wheel_dy = std::mem::take(&mut self.wheel_pending_dy);
                 if wheel_dy != 0.0 {
                     let (w, vh, scale) = state.viewport();
+                    scroll_trace::log(
+                        &format!("wheel dy={wheel_dy:.1} before"),
+                        self.doc_engine.doc.as_ref(),
+                        w,
+                        vh,
+                        scale,
+                    );
                     let remeasure = if let Some(doc) = self.doc_engine.doc.as_mut() {
                         doc.scroll_by(wheel_dy, vh);
                         doc.needs_remeasure(vh)
                     } else {
                         false
                     };
+                    scroll_trace::log("wheel scrolled", self.doc_engine.doc.as_ref(), w, vh, scale);
                     // Wheel-scrolled into height-estimated lines → rebuild to lay them out.
                     if remeasure {
                         self.doc_engine.rebuild_preserving_scroll(w, scale, vh);
+                        scroll_trace::log(
+                            "wheel rebuilt",
+                            self.doc_engine.doc.as_ref(),
+                            w,
+                            vh,
+                            scale,
+                        );
                         // Image lines scrolled into the materialized range need loading.
                         sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
                     }
@@ -4996,8 +5058,22 @@ impl ApplicationHandler<WritEvent> for App {
 
                 // Apply any coalesced async-completion rebuild once, before drawing.
                 if self.pending_rebuild {
+                    scroll_trace::log(
+                        "deferred before",
+                        self.doc_engine.doc.as_ref(),
+                        width,
+                        editor_h,
+                        state.scale,
+                    );
                     self.doc_engine
                         .rebuild_preserving_scroll(width, state.scale, editor_h);
+                    scroll_trace::log(
+                        "deferred rebuilt",
+                        self.doc_engine.doc.as_ref(),
+                        width,
+                        editor_h,
+                        state.scale,
+                    );
                     sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
                     self.pending_rebuild = false;
                 }

@@ -1286,8 +1286,13 @@ impl DocLayout {
         let measure_from_line = anchor_line.saturating_sub(MEASURE_OVERSCAN_LINES);
         // Materialize downward from the anchor until this much height is covered — the
         // viewport plus one overscan band — so the viewport can never reach a placeholder.
+        // Coverage is counted from the anchor's *bottom*: the viewport top lies somewhere
+        // inside the anchor line, and that line can be far taller than the viewport (a
+        // diagram), so counting its full height would declare the band complete while
+        // the lines just below it are on screen — an un-drawn gap that rebuilding at the
+        // same anchor never fills. From the bottom, viewport + overscan always suffices.
         let band_span = viewport_h + MEASURE_OVERSCAN_PX;
-        let mut band_y = 0.0f32; // height materialized from `anchor_line` down
+        let mut band_y = 0.0f32; // height materialized below `anchor_line`
         let mut past_band = false; // true once the band is tall enough; tail is estimated
         let mut measured_start = n; // first materialized line (n = none materialized yet)
         let mut measured_count = n; // first estimated tail line (n = materialized to end)
@@ -1452,7 +1457,7 @@ impl DocLayout {
                 let (block, block_h) = build_image_block(images, &img, content_w, scale, img_vpad);
                 let range = snapshot.line_byte_range(i);
                 height_cache.set(render_key(version, i, cursor_component(i, &range)), block_h);
-                if i >= anchor_line {
+                if i > anchor_line {
                     band_y += block_h;
                     if band_y >= band_span {
                         past_band = true;
@@ -1491,7 +1496,7 @@ impl DocLayout {
                 let (block, block_h) = build_image_block(images, &img, content_w, scale, img_vpad);
                 let range = snapshot.line_byte_range(i);
                 height_cache.set(render_key(version, i, cursor_component(i, &range)), block_h);
-                if i >= anchor_line {
+                if i > anchor_line {
                     band_y += block_h;
                     if band_y >= band_span {
                         past_band = true;
@@ -1764,9 +1769,10 @@ impl DocLayout {
             // `rkey` as the render cache / estimate-branch lookup.
             height_cache.set(rkey, line_h);
             let total_h = gh + line_h;
-            // Count coverage only from the anchor down (lines above are fixed-count
-            // overscan); stop once the viewport + overscan below is covered.
-            if i >= anchor_line {
+            // Count coverage only below the anchor (lines above are fixed-count overscan;
+            // see `band_span` for why the anchor itself doesn't count); stop once the
+            // viewport + overscan below is covered.
+            if i > anchor_line {
                 band_y += total_h;
                 if band_y >= band_span {
                     past_band = true;
@@ -1901,6 +1907,19 @@ impl DocLayout {
     /// any ghost (deleted) rows stacked above it.
     fn real_top(&self, line: usize) -> f32 {
         self.tops[line] + self.ghost_height[line]
+    }
+
+    /// The materialized band `[measured_start, measured_count)`, for diagnostics.
+    pub(crate) fn measured_band(&self) -> (usize, usize) {
+        (self.measured_start, self.measured_count)
+    }
+
+    /// True if `line` takes no vertical space of its own (ghost rows above it excluded):
+    /// folded away, or a non-anchor line of a rendered mermaid / display-math block. Such
+    /// lines share their `tops` with the next visible line, so per-line decorations
+    /// (line numbers) must skip them or they all stack at the same y.
+    pub fn line_is_collapsed(&self, line: usize) -> bool {
+        line + 1 < self.tops.len() && self.tops[line + 1] - self.real_top(line) <= 0.0
     }
 
     /// True if `line` currently renders as a standalone image block (its markdown text
@@ -3342,6 +3361,121 @@ mod tests {
             doc.measured_count - doc.measured_start < 400,
             "materialized band {} should be a small window of {n}",
             doc.measured_count - doc.measured_start
+        );
+    }
+
+    /// A diagram taller than the viewport, wheel-scrolled the way the shell does it
+    /// (`scroll_by`, then rebuild at the scroll anchor and re-pin when `needs_remeasure`):
+    /// the scroll must reach the document end, and every line on screen must be laid out
+    /// after each rebuild — the band has to cover the viewport from where it *starts*
+    /// inside the tall line, not from that line's top (else the text below the diagram
+    /// stays an un-drawn, height-estimated gap that no rebuild ever fills).
+    #[cfg(feature = "mermaid")]
+    #[test]
+    fn wheel_scroll_through_tall_diagram_lays_out_what_is_visible() {
+        use crate::buffer::Buffer;
+        use crate::image_cache::{ImagePaint, LoadedImage};
+        use vello::peniko::{Blob, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
+
+        let mut engine = TextEngine::new();
+        let theme = EditorTheme::dracula();
+        let source = "flowchart TB\n  A --> B\n";
+        let mut text: String = (0..20).map(|i| format!("Before {i}.\n")).collect();
+        text.push_str("```mermaid\n");
+        text.push_str(source);
+        text.push_str("```\n");
+        text.extend((0..300).map(|i| format!("After {i}: the quick brown fox.\n")));
+        let mut buffer: Buffer = text.parse().unwrap();
+        let snapshot = buffer.render_snapshot();
+        let fence = 20usize;
+        let viewport_h = 600.0f32;
+        let params = test_params(&theme, 1000.0);
+
+        // The diagram, already rendered: 700×3000 logical, five viewports tall.
+        let images = ImageCache::new();
+        let pixel = ImageData {
+            data: Blob::new(std::sync::Arc::new(vec![0u8; 4])),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: 1,
+            height: 1,
+        };
+        images.set_loaded(
+            &mermaid::key_for(source),
+            LoadedImage {
+                paint: ImagePaint::Raster(ImageBrush::new(pixel)),
+                width: 1,
+                height: 1,
+                display_w: 700.0,
+                display_h: 3000.0,
+                baseline: None,
+            },
+        );
+
+        let mut height_cache = HeightCache::new();
+        let mut build = |anchor: usize| {
+            DocLayout::build(
+                &mut engine,
+                &mut LineCache::new(),
+                &mut RenderCache::new(),
+                &mut height_cache,
+                &mut TableCache::new(),
+                1,
+                &snapshot,
+                &theme,
+                None,
+                None,
+                &images,
+                0, // caret at the top, outside the fence: diagram mode
+                &params,
+                None,
+                anchor,
+                viewport_h,
+                &[],
+                &(0..0),
+                &std::collections::HashMap::new(),
+            )
+        };
+        let mut doc = build(0);
+        assert!(
+            doc.image_blocks[fence].is_some(),
+            "the fence must render as the diagram"
+        );
+        // The diagram line has height; the source lines and closing fence under it
+        // collapse (so the gutter skips their numbers); the text after it doesn't.
+        assert!(!doc.line_is_collapsed(fence));
+        for line in fence + 1..=fence + 3 {
+            assert!(doc.line_is_collapsed(line), "fence line {line} should collapse");
+        }
+        assert!(!doc.line_is_collapsed(fence + 4));
+        let mut prev = -1.0f32;
+        for step in 0..2000 {
+            doc.scroll_by(60.0, viewport_h);
+            if doc.needs_remeasure(viewport_h) {
+                let (line, off) = doc.scroll_anchor();
+                doc = build(line);
+                doc.scroll_y = doc.anchor_scroll_y(line, off);
+                doc.clamp_scroll(viewport_h);
+            }
+            assert!(
+                !doc.needs_remeasure(viewport_h),
+                "step {step}: a rebuild at the anchor must lay out the whole viewport \
+                 (scroll_y={}, visible={:?}, band={}..{})",
+                doc.scroll_y,
+                doc.visible_range(viewport_h),
+                doc.measured_start,
+                doc.measured_count
+            );
+            if doc.scroll_y <= prev {
+                break;
+            }
+            prev = doc.scroll_y;
+        }
+        assert!(
+            (doc.scroll_y - doc.max_scroll(viewport_h)).abs() < 1.0,
+            "wheel scrolling got stuck at {} of {}",
+            doc.scroll_y,
+            doc.max_scroll(viewport_h)
         );
     }
 
