@@ -17,13 +17,13 @@ use parley::{Affinity, Cluster, Cursor, PositionedLayoutItem};
 use ropey::Rope;
 use vello::Scene;
 use vello::kurbo::{Affine, Rect, Stroke};
-use vello::peniko::{Brush, Color, Fill, ImageBrush};
+use vello::peniko::{Brush, Color, Fill};
 
 use crate::buffer::RenderSnapshot;
 use crate::consts::UI_LINE_HEIGHT;
 use crate::diff::{DiffState, InlineChange};
 use crate::editor::EditorTheme;
-use crate::image_cache::{ImageCache, ImageState};
+use crate::image_cache::{ImageCache, ImagePaint, ImageState, draw_paint};
 use crate::inline::{
     GitHubContext, MathSpan, NakedUrl, RawGitHubMatch, StyledRegion, github_refs_to_styled_regions,
     naked_urls_to_styled_regions,
@@ -570,10 +570,11 @@ struct ImageBlock {
 }
 
 enum ImageBlockKind {
-    /// `dest_*` are device px on screen; `nat_*` are the image's intrinsic pixel
-    /// dimensions (draw_image paints at native size, so the transform scales `dest/nat`).
+    /// `dest_*` are device px on screen; `nat_*` are the paint's native size (bitmap
+    /// pixels, or a vector's logical units — see `LoadedImage::native_size`); the draw
+    /// transform scales `dest/nat`.
     Loaded {
-        brush: ImageBrush,
+        paint: ImagePaint,
         nat_w: f32,
         nat_h: f32,
         dest_w: f32,
@@ -591,8 +592,8 @@ enum ImageBlockKind {
 /// only what's needed to paint there — the brush + intrinsic pixel size for a loaded
 /// image, or `None` for a loading/failed/absent placeholder rect.
 struct InlineImageDraw {
-    /// `(brush, nat_w, nat_h)` for a loaded image; `None` paints a placeholder box.
-    brush: Option<(ImageBrush, f32, f32)>,
+    /// `(paint, nat_w, nat_h)` for a loaded image; `None` paints a placeholder box.
+    brush: Option<(ImagePaint, f32, f32)>,
     /// Device-px to shift the drawn image DOWN from its laid-out box position. Parley
     /// bottom-aligns an inline box to the text baseline; math has content below the
     /// baseline (descenders), so its image is shifted down by its descent to sit the
@@ -778,12 +779,13 @@ fn build_image_block(
             let ih = loaded.display_h * scale;
             let dw = iw.min(content_w);
             let dh = if iw > 0.0 { ih * dw / iw } else { 0.0 };
+            let (nat_w, nat_h) = loaded.native_size();
             let block = ImageBlock {
                 alt: img.alt.clone(),
                 kind: ImageBlockKind::Loaded {
-                    brush: loaded.brush.clone(),
-                    nat_w: loaded.width as f32,
-                    nat_h: loaded.height as f32,
+                    paint: loaded.paint.clone(),
+                    nat_w,
+                    nat_h,
                     dest_w: dw,
                     dest_h: dh,
                 },
@@ -852,11 +854,8 @@ fn resolve_inline_images(
                         h *= max_advance / w;
                         w = max_advance;
                     }
-                    let brush = Some((
-                        loaded.brush.clone(),
-                        loaded.width as f32,
-                        loaded.height as f32,
-                    ));
+                    let (nat_w, nat_h) = loaded.native_size();
+                    let brush = Some((loaded.paint.clone(), nat_w, nat_h));
                     (
                         w,
                         h,
@@ -949,11 +948,8 @@ fn resolve_inline_math(
                         // shift over-shoots for math clamped to the wrap width.
                         descent *= s;
                     }
-                    let brush = Some((
-                        loaded.brush.clone(),
-                        loaded.width as f32,
-                        loaded.height as f32,
-                    ));
+                    let (nat_w, nat_h) = loaded.native_size();
+                    let brush = Some((loaded.paint.clone(), nat_w, nat_h));
                     (
                         w,
                         h,
@@ -2191,14 +2187,14 @@ impl DocLayout {
                 let x = self.pad_x as f64 + pib.x as f64;
                 let y = gy as f64 + pib.y as f64 + draw.baseline_offset as f64;
                 match &draw.brush {
-                    Some((brush, nat_w, nat_h)) => {
-                        // draw_image paints at native pixel size, so scale box/intrinsic.
-                        let transform = Affine::translate((x, y))
-                            * Affine::scale_non_uniform(
-                                pib.width as f64 / *nat_w as f64,
-                                pib.height as f64 / *nat_h as f64,
-                            );
-                        scene.draw_image(brush, transform);
+                    Some((paint, nat_w, nat_h)) => {
+                        draw_paint(
+                            scene,
+                            paint,
+                            (*nat_w, *nat_h),
+                            (x, y),
+                            (pib.width, pib.height),
+                        );
                     }
                     None => {
                         let rect = Rect::new(x, y, x + pib.width as f64, y + pib.height as f64)
@@ -2436,19 +2432,19 @@ impl DocLayout {
             let top = (self.real_top(i) - self.scroll_y + self.img_vpad) as f64;
             match &block.kind {
                 ImageBlockKind::Loaded {
-                    brush,
+                    paint,
                     nat_w,
                     nat_h,
                     dest_w,
                     dest_h,
                 } => {
-                    // draw_image paints at native pixel size, so scale dest/intrinsic.
-                    let transform = Affine::translate((x, top))
-                        * Affine::scale_non_uniform(
-                            (*dest_w / *nat_w) as f64,
-                            (*dest_h / *nat_h) as f64,
-                        );
-                    scene.draw_image(brush, transform);
+                    draw_paint(
+                        scene,
+                        paint,
+                        (*nat_w, *nat_h),
+                        (x, top),
+                        (*dest_w, *dest_h),
+                    );
                 }
                 ImageBlockKind::Loading | ImageBlockKind::Failed { .. } => {
                     let line_bottom = (self.tops[i + 1] - self.scroll_y) as f64;

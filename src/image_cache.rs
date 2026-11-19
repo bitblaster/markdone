@@ -43,13 +43,29 @@ static SVG_FONTS: LazyLock<Arc<fontdb::Database>> = LazyLock::new(|| {
     Arc::new(db)
 });
 
-/// A decoded image ready to paint, plus its raster pixel size and logical display
-/// size. For raster sources the two match; for SVG the raster size is supersampled
-/// while the display size is the SVG's intrinsic logical size (see `decode_svg`).
-/// `Arc`-wrapped in the cache so a cache clone stays O(1) (the `Blob` is Arc-backed
-/// too, but the `Arc<LoadedImage>` keeps the whole entry a single refcount bump).
+/// The shared system-font database, for other SVG parsers (mermaid's vector path).
+pub fn svg_fonts() -> Arc<fontdb::Database> {
+    SVG_FONTS.clone()
+}
+
+/// What a loaded image paints with: a decoded bitmap, or a vector scene fragment (an SVG
+/// diagram converted once to Vello drawing commands, appended to the frame's scene —
+/// crisp at any scale, no pixels held).
+#[derive(Clone)]
+pub enum ImagePaint {
+    Raster(ImageBrush),
+    Vector(Arc<vello::Scene>),
+}
+
+/// A decoded image ready to paint, plus its native size and logical display size. For
+/// raster sources the native size is the bitmap's pixels (equal to the display size, or
+/// supersampled for SVG — see `decode_svg`); for a vector the scene is drawn in logical
+/// units, so the native size *is* the display size. `Arc`-wrapped in the cache so a cache
+/// clone stays O(1) (the `Blob` is Arc-backed too, but the `Arc<LoadedImage>` keeps the
+/// whole entry a single refcount bump).
 pub struct LoadedImage {
-    pub brush: ImageBrush,
+    pub paint: ImagePaint,
+    /// Raster pixel size; for a vector, the display size rounded (see [`Self::native_size`]).
     pub width: u32,
     pub height: u32,
     pub display_w: f32,
@@ -57,6 +73,58 @@ pub struct LoadedImage {
     /// For math: logical px from the image top down to the text baseline (so inline math
     /// can sit on the line). `None` for ordinary images (they have no baseline).
     pub baseline: Option<f32>,
+}
+
+impl LoadedImage {
+    /// The size the paint is drawn at before scaling to its destination: bitmap pixels for
+    /// a raster, logical units for a vector scene.
+    pub fn native_size(&self) -> (f32, f32) {
+        match self.paint {
+            ImagePaint::Raster(_) => (self.width as f32, self.height as f32),
+            ImagePaint::Vector(_) => (self.display_w, self.display_h),
+        }
+    }
+
+    /// Approximate bytes held: the RGBA pixels of a raster, the encoded commands of a
+    /// vector scene (for memory accounting and profiling).
+    pub fn bytes(&self) -> usize {
+        match &self.paint {
+            ImagePaint::Raster(_) => self.width as usize * self.height as usize * 4,
+            ImagePaint::Vector(scene) => {
+                let enc = scene.encoding();
+                enc.path_tags.len()
+                    + enc.path_data.len() * 4
+                    + enc.draw_tags.len() * 4
+                    + enc.draw_data.len() * 4
+                    + enc.transforms.len() * 24
+                    + enc.styles.len() * 8
+            }
+        }
+    }
+}
+
+/// Paint `paint` with its native size `(nat_w, nat_h)` fitted into the device rect at
+/// `(x, y)` of size `dest_w × dest_h`. A raster is drawn at native pixel size, a vector in
+/// its logical units, so both scale by `dest / native`.
+pub fn draw_paint(
+    scene: &mut vello::Scene,
+    paint: &ImagePaint,
+    (nat_w, nat_h): (f32, f32),
+    (x, y): (f64, f64),
+    (dest_w, dest_h): (f32, f32),
+) {
+    if nat_w <= 0.0 || nat_h <= 0.0 {
+        return;
+    }
+    let transform = vello::kurbo::Affine::translate((x, y))
+        * vello::kurbo::Affine::scale_non_uniform(
+            (dest_w / nat_w) as f64,
+            (dest_h / nat_h) as f64,
+        );
+    match paint {
+        ImagePaint::Raster(brush) => scene.draw_image(brush, transform),
+        ImagePaint::Vector(fragment) => scene.append(fragment, Some(transform)),
+    }
 }
 
 /// Load state for one image URL.
@@ -204,7 +272,7 @@ impl ImageCache {
         let mut out = (0, 0);
         for (url, state) in &inner.states {
             if let ImageState::Loaded(img) = state {
-                let bytes = img.width as usize * img.height as usize * 4;
+                let bytes = img.bytes();
                 if inner.evictable.contains(url) {
                     out.0 += bytes;
                 } else {
@@ -239,7 +307,7 @@ impl ImageCache {
         let mut total = 0usize;
         for url in evictable.iter() {
             if let Some(ImageState::Loaded(img)) = states.get(url) {
-                let bytes = img.width as usize * img.height as usize * 4;
+                let bytes = img.bytes();
                 total += bytes;
                 if !keep.contains(url) {
                     held.push((last_used.get(url).copied().unwrap_or(0), bytes, url));
@@ -318,7 +386,7 @@ pub fn decode(bytes: &[u8]) -> Option<LoadedImage> {
             height,
         };
         return Some(LoadedImage {
-            brush: ImageBrush::new(data),
+            paint: ImagePaint::Raster(ImageBrush::new(data)),
             width,
             height,
             display_w,
@@ -377,7 +445,7 @@ fn decode_svg(bytes: &[u8]) -> Option<LoadedImage> {
         height: rh,
     };
     Some(LoadedImage {
-        brush: ImageBrush::new(data),
+        paint: ImagePaint::Raster(ImageBrush::new(data)),
         width: rw,
         height: rh,
         display_w: dw,

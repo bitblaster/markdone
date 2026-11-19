@@ -171,7 +171,9 @@ Headings, nested lists, and callouts all fold from the gutter through one unifie
 
 ### Mermaid Diagrams
 
-Fenced ` ```mermaid ` blocks render inline as diagrams. Rendering runs off the UI thread and is cached, so scrolling stays smooth. Drag a selection through a diagram (or move the cursor onto its block) and it de-sugars back to the raw source you're actually editing, then snaps back to the rendered diagram when you leave.
+Fenced ` ```mermaid ` blocks render inline as diagrams. Rendering runs off the UI thread and is cached, so scrolling stays smooth.
+
+Diagrams are laid out by [merman](https://github.com/Latias94/merman), a Rust port of Mermaid 12 that aims at output parity with Mermaid itself, so they match what Zettlr (Mermaid 12.1) draws. Flowcharts use Mermaid 12's default ELK layout; a `%%{init: {"layout": "dagre"}}%%` directive switches to dagre, and other `%%{init}%%` options (such as `theme`) are honoured too. On screen diagrams use Mermaid's dark theme on a transparent background; PDF export uses the light theme. The SVG is drawn as vectors with Vello (via [vello_svg](https://github.com/linebender/vello_svg)), so diagrams stay sharp at any window scale. Drag a selection through a diagram (or move the cursor onto its block) and it de-sugars back to the raw source you're actually editing, then snaps back to the rendered diagram when you leave.
 
 ![A Mermaid flowchart rendered inline in writ](https://raw.githubusercontent.com/wilfreddenton/writ/main/assets/mermaid.png)
 
@@ -263,7 +265,7 @@ writ = { version = "0.19", default-features = false }
 | `github` | GitHub ref validation + `#`/`@` autocomplete |
 | `watch` | live file-reload on external edits |
 | `remote-images` | fetch `http(s)` image URLs (adds tokio/reqwest) |
-| `mermaid` | render fenced `mermaid` blocks as diagrams |
+| `mermaid` | render fenced `mermaid` blocks as diagrams (merman; includes EPL-2.0 code, see [License](#license)) |
 | `math` | render `$…$` / `$$…$$` LaTeX math (RaTeX) |
 | `editor` | the full `core::Editor` orchestration (implies `git`, `github`, `watch`) |
 | `app` *(default)* | the winit + Vello desktop application |
@@ -296,3 +298,12 @@ Rust, Bash, and TypeScript are supported through grammar crates and highlight qu
 ## Limitations
 
 Only **ATX** headings (`# Heading`) are recognized — setext headings (a line underlined with `===` or `---`) render as plain text and don't appear in the outline or fold. This is deliberate: setext text and its underline live on separate lines, so full support means both collecting *and* rendering it across the pair, for a syntax `#` dominates in practice.
+
+## License
+
+Markdone is released under the MIT license, like writ, from which it is forked.
+
+Builds with the `mermaid` feature (on by default through `app`) include third-party code under other licenses:
+
+- [merman](https://github.com/Latias94/merman), the Mermaid renderer: MIT or Apache-2.0.
+- `merman-elk-layered`, merman's Rust port of the layered algorithm of the [Eclipse Layout Kernel (ELK)](https://github.com/eclipse-elk/elk), which lays out flowcharts the way Mermaid 12 does by default: **Eclipse Public License 2.0** ([text](https://www.eclipse.org/legal/epl-2.0/)). EPL-2.0 is a weak, file-level copyleft: it covers that crate's own files, not the rest of Markdone. Its source is published on [crates.io](https://crates.io/crates/merman-elk-layered) and in the [merman repository](https://github.com/Latias94/merman); see merman's [THIRD_PARTY_NOTICES.md](https://github.com/Latias94/merman/blob/main/THIRD_PARTY_NOTICES.md) for the obligations that apply when distributing binaries.

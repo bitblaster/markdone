@@ -39,8 +39,9 @@ github = ["_net"]
 watch = ["dep:notify", "dep:notify-debouncer-full"]
 remote-images = ["_net"]
 
-# render ```mermaid fences as diagrams (native SVG via mermaid-rs-renderer → writ's resvg)
-mermaid = ["dep:mermaid-rs-renderer"]
+# render ```mermaid fences as diagrams: Mermaid 12-parity SVG via merman, drawn as vectors
+# (usvg → vello_svg → a Vello scene fragment)
+mermaid = ["dep:merman", "dep:serde_json", "dep:vello_svg"]
 
 # render LaTeX math ($…$ / $$…$$) via RaTeX (parse→layout→tiny-skia PNG, embedded fonts)
 math = ["dep:ratex-parser", "dep:ratex-layout", "dep:ratex-render", "dep:ratex-types"]
@@ -62,9 +63,14 @@ imara-diff = "0.2"
 gix = { version = "0.84", default-features = false, features = ["sha1"], optional = true }
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"], optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
-# Native mermaid → SVG. `default-features=false` drops its `png` feature (which pulls
-# resvg 0.47, conflicting with our 0.46); we feed its SVG string into our own resvg.
-mermaid-rs-renderer = { version = "0.3", default-features = false, optional = true }
+# Native mermaid → SVG: a parity-focused Rust port of Mermaid 12 (dagre via `dugong`, ELK,
+# the "neo" look), which is what Zettlr 4.9 draws. `complete-svg` alone enables no diagram
+# family, hence `all-diagrams`; `-elk` adds Mermaid 12's default flowchart layout (ELK is
+# EPL-2.0 — see merman's THIRD_PARTY_NOTICES). No `png` feature: we draw its SVG ourselves.
+merman = { version = "0.10", default-features = false, features = ["all-diagrams", "complete-svg-elk"], optional = true }
+# SVG → Vello scene, so diagrams are drawn as vectors (crisp at any scale, no rasters).
+# Shares usvg 0.48 with resvg below.
+vello_svg = { version = "0.11", optional = true }
 # LaTeX math → raster (tiny-skia, embedded KaTeX fonts; no resvg — see `math` feature).
 ratex-parser = { version = "0.1.12", optional = true }
 ratex-layout = { version = "0.1.12", optional = true }
@@ -72,7 +78,7 @@ ratex-render = { version = "0.1.12", features = ["embed-fonts"], optional = true
 ratex-types = { version = "0.1.12", optional = true }
 # SVG rasterization (badges etc.); default features pull in text + system-fonts,
 # needed to render `<text>` labels in shields.io-style badges.
-resvg = "0.46"
+resvg = "0.48"
 # --- Linebender rendering stack (see MIGRATION-PLAN.md). `wgpu` is NOT a direct
 # dep — we use `vello::wgpu` so there is a single wgpu in the tree. ---
 parley = "0.11.1"
