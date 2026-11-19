@@ -73,7 +73,7 @@ impl UiLayer {
         ui_font: Option<(Vec<u8>, u32)>,
         fallback_fonts: Vec<(Vec<u8>, u32)>,
     ) -> Self {
-        let ctx = egui::Context::default();
+        let ctx = new_context();
         ctx.set_fonts(ui_fonts(ui_font, fallback_fonts));
         let max_texture_side = device.limits().max_texture_dimension_2d as usize;
         let winit = egui_winit::State::new(
@@ -335,6 +335,16 @@ impl UiLayer {
             self.renderer.free_texture(id);
         }
     }
+}
+
+/// The egui context for the chrome. egui's own keyboard zoom is off: `Ctrl` `+`/`-`/`0`
+/// are the editor's zoom (font size), and egui reacting to them too would scale its
+/// points away from the window scale — while the shell places the table of contents, the
+/// bars and the pointer test assuming one point is `scale` device px.
+fn new_context() -> egui::Context {
+    let ctx = egui::Context::default();
+    ctx.options_mut(|o| o.zoom_with_keyboard = false);
+    ctx
 }
 
 /// Whether an egui area (menu, popup, dialog, backdrop) lies under `pos` (points), as of
@@ -627,6 +637,33 @@ mod tests {
                     });
             }
         });
+    }
+
+    /// `Ctrl` `+` zooms the editor's font only: egui must not rescale its own points too
+    /// (regression: the table of contents jumped around on every zoom step, placed in
+    /// points computed from the unchanged window scale).
+    #[test]
+    fn editor_zoom_keys_do_not_zoom_the_chrome() {
+        let zoom_in = vec![egui::Event::Key {
+            key: egui::Key::Plus,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        }];
+        // egui applies the zoom at the end of a pass; a second pass makes it visible.
+        let press = |ctx: &egui::Context| {
+            frame_with(ctx, false, None, zoom_in.clone());
+            frame_with(ctx, false, None, Vec::new());
+        };
+        // A plain egui context does zoom on this event (so the test exercises it)…
+        let plain = egui::Context::default();
+        press(&plain);
+        assert!(plain.zoom_factor() > 1.0, "the event should trigger egui's zoom");
+        // …ours does not.
+        let ctx = new_context();
+        press(&ctx);
+        assert_eq!(ctx.zoom_factor(), 1.0);
     }
 
     /// The document area is not "over egui" (regression: the background layer spans the

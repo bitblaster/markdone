@@ -930,6 +930,8 @@ struct App {
     scrollbar_pending: bool,
     /// Wheel scroll (device px) accumulated since the last frame, applied once per frame.
     wheel_pending_dy: f32,
+    /// Ctrl+wheel zoom not yet applied, in steps (fractions from touchpad pixel deltas).
+    wheel_zoom_acc: f32,
     /// `MARKDONE_AUTOSCROLL` benchmark run finished (reached the bottom).
     autoscroll_done: bool,
     /// Tab switch requested from inside a redraw (where `state` is borrowed), applied
@@ -1103,6 +1105,7 @@ impl App {
             scrollbar_hover: false,
             scrollbar_pending: false,
             wheel_pending_dy: 0.0,
+            wheel_zoom_acc: 0.0,
             autoscroll_done: false,
             pending_tab_switch: None,
             autotabs_returning: false,
@@ -2383,6 +2386,9 @@ impl App {
 /// materialized band are always kept; older ones beyond this are evicted and reloaded on
 /// demand. ~10 downscaled 1024×728 screenshots.
 const IMAGE_MEMORY_BUDGET: usize = 32 * 1024 * 1024;
+
+/// Touchpad scroll distance (device px) that makes one Ctrl+wheel zoom step.
+const WHEEL_ZOOM_PX_PER_STEP: f32 = 50.0;
 
 /// Pin glibc's malloc thresholds so large blocks always go through `mmap` and return
 /// to the OS when freed. By default glibc *raises* both thresholds after the first large
@@ -3953,6 +3959,22 @@ impl ApplicationHandler<WritEvent> for App {
                 // height and relayout at the new scale, not just redraw stale geometry.
                 sync_find_chrome(&mut self.doc_engine, state);
                 state.window.request_redraw();
+            }
+            // Ctrl/Cmd + wheel zooms the document text (like a browser) instead of scrolling:
+            // wheel up = larger. Notches count one step each; touchpad pixel deltas are
+            // accumulated into steps so one gesture doesn't jump across many sizes.
+            WindowEvent::MouseWheel { delta, .. }
+                if self.modifiers.control_key() || self.modifiers.super_key() =>
+            {
+                self.wheel_zoom_acc += match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / WHEEL_ZOOM_PX_PER_STEP,
+                };
+                let steps = self.wheel_zoom_acc.trunc();
+                if steps != 0.0 {
+                    self.wheel_zoom_acc -= steps;
+                    self.zoom(Some(steps));
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let dy = match delta {
