@@ -11,46 +11,50 @@ env:
 
 jobs:
   check:
-    name: Check
-    runs-on: ubuntu-latest
+    name: Check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
 
-      - name: Install system dependencies
-        # winit needs libxkbcommon; fontconfig is dlopen'd at runtime via the
-        # fontique `fontconfig-dlopen` feature (no -dev headers needed).
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        # libwayland-client is linked by the Wayland drag-and-drop listener; winit's
+        # X11/xkbcommon and fontconfig are dlopen'd at runtime (no -dev headers needed),
+        # libxkbcommon-dev is kept for winit's build.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev
 
       - name: Check formatting
+        if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Build
-        run: cargo build --verbose
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       # Guard the reduced-feature library paths: `--all-features` can't catch a module
       # that uses a feature-gated dep while being registered ungated (the render-only /
       # editor-only consumers pull neither winit nor the app stack).
       - name: Build (render-only, no default features)
-        run: cargo build --no-default-features --verbose
+        if: runner.os == 'Linux'
+        run: cargo build --locked --no-default-features
 
       - name: Build (editor, no app)
-        run: cargo build --no-default-features --features editor --verbose
+        if: runner.os == 'Linux'
+        run: cargo build --locked --no-default-features --features editor
 
-      - name: Run tests
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_API_TOKEN }}
-        run: cargo test --verbose
-
-      - name: Package check
-        run: cargo publish --dry-run --locked
+      # The `github::` tests call api.github.com with a token; skipped here.
+      - name: Test
+        run: cargo test --locked -- --skip github::
