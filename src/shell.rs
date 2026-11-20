@@ -3558,6 +3558,8 @@ fn update_pointer_cursor(
     if icon != *current {
         *current = icon;
         state.window.set_cursor(icon);
+        // One egui frame, so that egui-winit learns the new icon (see `UiLayer::run`).
+        state.window.request_redraw();
     }
 }
 
@@ -5527,6 +5529,7 @@ impl ApplicationHandler<WritEvent> for App {
                 self.toc_current = toc.as_ref().and_then(|t| t.1);
                 let mut toc_response = None;
                 if let Some(ui) = self.ui.as_mut() {
+                    ui.set_editor_cursor(self.cursor_icon);
                     ui.set_side_panel(toc.as_ref().map(|t| {
                         let mut r = t.2;
                         r.min.x -= 1.0;

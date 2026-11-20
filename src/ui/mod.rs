@@ -62,6 +62,9 @@ pub struct UiLayer {
     popup_open: bool,
     /// The table of contents panel (points), when shown: egui owns the pointer there.
     side_panel: Option<egui::Rect>,
+    /// The cursor the editor shows over the document, reported to egui-winit whenever
+    /// egui is inactive (see [`Self::run`]).
+    editor_cursor: egui::CursorIcon,
 }
 
 impl UiLayer {
@@ -97,6 +100,7 @@ impl UiLayer {
             pointer_over: false,
             popup_open: false,
             side_panel: None,
+            editor_cursor: egui::CursorIcon::Default,
         }
     }
 
@@ -134,11 +138,7 @@ impl UiLayer {
             let over = (position.y as f32) < Self::top_inset(window.scale_factor() as f32)
                 || area_at(&self.ctx, pos)
                 || self.side_panel.is_some_and(|r| r.contains(pos));
-            if over && !self.pointer_over {
-                // egui-winit sets the cursor only when its own icon changes, and it does
-                // not know what the editor set: start from the default arrow.
-                window.set_cursor(winit::window::CursorIcon::Default);
-            } else if !over && self.pointer_over {
+            if !over && self.pointer_over {
                 self.cursor_released = true;
             }
             self.pointer_over = over;
@@ -179,6 +179,16 @@ impl UiLayer {
     /// Set the area of the table of contents panel (points), `None` when closed.
     pub fn set_side_panel(&mut self, rect: Option<egui::Rect>) {
         self.side_panel = rect;
+    }
+
+    /// The cursor the editor shows over the document (the window has it already).
+    pub fn set_editor_cursor(&mut self, icon: winit::window::CursorIcon) {
+        use winit::window::CursorIcon as W;
+        self.editor_cursor = match icon {
+            W::Text => egui::CursorIcon::Text,
+            W::Pointer => egui::CursorIcon::PointingHand,
+            _ => egui::CursorIcon::Default,
+        };
     }
 
     /// Whether a menu or popup is open (a click outside it only closes it).
@@ -228,17 +238,15 @@ impl UiLayer {
         }
 
         // Cursor ownership: egui over its own areas, the editor over the document.
-        // egui-winit only calls `set_cursor` when its icon differs from its cache, and
-        // it does not see what the editor sets. So on entering egui reset the window
-        // cursor to the default (matching egui's cache), and over the document report
-        // the default icon so egui changes nothing.
+        // egui-winit calls `set_cursor` only when the icon differs from its cache, and it
+        // does not see what the editor sets on the window. So over the document report
+        // the editor's own icon: egui-winit's cache then follows the window, and when it
+        // re-applies its icon (it drops the cache whenever a frame runs with the pointer
+        // outside the window) it re-applies the editor's, not a stale arrow.
         let mut platform_output = output.platform_output;
         let wants_ime = platform_output.ime.is_some();
-        if self.active && !was_active {
-            window.set_cursor(winit::window::CursorIcon::Default);
-        }
         if !self.active {
-            platform_output.cursor_icon = egui::CursorIcon::Default;
+            platform_output.cursor_icon = self.editor_cursor;
             self.cursor_released |= was_active;
         }
         self.winit.handle_platform_output(window, platform_output);
