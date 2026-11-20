@@ -1,309 +1,339 @@
 # Markdone
 
-A fast, lightweight Markdown editor with live inline rendering: a native alternative
-to Electron editors such as Zettlr, at a fraction of the memory.
+A fast, lightweight Markdown editor with live inline rendering: a native alternative to
+Electron editors such as Zettlr, at a fraction of the memory. It runs on Linux, Windows
+and macOS.
 
 Markdone is a fork of [writ](https://github.com/wilfreddenton/writ) by Wilfred Denton
-(MIT license). It adds an application UI (menus, tabs, dialogs, preferences) drawn with
-egui on top of writ's Vello document renderer.
+(MIT license), whose GPU document renderer and editing engine it builds on. It adds a
+desktop application around them: menus, tabs, dialogs, preferences, a table of contents,
+themes, PDF export, diagrams and more.
 
-![Markdown rendered inline: a clean heading, styled prose, and a syntax-highlighted Rust code block](assets/hero.png)
+![The Markdone window: document tabs, line numbers, a rendered document with a task list, a callout, a code block, a table, a Mermaid diagram and math, and the table of contents](assets/hero.png)
 
 ## Install
 
+Download the archive for your system from the
+[Releases](https://github.com/bitblaster/markdone/releases) page. The builds are not
+signed yet, so Windows and macOS warn about them on the first launch (see below).
+
+### Windows
+
+- **Installer** (`markdone-…-x86_64-pc-windows-msvc-setup.exe`): installs for the current
+  user (no administrator rights needed; installing for all users is offered too), adds
+  Markdone to the Start menu and optionally to the desktop, and can associate `.md` and
+  `.markdown` files with it. Uninstall it from *Settings → Apps*.
+- **Portable** (`markdone-…-x86_64-pc-windows-msvc.zip`): unzip anywhere and run
+  `markdone.exe`.
+
+On the first launch SmartScreen may say that it protected your PC: choose *More info →
+Run anyway*.
+
+### macOS (Apple Silicon)
+
+Unzip `markdone-…-aarch64-apple-darwin.zip` and move `Markdone.app` to *Applications*.
+The app is not signed or notarized, so Gatekeeper blocks it the first time (it may even
+call it "damaged"). Remove the quarantine flag the download received, then open it
+normally:
+
 ```bash
-packaging/install.sh            # binary in ~/.local/bin, launcher entry and icon
-packaging/install.sh --default  # also the default application for Markdown files
-packaging/install.sh --uninstall
+xattr -dr com.apple.quarantine /Applications/Markdone.app
+```
+
+### Linux (x86_64)
+
+Extract `markdone-…-x86_64-unknown-linux-gnu.tar.gz` and run the install script from the
+extracted folder. It installs for the current user (no root needed): the binary in
+`~/.local/bin`, the launcher entry and the icon in `~/.local/share`.
+
+```bash
+./install.sh             # install
+./install.sh --default   # also make Markdone the default application for Markdown files
+./install.sh --uninstall # remove it (the configuration and the session stay)
+```
+
+The binary needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later). It
+can also be run directly from the extracted folder, without installing.
+
+### From source
+
+See [Building from source](#building-from-source). On Linux,
+`packaging/linux/install.sh` builds Markdone and installs it as above.
+
+## Usage
+
+Open Markdone from the Start menu, *Applications* or your launcher, or from a terminal:
+
+```bash
+markdone notes.md todo.md    # open these files, one tab each
+markdone                     # restore the previous session (the tabs left open)
 ```
 
 Markdone runs as a single instance: opening a file while it is running (from the file
 manager or the command line) adds a tab to the open window. `--new-instance` starts a
 separate one.
 
-## Usage
+| Option | Description |
+|--------|-------------|
+| `FILE…` | Documents to open, one tab each |
+| `--new-instance` | Start a separate instance instead of handing the files to the running one |
+| `--demo` | Open a showcase document with a synthetic inline diff |
+| `--config <path>` | Use this configuration file instead of the default one |
+| `--github-token <token>` | GitHub API token for the GitHub references (or the `GITHUB_TOKEN` variable) |
+| `--github-repo <owner/repo>` | GitHub repository for the references (default: detected from the git remote) |
+| `--autosave` | Save the document on every edit |
 
-```bash
-markdone --file path/to/document.md
-```
-
-Run `markdone --demo` (or with no arguments) to open a built-in showcase document with a synthetic git-`HEAD` diff, so you can see the inline diff, rendering, and code-fence highlighting without setting anything up.
-
-Flags:
-
-| Flag | Description |
-|------|-------------|
-| `--file <path>` | Open a markdown file (watched for live external edits) |
-| `--demo` | Open the showcase document with a synthetic HEAD diff |
-| `--autosave` | Save on every edit (used by the GhostText daemon) |
-| `--github-repo <owner/repo>` | GitHub context for ref validation (else auto-detected from the git remote) |
-| `--github-token <token>` | GitHub API token (or the `GITHUB_TOKEN` env var) for ref validation, hover cards, and autocomplete |
-| `--config <path>` | Config file location (default `~/.config/markdone/config.toml`) |
-
-Markdone is rendered on [winit](https://github.com/rust-windowing/winit) + [wgpu](https://wgpu.rs) + [Vello](https://github.com/linebender/vello) + [Parley](https://github.com/linebender/parley) (GPU 2D rendering and text layout). On Linux/Mesa (including Asahi) select the Vulkan backend with `WGPU_BACKEND=vulkan`. Fonts are resolved via [Fontique](https://github.com/linebender/parley) with fontconfig loaded at runtime — no `-dev` headers needed.
-
-### Configuration
-
-writ reads an optional TOML config from `~/.config/markdone/config.toml` (platform config dir, overridable with `--config <path>`). It sets the theme and the document font; a missing or malformed file just falls back to the built-in defaults. See [`config.example.toml`](config.example.toml) for a fully commented example.
-
-```toml
-[font]
-family = "JetBrains Mono"   # must be monospace; verified at startup, falls back if not
-size = 18.0
-
-[theme]
-name = "nord"               # a built-in preset (see below) or a [themes.*] you define
-
-[theme.overrides]           # optional per-color hex tweaks on top of the selected theme
-comment = "#7A88B8"
-```
-
-- **Themes.** Pick a built-in preset by `name` — dark: `dracula` (default), `nord`, `solarized-dark`, `gruvbox-dark`, `tokyo-night`, `catppuccin-mocha`; light: `solarized-light`, `catppuccin-latte` — or define your own under `[themes.<name>]` (any omitted color is inherited from dracula) and select it. `[theme.overrides]` applies hex tweaks on top. The 12 color slots are `background`, `surface`, `foreground`, `selection`, `comment`, `red`, `orange`, `yellow`, `green`, `cyan`, `purple`, `pink`.
-- **Font.** The family **must be monospace** — writ verifies fixed-pitch at startup and falls back to the system monospace (with a warning) if the font is proportional or not installed, protecting its deterministic wrapping.
-- Config is read once at startup; edits take effect on the next launch.
-
-### Inline git diff
-
-When the open file lives in a git repository, writ renders a live inline diff against `HEAD`: added lines and words are tinted green, deleted lines appear as red "ghost" rows above their position, all with the same markdown rendering as the rest of the document. writ watches both the file and the repository's `HEAD`, so edits made by an external tool (e.g. an AI agent) reload and re-diff live — and committing, amending, or switching branches re-bases the diff immediately, even when the working file itself is untouched.
-
-![Inline git diff: red ghost rows for deletions above green added lines, with word-level highlighting, all rendered as Markdown](https://raw.githubusercontent.com/wilfreddenton/writ/main/assets/diff.png)
-
-### GitHub integration
-
-When the open file is inside a GitHub repository (auto-detected from the `origin` remote, or set with `--github-repo owner/repo`) and a token is available (`--github-token` or the `GITHUB_TOKEN` env var), writ makes GitHub references live:
-
-- **Ref detection + validation.** `#123` (issues/PRs), `@user` mentions, and cross-repo `owner/repo#456` refs are detected and validated against the GitHub API — valid refs are colored, invalid ones stay plain.
-- **Hover cards.** Hover a validated ref for a popover with the issue/PR title and open/closed/merged status.
-- **Autocomplete.** Type `#` to search issues and PRs, or `@` to search users, in a dropdown scoped to the repo.
-- **Ctrl+R** force-revalidates all refs (busts a stale cache).
-
-Validation is scoped to the visible viewport and cached, so scrolling a large document doesn't re-hit the API.
-
-### GhostText Integration
-
-writ can edit browser textareas via the [GhostText](https://ghosttext.fregante.com/) protocol. Install the GhostText browser extension, then run the `writd` daemon:
-
-```bash
-writd
-```
-
-The daemon listens on port 4001. When you activate GhostText on a textarea, `writd` spawns a writ instance with `--autosave` enabled. Edits in writ sync back to the browser in real-time. This is useful for writing GitHub comments, issues, and PRs with writ's markdown editing features.
-
-The `--autosave` flag can also be used standalone to save on every edit:
-
-```bash
-markdone --file doc.md --autosave
-```
-
-## Development
-
-```bash
-git clone https://github.com/wilfreddenton/writ
-cd writ
-cargo run -- --file path/to/document.md
-```
-
-On Linux, using a faster linker significantly improves build times. See [Zed's linker documentation](https://github.com/zed-industries/zed/blob/main/docs/src/development/linux.md#linkers-linker) for setup instructions.
-
-### Build Profiles
-
-The dev profile optimizes dependencies (`opt-level = 2` for all deps, via `[profile.dev.package."*"]`) while keeping writ's own code unoptimized and debuggable — so a plain `cargo run` is comfortably interactive (the graphics/parsing stack — wgpu, Vello, Parley, tree-sitter — runs at full speed). Dependencies compile once, so incremental writ builds stay fast.
-
-For maximum runtime performance (slower compile times), use a full release build:
-
-```bash
-cargo run --release -- --file path/to/document.md
-```
-
-The release profile enables thin LTO and a single codegen unit for best optimization; the `release-fast` profile (`cargo run --profile release-fast`) trades some of that for faster compilation by disabling LTO and using parallel codegen units.
+Shortcuts are written with Ctrl in this document; on macOS they use Cmd, and text
+navigation follows the Mac conventions (Option+arrows by word, Cmd+arrows to the line or
+document ends).
 
 ## Features
 
-### Inline Rendering
+### Inline rendering
 
-Markdown syntax is hidden when your cursor is elsewhere, revealing clean formatted text. Move your cursor to any formatted element and the raw syntax appears for editing. Headings hide their `#` markers and display at the appropriate size. Bold and italic text hides the `*` markers. Inline code hides the backticks and renders in a monospace font. Links hide the URL syntax entirely and can be opened with Ctrl+click (Cmd+click on macOS).
+Markdown syntax is hidden when the cursor is elsewhere and comes back where you edit.
+Headings hide their `#` markers and display at their size, bold and italic hide their
+markers, inline code hides its backticks, links hide the URL (Ctrl+click opens it). The
+editor keeps a file's line endings: a Windows (CRLF) file is saved back as CRLF.
 
-### Images
+### Documents and tabs
 
-Images render inline, supporting both URLs and local file paths (absolute or relative to the markdown file). When an image is on its own line, only the rendered image is shown. Move your cursor to the line to reveal the markdown syntax above the image.
+Every document opens in a tab; the open tabs are restored at the next start, and
+*File → Open Recent* lists the recent files. Files changed on disk by another program
+reload automatically (or after asking, see the preferences); a document with unsaved
+changes is never overwritten without asking. Files and images can be dropped on the
+window.
 
-### Lists and Blockquotes
+### Table of contents
 
-Unordered list markers (`-`) are replaced with bullet symbols when the cursor is away. Ordered lists are automatically renumbered as you edit. Task lists render interactive checkboxes that you can click to toggle. Blockquotes hide their `>` markers and show a left border instead.
+*View → Table of Contents* (Ctrl+Shift+O) shows the headings in a side panel: click one
+to jump to it; the current section is highlighted. Drag the panel edge to resize it.
 
-Nesting is fully supported. A task item inside a blockquote is represented internally as a stack of layers, and each layer contributes its visual treatment independently.
+### Formatting and editing
+
+The *Format* menu, the context menu and the shortcuts apply bold, italic, underline,
+strikethrough, highlight and code, turn lines into headings, lists or quotes, and insert
+links, images and code blocks. Pasting rich text (from a web page or an office suite)
+converts it to Markdown; *Paste without Style* keeps the plain text, and *Copy as HTML*
+copies the rendered selection.
+
+Selection works with click, drag (with edge auto-scroll), Shift+arrows, double-click
+(word) and triple-click (line). Undo and redo group typing into words, cursor movement
+and deletion operate on whole grapheme clusters, and vertical movement keeps its column
+through short lines.
+
+### Lists, tasks and quotes
+
+List markers become bullets, ordered lists renumber as you edit, and task lists render
+checkboxes you can click. Blockquotes show a bar instead of `>`. Nesting is fully
+supported.
+
+Enter inserts a plain newline. Shift+Enter continues the current list or quote
+(`- item` → a new `- `), Shift+Alt+Enter adds an indented continuation paragraph. Tab
+cycles through the nesting states that fit the context (sibling item, paragraph indent,
+nested item); Shift+Tab goes back.
 
 ### Callouts
 
-Obsidian-style callouts — a blockquote whose first line is `> [!note]` (or `tip`, `warning`, `danger`, `success`, `question`, `example`, `quote`, …) — render inline with a type icon and accent color. Twelve types with their aliases are recognized. Add `+`/`-` after the type (`> [!tip]-`) to make a callout foldable (and start it collapsed); callouts nest, and each nesting level folds independently with the same gutter-chevron gestures as headings and lists. A custom title after the type (`> [!warning] Be careful`) replaces the default. As with other markers, the raw `[!type]` syntax reveals while your cursor is on the header line.
+Obsidian-style callouts (`> [!note]`, `tip`, `warning`, `danger` and the other types,
+with their aliases) render with an icon and an accent color. A custom title can follow
+the type, and `+`/`-` after it (`> [!tip]-`) makes the callout foldable.
 
-![Obsidian-style callouts: note, foldable tip, warning, and danger, each with its own icon and accent color](https://raw.githubusercontent.com/wilfreddenton/writ/main/assets/callouts.png)
+![Callouts: note, a collapsed foldable tip, warning with a custom title, and danger](assets/callouts.png)
 
-### Smart Enter and Tab
+### Code blocks
 
-Enter inserts a raw newline—no magic. Shift+Enter continues the current container by copying markers from the current line (e.g., on `- item|`, Shift+Enter creates `\n- `). Shift+Alt+Enter creates an indented continuation for nested paragraphs within list items.
+Fenced code blocks are shown as panels with their language in the corner; the fences come
+back when the cursor enters the block. Syntax highlighting covers Rust, Python, Java,
+JavaScript, TypeScript, C, C++, PHP and shell (`bash`/`sh`), plus Mermaid and LaTeX
+sources. In a code block Tab indents.
 
-Tab cycles through nesting states based on tree-sitter context. On a blank line after a list item, Tab cycles through: sibling marker → paragraph indent → nested marker → empty. Shift+Tab cycles backwards. This replaces traditional indent/dedent with context-aware structure cycling.
+### Tables
 
-### Code Blocks
+Pipe tables render as a grid with a bold header, column alignment (`:--`, `:-:`, `--:`)
+and inline styles in the cells; the raw source comes back when the cursor enters the
+table. Type a header row such as `| Name | Age |` and press Shift+Enter to add the
+delimiter and a body row; Tab moves between cells and adds a row from the last one;
+adding a column to the header extends every row.
 
-Fenced code blocks render with syntax highlighting for Rust, Bash, and TypeScript (`typescript` or `ts`). The fence line's delimiter and language name are colored distinctly, and the code is highlighted per-grammar. Move your cursor into the block to edit.
+### Mermaid diagrams
 
-### Selection and Editing
+` ```mermaid ` blocks render as diagrams, drawn as vectors (sharp at any window scale),
+off the UI thread. They are laid out by [merman](https://github.com/Latias94/merman), a
+Rust port of Mermaid 12, so they match what Mermaid itself (and Zettlr) draw: flowcharts
+use Mermaid's default ELK layout, and `%%{init: {"layout": "dagre"}}%%` or other `init`
+options (such as `theme`) are honoured. Diagrams follow the light or dark theme; the PDF
+export uses Mermaid's light theme. Moving the cursor into the block shows its source.
 
-Full selection support with click, drag (with edge auto-scroll), shift+arrow keys, double-click to select word, and triple-click to select line. Vertical movement keeps a sticky goal column through short lines. Copy, cut, and paste (with normalization) work as expected, and paste is context-aware inside blockquotes and code blocks. Undo/redo coalesce runs of typing into word-granular steps, with full cursor restoration. Cursor movement, selection, and deletion operate on whole grapheme clusters (so emoji and combining marks never split).
-
-### GFM Tables
-
-Pipe tables render as a live grid — bold header, per-column alignment (`:--`/`:-:`/`--:`), and inline styles (bold, code, links) inside cells. Move your cursor into a table and it reveals the raw pipe source for editing; move out and it snaps back to the grid. Type a header row like `| Name | Age |` and press Shift+Enter to scaffold the delimiter and a body row; Tab moves between cells (and appends a row from the last cell). Type a new column into the header and the delimiter and every body row grow to match — in place, wherever you added it. Backspace on a freshly-added empty row removes it in one press.
-
-![A GFM table rendered as a grid with a bold header and right-aligned numeric columns](https://raw.githubusercontent.com/wilfreddenton/writ/main/assets/tables.png)
-
-### Find and Replace
-
-Ctrl+F opens a find bar docked above the status bar; Ctrl+H adds the replace row. Matches highlight live with a count, and the current match is emphasized; Enter/Shift+Enter cycle through them. Toggle regular expressions (Alt+R, with `$1` capture groups in the replacement) and case sensitivity (Alt+C). Enter in the replace field swaps the current match, Ctrl+Enter replaces all in one undo step. Click into the document to keep the bar open while you edit.
-
-### Folding
-
-Headings, nested lists, and callouts all fold from the gutter through one unified model. Hover the left margin to reveal a chevron on any foldable line and click to collapse its section; the outline mirrors what's folded. Modifier-clicks scope the fold: Ctrl folds every section at that level, Shift folds recursively, Ctrl+Shift folds that level and everything deeper. Jumping to a hidden line auto-unfolds it. Task lists fold the same way, so a long checklist collapses to its parent item.
-
-![A collapsed callout showing its gutter chevron, above a foldable heading section and a nested list](https://raw.githubusercontent.com/wilfreddenton/writ/main/assets/folding.png)
-
-### Mermaid Diagrams
-
-Fenced ` ```mermaid ` blocks render inline as diagrams. Rendering runs off the UI thread and is cached, so scrolling stays smooth.
-
-Diagrams are laid out by [merman](https://github.com/Latias94/merman), a Rust port of Mermaid 12 that aims at output parity with Mermaid itself, so they match what Zettlr (Mermaid 12.1) draws. Flowcharts use Mermaid 12's default ELK layout; a `%%{init: {"layout": "dagre"}}%%` directive switches to dagre, and other `%%{init}%%` options (such as `theme`) are honoured too. On screen diagrams use Mermaid's dark theme on a transparent background; PDF export uses the light theme. The SVG is drawn as vectors with Vello (via [vello_svg](https://github.com/linebender/vello_svg)), so diagrams stay sharp at any window scale. Drag a selection through a diagram (or move the cursor onto its block) and it de-sugars back to the raw source you're actually editing, then snaps back to the rendered diagram when you leave.
-
-![A Mermaid flowchart rendered inline in writ](https://raw.githubusercontent.com/wilfreddenton/writ/main/assets/mermaid.png)
+![A Mermaid flowchart rendered inline](assets/mermaid.png)
 
 ### Math
 
-LaTeX math renders inline via RaTeX with the KaTeX fonts embedded. Block `$$…$$` renders as centered display math on its own line; inline `$…$` renders as a baseline-aligned box within the text (the GitHub/pandoc rule keeps prose like "$5 and $10" literal). Glyphs take the theme foreground color. As with mermaid, moving the cursor into a span reveals its raw source for editing.
+LaTeX math renders with [RaTeX](https://github.com/erweixin/RaTeX) and the KaTeX fonts:
+`$$…$$` as centered display math, `$…$` inline on the text baseline (prose such as "$5 and
+$10" stays literal). The source comes back when the cursor enters it.
 
-![Inline and block LaTeX math rendered in writ](https://raw.githubusercontent.com/wilfreddenton/writ/main/assets/math.png)
+![Inline and display LaTeX math](assets/math.png)
 
-## Library Usage
+### Inline git diff
 
-writ is also a library: its rendering and editing layers work independently of the
-desktop app, and the network/GUI dependencies are feature-gated so a render-only
-consumer stays lean.
+In a git repository, Markdone shows the changes since the last commit inline: added lines
+and words tinted green, deleted lines as faded ghost rows above their position, all
+rendered as Markdown. The diff follows edits, external changes and commits or branch
+switches live. *View → Git Differences* turns it off.
 
-### Headless markdown renderer
+![Inline git diff: deleted lines as red rows, added lines and words in green](assets/diff.png)
 
-`MarkdownView` renders markdown into a [Vello](https://github.com/linebender/vello)
-`Scene` with no window, GPU device, or editor. Feed it content up front or stream it
-in with `push_str`, then paint — useful for embedding writ's renderer elsewhere, or
-for rendering LLM output as it arrives.
+### Find and replace
 
-writ 0.19 uses Vello 0.10. Consumers passing a `Scene` to writ must use the same
-Vello version.
+Ctrl+F opens the find bar, Ctrl+H adds the replace field. Matches highlight live with a
+count; Enter and Shift+Enter move between them. Regular expressions (Alt+R, with `$1`
+groups in the replacement) and case sensitivity (Alt+C) can be toggled; Ctrl+Enter
+replaces all matches in one undo step.
 
-```rust
-use vello::Scene;
-use writ::MarkdownView;
+### Folding
 
-let mut view = MarkdownView::new();
-view.push_str("# Streaming\n\n");           // append incrementally (e.g. LLM tokens)
-view.push_str("More text arrives later.\n");
+Headings, nested lists and foldable callouts fold from the margin: hover it to reveal a
+chevron and click to collapse the section. Ctrl+click folds every section at that level,
+Shift+click folds recursively, Ctrl+Shift+click folds that level and the deeper ones.
+Ctrl+Shift+1…6 folds every heading at that depth.
 
-let mut scene = Scene::new();
-view.render(&mut scene, 800.0, 600.0, 1.0);  // draw into the Scene
-// …then hand `scene` to a vello::Renderer to rasterize onto your own surface.
-```
+### PDF export
 
-`writ::rasterize_scene_to_png` renders a `Scene` to a PNG headlessly — see
-`examples/streaming_markdown.rs` for an end-to-end streaming → PNG demo. The layout
-and draw internals live in the `markdown_view`, `render`, `doc_layout`, and
-`text_engine` modules.
+*File → Export as PDF* (Ctrl+E) prints the document, with its images, diagrams and math,
+through an installed Chromium-family browser (Chrome, Chromium, Edge or Brave), which
+must be present.
 
-### Editing engine
+### Appearance
 
-`core::Editor` (behind the `editor` feature) is a headless, renderer-free editor: a
-rope buffer, cursor/selection, tree-sitter markdown parsing, and an inline git-diff
-model, with no window or GPU dependency.
+- **Light and dark modes**, each with its own theme, switched with *View → Dark Mode* or
+  automatically following the system setting (on Linux through the XDG desktop portal,
+  supported by KDE, GNOME and others). Built-in themes: dark `dracula`, `nord`,
+  `solarized-dark`, `gruvbox-dark`, `tokyo-night`, `catppuccin-mocha`; light
+  `solarized-light`, `catppuccin-latte`; custom themes can be defined in the
+  configuration file.
+- **Fonts**: any installed font for the text, a monospace font for the code.
+- **Zoom**: Ctrl+plus, Ctrl+minus, Ctrl+0 or Ctrl+wheel.
+- Text width (limited or the whole window), line numbers.
 
-```rust
-use std::path::Path;
-use writ::core::Editor;
+### GitHub references
 
-// Open a file (loads content and the git-HEAD diff base)…
-let mut editor = Editor::open(Path::new("notes.md"));
-// …or start from a string.
-let mut editor = Editor::new("# Hello, world!");
+Optionally (*Preferences → Privacy*, off by default), in a GitHub repository Markdone
+recognizes `#123` issues and pull requests, `@user` mentions and `owner/repo#456`
+references. With a GitHub token (set in the same preferences section, or with
+`--github-token` or the `GITHUB_TOKEN` variable, which take precedence) it checks them
+against the GitHub API: valid ones are colored and show a card on hover, and typing `#`
+or `@` offers completions; Ctrl+R revalidates them. The token in the preferences is
+stored in plain text in the configuration file.
 
-// Edit.
-editor.type_char('x');
-editor.enter();
-editor.backspace();
+## Configuration
 
-// Query.
-editor.text();
-editor.cursor_position();     // cursor byte offset
-editor.selection_range();     // None if collapsed
-editor.is_dirty();
-editor.diff_state();          // inline diff vs HEAD, if any
+*Edit → Preferences* changes the settings and saves them immediately to `config.toml`:
 
-// Persist.
-editor.save().unwrap();
-```
+| System | Location |
+|--------|----------|
+| Linux | `~/.config/markdone/config.toml` |
+| Windows | `%APPDATA%\markdone\config.toml` |
+| macOS | `~/Library/Application Support/markdone/config.toml` |
 
-### Feature flags
-
-`default = ["app"]` builds the full desktop editor. For library use, disable defaults
-and opt into only what you need:
+The file can also be edited by hand (Markdone keeps your comments when it saves);
+[`config.example.toml`](config.example.toml) documents every key. Custom themes live only
+there:
 
 ```toml
-# render-only: pulls in none of tokio/reqwest/gix/github/winit
-writ = { version = "0.19", default-features = false }
+[theme]
+dark = "my-midnight"      # the theme of dark mode
+light = "catppuccin-latte"
+
+[themes.my-midnight]      # colors omitted here are inherited from dracula
+background = "#0B0E14"
+foreground = "#BFBDB6"
 ```
 
-| Feature | Adds |
-|---------|------|
-| *(base)* | `MarkdownView`, `rasterize_scene_to_png`, and all markdown parse / layout / diff rendering |
-| `git` | inline-diff base sourced from git `HEAD` (gix) |
-| `github` | GitHub ref validation + `#`/`@` autocomplete |
-| `watch` | live file-reload on external edits |
-| `remote-images` | fetch `http(s)` image URLs (adds tokio/reqwest) |
-| `mermaid` | render fenced `mermaid` blocks as diagrams (merman; includes EPL-2.0 code, see [License](#license)) |
-| `math` | render `$…$` / `$$…$$` LaTeX math (RaTeX) |
-| `editor` | the full `core::Editor` orchestration (implies `git`, `github`, `watch`) |
-| `app` *(default)* | the winit + Vello desktop application |
-| `ghosttext` | the `writd` GhostText daemon |
+## Building from source
+
+Requirements: Rust (stable, 1.95 or newer) and a C compiler (for the syntax grammars).
+
+- **Linux**: `libwayland-dev` and `libxkbcommon-dev` (Debian/Ubuntu names); fontconfig is
+  loaded at runtime.
+- **Windows**: the Visual Studio Build Tools (MSVC).
+- **macOS**: the Xcode Command Line Tools.
+
+```bash
+git clone https://github.com/bitblaster/markdone
+cd markdone
+cargo run --release -- notes.md
+```
+
+Build profiles:
+
+- **dev** (`cargo run`): dependencies optimized, Markdone's own code unoptimized and
+  debuggable, so a debug build is still comfortable to use.
+- **release**: thin LTO, a single codegen unit, stripped symbols, and the Mermaid renderer
+  optimized for size; the slowest to build.
+- **release-fast** (`cargo build --profile release-fast`): release optimizations without
+  LTO, for quicker builds while trying changes.
+
+`cargo test` runs the tests (the `github::` ones call the GitHub API and need
+`GITHUB_TOKEN`; skip them with `cargo test -- --skip github::`). CI runs formatting,
+clippy and the tests on Linux, Windows and macOS. Pushing a `vX.Y.Z` tag that matches the
+version in `Cargo.toml` builds the release archives and the Windows installer and drafts a
+GitHub Release.
+
+Diagnostics: `MARKDONE_PROFILE=1` logs frame, rebuild and diagram render times;
+`MARKDONE_SCROLL_TRACE=1` logs scrolling and layout; `MARKDONE_WINDOW_SIZE=1100x700` sets
+the initial window size (for screenshots). On Linux/Mesa systems such as Asahi,
+`WGPU_BACKEND=vulkan` selects the Vulkan backend.
 
 ## Architecture
 
-The buffer stores raw markdown text using ropey, a rope data structure that provides O(log n) insertions and deletions. On every edit, tree-sitter incrementally reparses the document. Tree-sitter-md produces two parse trees: a block tree representing document structure (paragraphs, headings, lists, code blocks) and separate inline trees for each paragraph's inline content (bold, italic, links). The parser maintains both trees and provides a unified cursor that transparently switches between them when traversing.
+The document is drawn with [winit](https://github.com/rust-windowing/winit),
+[wgpu](https://wgpu.rs), [Vello](https://github.com/linebender/vello) (GPU 2D rendering)
+and [Parley](https://github.com/linebender/parley) (text layout); the menus, dialogs and
+panels are drawn with [egui](https://github.com/emilk/egui) on top.
 
-Line information is derived from the parse tree. A preorder traversal collects all nodes in document order, then for each line, binary search finds the relevant nodes and extracts markers. Each line has a list of markers representing block-level syntax elements—a task item inside a blockquote has two markers: `[Checkbox, BlockQuote]` (innermost to outermost). Each marker knows its byte range (the bytes to hide when the cursor is away), its visual substitution (e.g., `-` becomes `•`), and its continuation text for smart enter.
+The buffer stores the raw Markdown in a rope (ropey), and tree-sitter reparses it
+incrementally on every edit: only the changed region is reparsed, so editing a
+10,000-line document feels like editing a short one. Tree-sitter-md produces a block tree
+(paragraphs, headings, lists, code blocks) and an inline tree per paragraph (emphasis,
+links), walked through a unified cursor.
 
-The renderer lays out each line independently with Parley. It determines whether to show or hide markers based on cursor position: if the cursor is on the line, raw markdown syntax is visible for editing; otherwise, markers are hidden and substitutions are shown. For inline styles like bold or italic, the same logic applies per-span. A per-line display↔buffer segment map translates between the laid-out *display* string (markers hidden) and *buffer* byte offsets, so cursor placement, click hit-testing, and diff highlights all stay aligned.
+Each line carries the markers of its block syntax (a task item in a blockquote has
+`[Checkbox, BlockQuote]`), each knowing the bytes to hide when the cursor is away, its
+visual substitution (`-` becomes `•`) and its continuation for Shift+Enter. Lines are laid
+out independently with Parley, hiding or showing markers depending on the cursor; a
+per-line map between the displayed text and the buffer offsets keeps cursor placement,
+hit-testing and diff highlights aligned.
 
-### Viewport Virtualization
+Layout is virtualized: only the lines in and around the viewport are laid out, the rest
+are height-estimated (text, tables and diagrams at their expected size), and the scroll
+position is pinned to a line, so off-screen corrections never move what is on screen.
 
-Layout is virtualized: only the lines in (and just around) the viewport are fully laid out with Parley; the rest are height-estimated from a persistent per-line height cache, so building the layout is O(visible) regardless of document size or scroll depth. Scroll position is pinned to a `(line, offset)` anchor and re-pinned after every rebuild, so off-screen height corrections never shift what's on screen — first-open and deep-scroll of a large file stay fast and jitter-free.
-
-### Incremental Parsing
-
-Tree-sitter's incremental parsing is central to writ's responsiveness. When you type a character, tree-sitter doesn't reparse the entire document. Instead, the buffer tells tree-sitter what changed (the byte range and new content), and tree-sitter reuses unchanged portions of the previous syntax tree. The complexity is O(log n + k) where n is the document size and k is the size of the change, rather than O(n) for a full reparse. This means editing a 10,000-line document feels the same as editing a 100-line document.
-
-### Code Block Syntax Highlighting
-
-Code blocks are highlighted using tree-sitter-highlight with language-specific grammars. The editor walks the markdown AST to find fenced code blocks, extracts their content along with the language identifier from the fence line, and highlights each block separately using the appropriate grammar.
-
-This manual extraction approach was chosen over tree-sitter's built-in injection support, which proved unreliable for our use case. Editors like Zed and Helix build their own injection handling for similar reasons. The manual approach is simpler: we find code blocks, highlight them independently, and merge the results back with buffer-relative offsets.
-
-Rust, Bash, and TypeScript are supported through grammar crates and highlight queries. TypeScript combines its upstream query with JavaScript's shared syntax rules. Highlights are cached and only recomputed after edits.
+Code blocks are highlighted with tree-sitter-highlight, one grammar per language, block by
+block; highlights are cached and recomputed after edits. Mermaid diagrams are rendered to
+SVG by merman and recorded once into a Vello scene fragment, drawn as vectors.
 
 ## Limitations
 
-Only **ATX** headings (`# Heading`) are recognized — setext headings (a line underlined with `===` or `---`) render as plain text and don't appear in the outline or fold. This is deliberate: setext text and its underline live on separate lines, so full support means both collecting *and* rendering it across the pair, for a syntax `#` dominates in practice.
+- Only ATX headings (`# Heading`) are recognized; setext headings (a line underlined with
+  `===` or `---`) render as plain text.
+- macOS: opening a document from Finder (double-click, *Open With*) does not pass it to
+  Markdone yet; use *File → Open*, drag it on the window, or the command line.
 
 ## License
 
-Markdone is released under the MIT license (see [LICENSE](LICENSE)), like writ, from which it is forked.
+Markdone is released under the MIT license (see [LICENSE](LICENSE)), like writ, from which
+it is forked.
 
-Builds with the `mermaid` feature (on by default through `app`) include third-party code under other licenses:
+The Mermaid renderer included in the builds brings third-party code under other licenses:
 
-- [merman](https://github.com/Latias94/merman), the Mermaid renderer: MIT or Apache-2.0.
-- `merman-elk-layered`, merman's Rust port of the layered algorithm of the [Eclipse Layout Kernel (ELK)](https://github.com/eclipse-elk/elk), which lays out flowcharts the way Mermaid 12 does by default: **Eclipse Public License 2.0** ([text](https://www.eclipse.org/legal/epl-2.0/)). EPL-2.0 is a weak, file-level copyleft: it covers that crate's own files, not the rest of Markdone. Its source is published on [crates.io](https://crates.io/crates/merman-elk-layered) and in the [merman repository](https://github.com/Latias94/merman); see merman's [THIRD_PARTY_NOTICES.md](https://github.com/Latias94/merman/blob/main/THIRD_PARTY_NOTICES.md) for the obligations that apply when distributing binaries.
+- [merman](https://github.com/Latias94/merman): MIT or Apache-2.0.
+- `merman-elk-layered`, merman's Rust port of the layered algorithm of the
+  [Eclipse Layout Kernel (ELK)](https://github.com/eclipse-elk/elk), which lays out
+  flowcharts the way Mermaid 12 does by default: **Eclipse Public License 2.0**
+  ([text](https://www.eclipse.org/legal/epl-2.0/)). EPL-2.0 is a weak, file-level
+  copyleft: it covers that crate's own files, not the rest of Markdone. Its source is
+  published on [crates.io](https://crates.io/crates/merman-elk-layered) and in the
+  [merman repository](https://github.com/Latias94/merman); see merman's
+  [THIRD_PARTY_NOTICES.md](https://github.com/Latias94/merman/blob/main/THIRD_PARTY_NOTICES.md)
+  for the obligations that apply when distributing binaries.

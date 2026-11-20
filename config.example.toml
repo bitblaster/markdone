@@ -3,9 +3,11 @@
 # Edit → Preferences changes the settings below and keeps your comments.
 
 [font]
-# A monospace font family. Markdone verifies it is fixed-pitch at startup and falls back
-# to the system monospace (with a warning) if it isn't, or if the font isn't installed.
-family = "JetBrains Mono"
+# The text font: any installed font family. Omitted: the system monospace font.
+family = "Noto Sans"
+# The font of code blocks and inline code: a monospace family (a proportional one, or one
+# that isn't installed, falls back to the system monospace with a warning).
+code_family = "JetBrains Mono"
 # Base font size in logical pixels (default 18, clamped to 6–96).
 size = 18.0
 
@@ -31,12 +33,21 @@ check_on_focus = true
 # Look up GitHub issues / pull requests / users referenced in documents: reads the
 # repository from .git/config and calls api.github.com. Off by default.
 github = false
+# GitHub API token for those lookups (validation, hover cards, autocomplete). Stored in
+# plain text; --github-token or the GITHUB_TOKEN variable take precedence.
+# github_token = "ghp_..."
 
 [theme]
-# A built-in preset, or the name of a custom [themes.*] you define below. Built-ins:
+# One theme for dark mode and one for light mode: a built-in preset, or the name of a
+# custom [themes.*] you define below. Built-ins:
 #   dark:  dracula (default), nord, solarized-dark, gruvbox-dark, tokyo-night, catppuccin-mocha
-#   light: solarized-light, catppuccin-latte
-name = "dracula"
+#   light: solarized-light, catppuccin-latte (default)
+dark = "dracula"
+light = "catppuccin-latte"
+# The mode shown: "dark" (default) or "light" (View → Dark Mode switches it).
+mode = "dark"
+# Follow the system's light/dark setting instead, when the system reports one.
+follow_system = false
 
 # Optional per-color tweaks applied on top of the selected theme. Colors are hex,
 # "#RRGGBB" or "#RRGGBBAA". The 12 slots are:
@@ -47,7 +58,7 @@ name = "dracula"
 [theme.overrides]
 # comment = "#7A88B8"
 
-# Define your own themes here, then select one with `name` above. Any color you omit
+# Define your own themes here, then select one with `dark` or `light` above. Any color you omit
 # is inherited from dracula. A [themes.<name>] shadows a built-in of the same name.
 [themes.my-midnight]
 background = "#0B0E14"

@@ -1,18 +1,15 @@
-//! winit + wgpu + Vello application shell — the gpui replacement (see MIGRATION-PLAN.md).
+//! The desktop application shell: winit + wgpu + Vello for the document, egui for the
+//! chrome (menus, tabs, dialogs, preferences, table of contents).
 //!
-//! Phase 0–5: a working editor with inline git diff — renders a full markdown
-//! document (variable-height lines, tree-sitter highlighting, browser-grade
-//! wrapping, cursor-aware marker hiding) via Vello, with typing/arrows/backspace/
-//! enter/tab, click-to-place and drag selection (Parley hit-testing through the
-//! segment map), caret + selection painting, scroll (wheel + scroll-to-cursor),
-//! minimal IME commit, inline diff vs HEAD (green added lines/words, red ghost
-//! deleted lines interleaved above), and chrome (a title bar + a status bar with
-//! nesting context and cursor position; the editor is inset + clipped between
-//! them). CSD (custom window frame) and the async-blocked overlays are deferred.
-//! Run with
-//! `WGPU_BACKEND=vulkan cargo run --bin writ-next` on Asahi; set
-//! `MARKDONE_SHELL_SNAPSHOT=out.png` (+ optional `MARKDONE_SHELL_{W,H,SCROLL,CURSOR,SEL_A,SEL_B}`)
-//! to render one frame headlessly instead.
+//! It renders a full markdown document (variable-height lines, tree-sitter
+//! highlighting, browser-grade wrapping, cursor-aware marker hiding) via Vello, with
+//! editing, click/drag selection (Parley hit-testing through the segment map), caret
+//! and selection painting, scrolling, IME, the inline diff vs HEAD (green added
+//! lines/words, red ghost deleted lines above), and a status bar.
+//!
+//! Set `MARKDONE_SHELL_SNAPSHOT=out.png` (+ optional
+//! `MARKDONE_SHELL_{FILE,W,H,SCROLL,CURSOR,SEL_A,SEL_B,DIFF}`) to render one frame
+//! headlessly instead of opening a window.
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -405,20 +402,18 @@ fn build_status_info(editor: &Editor, doc: &DocLayout, editor_h: f32) -> StatusI
 /// Sample document shown until the shell loads real files (Phase 4+ wires input).
 /// The `--demo` (and no-args) showcase document — exercises headings, emphasis,
 /// inline code, task lists, a colored code fence, a blockquote, and links.
-const DEMO_DOC: &str = r##"# writ — a live Markdown diff viewer
+const DEMO_DOC: &str = r##"# Markdone — Markdown, rendered as you type
 
-**writ** renders Markdown as you type, and shows a live *inline diff* against
-git `HEAD`: added lines glow green, deletions appear as ghost rows, and
-word-level changes highlight in place. Point it at a file an agent is editing and
-watch the changes land in real time.
+**Markdone** shows Markdown the way it reads, and brings the syntax back only where
+you edit. In a git repository it also shows a live *inline diff* against `HEAD`:
+added text tinted green, deleted lines as faded ghost rows, changed words in place.
 
-## Features
+## What's inside
 
-- [x] ~~GPU-rendered Markdown (winit + Vello + Parley)~~
-- [x] ~~Live inline `git HEAD` diff with word-level changes~~
-- [x] ~~GitHub `#123` / `@user` refs — validated, with hover cards + autocomplete~~
-- [ ] GFM tables
-- [ ] Multi-cursor
+- [x] GPU-rendered text, tables, math and Mermaid diagrams
+- [x] A live inline diff against `git HEAD`, with word-level changes
+- [x] Tabs, a table of contents, light and dark themes
+- [ ] Your next document
 
 ## A code block
 
@@ -429,21 +424,21 @@ fn main() {
 }
 ```
 
-> Ctrl-click any link or `#ref` to open it in your browser.
+> Ctrl-click a link to open it in your browser.
 
-Try editing this file — every keystroke re-renders and re-diffs against HEAD.
+Try editing this text: every keystroke re-renders and re-diffs against HEAD.
 "##;
 
 /// A synthetic "git HEAD" version of `DEMO_DOC` so `--demo` shows the live inline
 /// diff (added/deleted/changed lines) without needing a real git repo.
-const DEMO_BASE: &str = r##"# writ — a Markdown viewer
+const DEMO_BASE: &str = r##"# Markdone — a Markdown editor
 
-**writ** renders Markdown as you type. Point it at a file and read it nicely.
+**Markdone** shows Markdown the way it reads.
 
-## Features
+## What's inside
 
-- GPU-rendered Markdown
-- This line is removed in the working copy, so it renders as a deleted ghost row.
+- [x] GPU-rendered text
+- This line was removed in the working copy, so it shows as a deleted ghost row.
 
 ## A code block
 
@@ -454,7 +449,7 @@ fn main() {
 }
 ```
 
-Try editing this file.
+Try editing this text.
 "##;
 
 /// The demo editor: the showcase doc with a synthetic HEAD base so the inline diff
