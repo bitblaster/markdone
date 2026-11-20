@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// How many recent files File → Open Recent keeps.
 pub const MAX_RECENT: usize = 10;
 
-#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Session {
     /// Documents open at exit, in tab order (untitled documents are not kept).
     #[serde(default)]
@@ -24,12 +24,28 @@ pub struct Session {
     /// Recently opened files, most recent first.
     #[serde(default)]
     pub recent: Vec<PathBuf>,
-    /// The table of contents panel is open.
-    #[serde(default)]
+    /// The table of contents panel is open (by default it is).
+    #[serde(default = "default_toc_open")]
     pub toc_open: bool,
     /// Its width, logical px (`None` = default).
     #[serde(default)]
     pub toc_width: Option<f32>,
+}
+
+fn default_toc_open() -> bool {
+    true
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            open: Vec::new(),
+            active: 0,
+            recent: Vec::new(),
+            toc_open: default_toc_open(),
+            toc_width: None,
+        }
+    }
 }
 
 impl Session {

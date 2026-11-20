@@ -14,17 +14,17 @@ size = 18.0
 [editor]
 # Text spans the whole window (true) or at most `max_width` logical pixels (default).
 full_width = false
-max_width = 880
+max_width = 1200
 # Line numbers in the left margin (View → Show Line Numbers).
-line_numbers = false
+line_numbers = true
 # In a git repository, show the changes since the last commit inline (View → Git
 # Differences): added text tinted, deleted lines as faded rows.
 git_diff = true
 
 [files]
-# When an open file changes on disk and has no unsaved changes: "reload" (default) or
-# "ask". A document with unsaved changes is never reloaded without asking.
-on_external_change = "reload"
+# When an open file changes on disk and has no unsaved changes: "ask" (default) or
+# "reload". A document with unsaved changes is never reloaded without asking.
+on_external_change = "ask"
 # Also compare the files with the disk when the window gets the focus or a tab is
 # selected (catches changes the file watcher misses, e.g. on network shares).
 check_on_focus = true

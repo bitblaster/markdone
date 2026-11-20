@@ -100,7 +100,7 @@ editor keeps a file's line endings: a Windows (CRLF) file is saved back as CRLF.
 
 Every document opens in a tab; the open tabs are restored at the next start, and
 *File → Open Recent* lists the recent files. Files changed on disk by another program
-reload automatically (or after asking, see the preferences); a document with unsaved
+reload after asking (or automatically, see the preferences); a document with unsaved
 changes is never overwritten without asking. Files and images can be dropped on the
 window.
 
