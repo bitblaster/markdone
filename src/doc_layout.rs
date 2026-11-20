@@ -636,6 +636,14 @@ const INLINE_IMG_PLACEHOLDER_W: f32 = 80.0;
 const INLINE_IMG_PLACEHOLDER_H: f32 = 20.0;
 
 /// A standalone image to paint on a line: `alt` text plus a load-state-specific payload.
+/// A fenced code block drawn as a box behind lines `first..=last`, with its language as a
+/// label at the top right (`None` while the raw fences are shown, or with no info string).
+struct CodeBox {
+    first: usize,
+    last: usize,
+    lang: Option<String>,
+}
+
 struct ImageBlock {
     alt: String,
     kind: ImageBlockKind,
@@ -1202,6 +1210,13 @@ pub struct DocLayout {
     image_bg: Color,
     /// Background chip painted behind inline `code` spans.
     code_bg: Color,
+    /// Fenced code blocks drawn as boxes (see `draw_code_blocks`), and their baked chrome
+    /// (device px + theme colors).
+    code_boxes: Vec<CodeBox>,
+    code_box_bg: Color,
+    code_box_pad: f32,
+    code_label_size: f32,
+    code_label_color: Color,
     /// Per-line grid-table row, parallel to `layouts`. `Some((layout, kind))` means the
     /// line renders as a table row (its text layout is empty); `None` otherwise.
     table_lines: Vec<Option<(Rc<TableLayout>, RowKind)>>,
@@ -1380,6 +1395,39 @@ impl DocLayout {
         // Scan mermaid fences once, not per line (a per-line info-string check allocates).
         #[cfg(feature = "mermaid")]
         let mermaid_blocks = snapshot.mermaid_blocks();
+        // Fenced code blocks render as boxes. A block the caret is outside of (and no
+        // selection overlaps — the same reveal rule as mermaid/math) hides its fence lines
+        // (zero height) and shows its language as a label instead; with the caret inside,
+        // the raw fences come back for editing. A block with no content line keeps its
+        // fences (else it would vanish entirely), and a mermaid block drawn as a diagram
+        // is left to the diagram path.
+        let mut collapsed_fences: HashSet<usize> = HashSet::new();
+        let mut code_boxes: Vec<CodeBox> = Vec::new();
+        for fb in snapshot.fenced_blocks() {
+            let revealed = ranges_overlap(&fb.block, selection)
+                || fb.block.contains(&cursor_line_start);
+            #[cfg(feature = "mermaid")]
+            if !revealed && mermaid_blocks.iter().any(|m| m.block == fb.block) {
+                continue;
+            }
+            let first = fb.open_line + 1;
+            let last = fb.close_line.map_or(fb.last_line, |c| c.saturating_sub(1));
+            if revealed || first > last {
+                code_boxes.push(CodeBox {
+                    first: fb.open_line,
+                    last: fb.last_line,
+                    lang: None,
+                });
+            } else {
+                collapsed_fences.insert(fb.open_line);
+                collapsed_fences.extend(fb.close_line);
+                code_boxes.push(CodeBox {
+                    first,
+                    last,
+                    lang: fb.lang,
+                });
+            }
+        }
         let mut bands = Bands::new(n, empty_layout.clone(), empty_render.clone());
         let mut image_urls: Vec<String> = Vec::new();
         #[cfg(feature = "mermaid")]
@@ -1473,6 +1521,11 @@ impl DocLayout {
             if let Some(m) = &math_block
                 && i != m.anchor_line
             {
+                bands.push_placeholder(0.0, snapshot.line_byte_range(i), None);
+                continue;
+            }
+            // Hidden fence line of a code block shown as a box: zero height, like a fold.
+            if collapsed_fences.contains(&i) {
                 bands.push_placeholder(0.0, snapshot.line_byte_range(i), None);
                 continue;
             }
@@ -1937,6 +1990,12 @@ impl DocLayout {
             // No background chip: green + monospace already reads as inline code, and a
             // translucent fill only muddies the diff line tint and selection it composites with.
             code_bg: Color::TRANSPARENT,
+            code_boxes,
+            // The image-placeholder tint: a faint panel that reads as "not prose".
+            code_box_bg: peniko_color_alpha(theme.comment, 0.08),
+            code_box_pad: 6.0 * scale,
+            code_label_size: 12.0 * scale,
+            code_label_color: peniko_color(theme.comment),
             table_lines,
             table_cell_pad_x: TABLE_CELL_PAD_X * scale,
             table_cell_pad_y: TABLE_CELL_PAD_Y * scale,
@@ -2605,6 +2664,38 @@ impl DocLayout {
 
     /// Paint inline-diff backgrounds for added lines (faint full-row bg + stronger
     /// word-change bg). Call BEFORE `draw` so glyphs sit on top.
+    /// Paint fenced code blocks as rounded panels behind their lines, the language as a
+    /// small label in the top-right corner. Call first: diff tints, selection and glyphs
+    /// all go on top.
+    pub fn draw_code_blocks(&self, engine: &mut TextEngine, scene: &mut Scene, viewport_h: f32) {
+        let (first, last) = self.visible_range(viewport_h);
+        let pad = self.code_box_pad as f64;
+        let x0 = self.pad_x as f64 - pad;
+        let x1 = (self.width - self.pad_x) as f64 + pad;
+        for cb in &self.code_boxes {
+            if cb.last < first || cb.first >= last || cb.last + 1 >= self.tops.len() {
+                continue;
+            }
+            let y0 = (self.real_top(cb.first) - self.scroll_y) as f64 - pad;
+            let y1 = (self.tops[cb.last + 1] - self.scroll_y) as f64 + pad;
+            let rect = Rect::new(x0, y0, x1, y1).to_rounded_rect(pad);
+            scene.fill(Fill::NonZero, Affine::IDENTITY, self.code_box_bg, None, &rect);
+            if let Some(lang) = &cb.lang {
+                let layout = engine.build_line(
+                    lang,
+                    1.0,
+                    self.code_label_size,
+                    UI_LINE_HEIGHT,
+                    self.code_label_color,
+                    None,
+                    &[],
+                );
+                let x = x1 as f32 - pad as f32 - layout.width();
+                engine.draw_line(scene, &layout, (x, y0 as f32 + pad as f32 * 0.5));
+            }
+        }
+    }
+
     pub fn draw_added_backgrounds(&self, scene: &mut Scene, viewport_h: f32) {
         let (first, last) = self.visible_range(viewport_h);
         for i in first..last {
@@ -2834,6 +2925,11 @@ mod tests {
             image_border: Color::TRANSPARENT,
             image_bg: Color::TRANSPARENT,
             code_bg: Color::TRANSPARENT,
+            code_boxes: Vec::new(),
+            code_box_bg: Color::TRANSPARENT,
+            code_box_pad: 0.0,
+            code_label_size: 12.0,
+            code_label_color: Color::TRANSPARENT,
             table_lines: heights.iter().map(|_| None).collect(),
             table_cell_pad_x: 0.0,
             table_cell_pad_y: 0.0,
@@ -3569,6 +3665,58 @@ mod tests {
             doc.scroll_y,
             doc.max_scroll(viewport_h)
         );
+    }
+
+    /// A code block the caret is outside of hides its fences and shows a labelled box;
+    /// with the caret inside, the fences are back (and no label). A block with no content
+    /// keeps its fences, so it doesn't vanish.
+    #[test]
+    fn code_block_fences_hide_outside_the_block() {
+        use crate::buffer::Buffer;
+        let mut engine = TextEngine::new();
+        let theme = EditorTheme::dracula();
+        let text = "Intro\n\n```rust\nfn main() {}\n```\n\nAfter\n\n```\n```\n";
+        let mut buffer: Buffer = text.parse().unwrap();
+        let snapshot = buffer.render_snapshot();
+        let params = test_params(&theme, 1000.0);
+        let mut build = |cursor: usize| {
+            DocLayout::build(
+                &mut engine,
+                &mut LineCache::new(),
+                &mut RenderCache::new(),
+                &mut HeightCache::new(),
+                &mut TableCache::new(),
+                1,
+                &snapshot,
+                &theme,
+                None,
+                None,
+                &ImageCache::new(),
+                cursor,
+                &params,
+                None,
+                0,
+                f32::INFINITY,
+                &[],
+                &(cursor..cursor),
+                &std::collections::HashMap::new(),
+            )
+        };
+        // Caret on "Intro": outside both blocks.
+        let doc = build(0);
+        assert!(doc.line_is_collapsed(2), "opening fence hidden");
+        assert!(!doc.line_is_collapsed(3), "code line shown");
+        assert!(doc.line_is_collapsed(4), "closing fence hidden");
+        let rust = doc.code_boxes.iter().find(|b| b.first == 3).expect("box");
+        assert_eq!((rust.last, rust.lang.as_deref()), (3, Some("rust")));
+        // The empty block keeps its fences.
+        assert!(!doc.line_is_collapsed(8) && !doc.line_is_collapsed(9));
+        // Caret on the code line: fences revealed, box spans them, no label.
+        let inside = text.find("fn main").unwrap();
+        let doc = build(inside);
+        assert!(!doc.line_is_collapsed(2) && !doc.line_is_collapsed(4));
+        let rust = doc.code_boxes.iter().find(|b| b.first == 2).expect("box");
+        assert_eq!((rust.last, rust.lang.as_deref()), (4, None));
     }
 
     /// Re-pinning to a captured anchor keeps the anchor line's on-screen position fixed

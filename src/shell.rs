@@ -3352,8 +3352,9 @@ fn paint_document(
         (content_top + editor_h) as f64,
     );
     scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
-    // Draw order (all before glyphs): diff row/word bg, quote gutters, rules, images,
-    // then selection.
+    // Draw order (all before glyphs): code block panels, diff row/word bg, quote
+    // gutters, rules, images, then selection.
+    doc.draw_code_blocks(engine, scene, editor_h);
     doc.draw_added_backgrounds(scene, editor_h);
     doc.draw_blockquote_gutters(scene, editor_h);
     doc.draw_horizontal_rules(scene, editor_h);

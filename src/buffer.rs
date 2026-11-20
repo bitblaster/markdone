@@ -87,6 +87,39 @@ pub struct RenderSnapshot {
     line_count: usize,
 }
 
+/// A fenced code block's line structure (see [`RenderSnapshot::fenced_blocks`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FencedBlock {
+    /// Byte range of the whole block, fences included.
+    pub block: Range<usize>,
+    /// Line of the opening fence.
+    pub open_line: usize,
+    /// Line of the closing fence; `None` when the block runs unclosed to the document end.
+    pub close_line: Option<usize>,
+    /// Last line of the block (the closing fence, or the last content line if unclosed).
+    pub last_line: usize,
+    /// The info string (language), trimmed; `None` when absent.
+    pub lang: Option<String>,
+}
+
+/// True if `line` closes a code block opened by `open`: the same fence character, at
+/// least as many of them, nothing else on the line (CommonMark; ≤3 spaces of indent).
+fn closes_fence(open: &str, line: &str) -> bool {
+    let fence = |s: &str| -> Option<(char, usize, String)> {
+        let t = s.trim_start_matches(' ');
+        if s.len() - t.len() > 3 {
+            return None;
+        }
+        let c = t.chars().next().filter(|&c| c == '`' || c == '~')?;
+        let n = t.chars().take_while(|&x| x == c).count();
+        (n >= 3).then(|| (c, n, t[n..].to_string()))
+    };
+    match (fence(open), fence(line)) {
+        (Some((oc, on, _)), Some((lc, ln, rest))) => lc == oc && ln >= on && rest.trim().is_empty(),
+        _ => false,
+    }
+}
+
 impl RenderSnapshot {
     /// Get the number of lines in the document.
     pub fn line_count(&self) -> usize {
@@ -221,6 +254,40 @@ impl RenderSnapshot {
             .callouts
             .iter()
             .find(|c| c.header_line == line_idx)
+    }
+
+    /// Every fenced code block, with the lines its fences sit on and its language — for
+    /// rendering blocks as boxes with hidden fences. O(code_blocks); called once per build.
+    pub fn fenced_blocks(&self) -> Vec<FencedBlock> {
+        let line_text = |line: usize| self.rope.line(line).to_string();
+        self.parsed
+            .code_blocks
+            .iter()
+            .map(|cb| {
+                let open_line = self.rope.byte_to_line(cb.block_range.start);
+                let last_byte = cb.block_range.end.saturating_sub(1).max(cb.block_range.start);
+                let last_line = self.rope.byte_to_line(last_byte);
+                let close_line = (last_line > open_line
+                    && closes_fence(&line_text(open_line), &line_text(last_line)))
+                .then_some(last_line);
+                let lang = cb.info_string_range.as_ref().and_then(|r| {
+                    let s = self
+                        .rope
+                        .byte_slice(r.clone())
+                        .to_string()
+                        .trim()
+                        .to_string();
+                    (!s.is_empty()).then_some(s)
+                });
+                FencedBlock {
+                    block: cb.block_range.clone(),
+                    open_line,
+                    close_line,
+                    last_line,
+                    lang,
+                }
+            })
+            .collect()
     }
 
     /// All ```` ```mermaid ```` fences in the document, scanned once. Computed per build
