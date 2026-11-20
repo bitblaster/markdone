@@ -129,6 +129,36 @@ opt-level = 2
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Drop the symbol table (~11 MB, mostly merman's): not needed to run, only for symbol
+# names in crash backtraces.
+strip = true
+
+# merman (the mermaid renderer) is ~20 MB of code across every diagram family, and renders
+# run off-thread in a few ms: optimize it for size rather than speed.
+[profile.release.package.merman]
+opt-level = "s"
+[profile.release.package.merman-core]
+opt-level = "s"
+[profile.release.package.merman-render]
+opt-level = "s"
+[profile.release.package.merman-model]
+opt-level = "s"
+[profile.release.package.merman-markup]
+opt-level = "s"
+[profile.release.package.merman-theme-contract]
+opt-level = "s"
+[profile.release.package.merman-unicode-linebreak]
+opt-level = "s"
+[profile.release.package.merman-layout-elk]
+opt-level = "s"
+[profile.release.package.merman-elk-layered]
+opt-level = "s"
+[profile.release.package.dugong]
+opt-level = "s"
+[profile.release.package.dugong-graphlib]
+opt-level = "s"
+[profile.release.package.roughr-merman]
+opt-level = "s"
 
 # Fast release builds for development (cargo build --profile release-fast)
 [profile.release-fast]

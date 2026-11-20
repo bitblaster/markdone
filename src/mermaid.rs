@@ -268,14 +268,31 @@ fn blend_mode(mode: usvg::BlendMode) -> BlendMode {
 /// `Err(Some(msg))` on a parse/render error (shown in the placeholder so the author sees
 /// what's wrong); `Err(None)` on a panic or an SVG that won't decode at all.
 fn render_to_image(source: &str) -> Result<LoadedImage, Option<String>> {
+    let t0 = std::time::Instant::now();
     match render_svg(&SCREEN, source) {
         Ok(svg) => {
+            let t1 = std::time::Instant::now();
             let vector = catch_unwind(AssertUnwindSafe(|| svg_to_vector(&svg))).ok().flatten();
+            if profiling() {
+                eprintln!(
+                    "[markdone] mermaid render {:.1} ms (merman {:.1} ms, vector {:.1} ms), {} bytes of source",
+                    t0.elapsed().as_secs_f64() * 1e3,
+                    (t1 - t0).as_secs_f64() * 1e3,
+                    t1.elapsed().as_secs_f64() * 1e3,
+                    source.len(),
+                );
+            }
             vector.or_else(|| decode(svg.as_bytes())).ok_or(None)
         }
         Err(RenderFail::Message(msg)) => Err(Some(msg)),
         Err(RenderFail::Panic) => Err(None),
     }
+}
+
+/// `MARKDONE_PROFILE=1` (the shell's profiling switch): log each diagram's render time.
+fn profiling() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MARKDONE_PROFILE").is_some_and(|v| v != "0"))
 }
 
 /// For each `(key, source)` with no cache entry, mark it loading and render on a worker
