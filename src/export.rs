@@ -82,6 +82,29 @@ fn find_browser() -> Option<PathBuf> {
         }
         None
     }
+    // macOS: browsers are app bundles, not on PATH; look in /Applications and the user's
+    // own ~/Applications, then fall back to PATH (e.g. a Homebrew `chromium`).
+    #[cfg(target_os = "macos")]
+    {
+        let bundles = [
+            "Google Chrome.app/Contents/MacOS/Google Chrome",
+            "Chromium.app/Contents/MacOS/Chromium",
+            "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "Brave Browser.app/Contents/MacOS/Brave Browser",
+        ];
+        let roots = [
+            Some(PathBuf::from("/Applications")),
+            dirs::home_dir().map(|h| h.join("Applications")),
+        ];
+        for root in roots.into_iter().flatten() {
+            for bundle in bundles {
+                let path = root.join(bundle);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+        }
+    }
     #[cfg(not(windows))]
     {
         let names = [

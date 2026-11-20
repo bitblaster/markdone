@@ -301,7 +301,7 @@ Only **ATX** headings (`# Heading`) are recognized — setext headings (a line u
 
 ## License
 
-Markdone is released under the MIT license, like writ, from which it is forked.
+Markdone is released under the MIT license (see [LICENSE](LICENSE)), like writ, from which it is forked.
 
 Builds with the `mermaid` feature (on by default through `app`) include third-party code under other licenses:
 
