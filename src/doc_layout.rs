@@ -3439,11 +3439,13 @@ mod tests {
         assert!(doc.content_height() > doc.tops[doc.line_count()]);
     }
 
-    /// The layout cache reuses unchanged lines: a warm rebuild (cache populated)
-    /// skips Parley shaping and is faster than the cold one. Also exercises that a
-    /// bounded set of entries survives (one per distinct line content).
+    /// The layout cache reuses unchanged lines: a warm rebuild (cache populated) takes
+    /// every line's layout from the cache instead of shaping it again. Also exercises
+    /// that a bounded set of entries survives (one per distinct line content). Checked
+    /// by identity, not by timing: on a busy CI runner the warm build can come out
+    /// slower than the cold one.
     #[test]
-    fn line_cache_reuses_and_speeds_up() {
+    fn line_cache_reuses_unchanged_lines() {
         use crate::buffer::Buffer;
         use std::time::Instant;
         let mut engine = TextEngine::new();
@@ -3480,10 +3482,10 @@ mod tests {
             )
         };
         let t0 = Instant::now();
-        let _ = build(&mut engine, &mut cache);
+        let cold_doc = build(&mut engine, &mut cache);
         let cold = t0.elapsed();
         let t1 = Instant::now();
-        let _ = build(&mut engine, &mut cache);
+        let warm_doc = build(&mut engine, &mut cache);
         let warm = t1.elapsed();
         println!("[cache] cold={cold:?} warm={warm:?}");
         assert_eq!(
@@ -3491,9 +3493,14 @@ mod tests {
             401,
             "one entry per distinct line (+trailing)"
         );
+        assert_eq!(cold_doc.layouts.len(), warm_doc.layouts.len());
         assert!(
-            warm < cold,
-            "warm rebuild ({warm:?}) should beat cold ({cold:?})"
+            cold_doc
+                .layouts
+                .iter()
+                .zip(&warm_doc.layouts)
+                .all(|(a, b)| Rc::ptr_eq(a, b)),
+            "the warm rebuild reuses every cached layout"
         );
     }
 
