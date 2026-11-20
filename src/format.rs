@@ -450,12 +450,14 @@ mod tests {
         assert_eq!(apply("text", &e), "text\n```\n\n```\n");
         assert_eq!(e.selection, 9..9);
 
+        // An absolute folder on this platform (`/docs` is relative on Windows: no drive).
+        let docs = Path::new(if cfg!(windows) { r"C:\docs" } else { "/docs" });
         assert_eq!(
-            image_markdown(Path::new("/docs/img/a b.png"), Some(Path::new("/docs/sub"))),
+            image_markdown(&docs.join("img").join("a b.png"), Some(&docs.join("sub"))),
             "![a b](<../img/a b.png>)"
         );
         assert_eq!(
-            image_markdown(Path::new("/docs/x.png"), Some(Path::new("/docs"))),
+            image_markdown(&docs.join("x.png"), Some(docs)),
             "![x](x.png)"
         );
         assert_eq!(

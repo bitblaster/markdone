@@ -639,16 +639,23 @@ mod tests {
 
     #[test]
     fn relative_images_become_absolute_file_urls() {
+        // An absolute folder on this platform (`/docs` is relative on Windows: no drive),
+        // and the file URL prefix it maps to.
+        let (docs, url) = if cfg!(windows) {
+            (r"C:\docs", "file:///C:/docs")
+        } else {
+            ("/docs", "file:///docs")
+        };
         let html = render_body(
             "![x](<img/a b.png>) ![w](img/c%20d.png) ![y](https://e.com/z.png)",
-            Some(Path::new("/docs")),
+            Some(Path::new(docs)),
         );
         assert!(
-            html.contains("src=\"file:///docs/img/a%20b.png\""),
+            html.contains(&format!("src=\"{url}/img/a%20b.png\"")),
             "{html}"
         );
         assert!(
-            html.contains("src=\"file:///docs/img/c%20d.png\""),
+            html.contains(&format!("src=\"{url}/img/c%20d.png\"")),
             "{html}"
         );
         assert!(html.contains("src=\"https://e.com/z.png\""));

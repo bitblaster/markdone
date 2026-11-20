@@ -2348,11 +2348,17 @@ let code = target(); // fenced block line
     #[test]
     fn link_at_resolves_relative_against_doc_dir() {
         let mut e = Editor::new("![img](assets/p.png) and [w](https://x.com)\n");
-        e.set_file_path(std::path::PathBuf::from("/home/u/notes/doc.md"));
+        // An absolute folder on this platform (`/home/…` is relative on Windows).
+        let notes = std::path::Path::new(if cfg!(windows) {
+            r"C:\home\u\notes"
+        } else {
+            "/home/u/notes"
+        });
+        e.set_file_path(notes.join("doc.md"));
         let rel = e.text().find("assets").unwrap();
         assert_eq!(
-            e.link_at(rel).as_deref(),
-            Some("/home/u/notes/assets/p.png"),
+            e.link_at(rel),
+            Some(notes.join("assets/p.png").to_string_lossy().into_owned()),
             "relative image path resolves against the doc dir"
         );
         let web = e.text().find("x.com").unwrap();
