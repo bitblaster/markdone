@@ -3088,6 +3088,7 @@ dependencies = [
  "undo",
  "unicode-segmentation",
  "vello",
+ "vello_encoding",
  "vello_svg",
  "wayland-backend",
  "wayland-client",

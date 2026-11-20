@@ -83,6 +83,8 @@ resvg = "0.48"
 # dep — we use `vello::wgpu` so there is a single wgpu in the tree. ---
 parley = "0.11.1"
 vello = "0.10"
+# The encoding types behind `vello::Scene` (the shell compares frames' scenes).
+vello_encoding = "0.10"
 winit = { version = "0.30", optional = true }
 fontique = { version = "0.11.1", features = ["fontconfig-dlopen"] }
 pollster = "0.4"

@@ -895,6 +895,11 @@ struct App {
     scene: Scene,
     /// The document scene shifted below the menu bar (rebuilt from `scene` each frame).
     frame_scene: Scene,
+    /// The `frame_scene` last rendered, and what it was rendered with: while a frame's
+    /// scene and parameters are identical, Vello's output (still in the target texture)
+    /// is reused instead of rendering it again (see [`same_scene`]).
+    rendered_scene: Scene,
+    rendered_with: Option<RenderedWith>,
     /// egui chrome: menu bar, menus, dialogs. Created with the surface.
     ui: Option<UiLayer>,
     doc_engine: DocEngine,
@@ -1115,6 +1120,8 @@ impl App {
             state: None,
             scene: Scene::new(),
             frame_scene: Scene::new(),
+            rendered_scene: Scene::new(),
+            rendered_with: None,
             ui: None,
             doc_engine: DocEngine {
                 text_engine,
@@ -2542,6 +2549,120 @@ impl App {
 /// materialized band are always kept; older ones beyond this are evicted and reloaded on
 /// demand. ~10 downscaled 1024×728 screenshots.
 const IMAGE_MEMORY_BUDGET: usize = 32 * 1024 * 1024;
+
+/// What a frame was rendered with, besides its scene (see `App::rendered_scene`). The
+/// target texture is recreated on a resize, and a new one holds no image yet.
+#[derive(PartialEq)]
+struct RenderedWith {
+    width: u32,
+    height: u32,
+    base_color: u32,
+    target: wgpu::Texture,
+}
+
+/// Whether two scenes encode exactly the same drawing, so that Vello (deterministic)
+/// would render the same image. Compares the encoded streams as they are; resources
+/// held by handle (fonts, images) compare by identity. A false "different" only costs
+/// a render; a false "same" would show a stale image, so nothing is skipped.
+fn same_scene(a: &Scene, b: &Scene) -> bool {
+    let (a, b) = (a.encoding(), b.encoding());
+    let (ra, rb) = (&a.resources, &b.resources);
+    a.n_paths == b.n_paths
+        && a.n_path_segments == b.n_path_segments
+        && a.n_clips == b.n_clips
+        && a.n_open_clips == b.n_open_clips
+        && a.flags == b.flags
+        && a.path_tags == b.path_tags
+        && a.draw_tags == b.draw_tags
+        && a.path_data == b.path_data
+        && a.draw_data == b.draw_data
+        && a.transforms == b.transforms
+        && a.styles == b.styles
+        && ra.color_stops == rb.color_stops
+        && ra.normalized_coords == rb.normalized_coords
+        && ra.glyphs.len() == rb.glyphs.len()
+        && ra
+            .glyphs
+            .iter()
+            .zip(&rb.glyphs)
+            .all(|(g, h)| g.id == h.id && g.x == h.x && g.y == h.y)
+        && ra.glyph_runs.len() == rb.glyph_runs.len()
+        && ra
+            .glyph_runs
+            .iter()
+            .zip(&rb.glyph_runs)
+            .all(|(r, q)| same_glyph_run(r, q))
+        && ra.patches.len() == rb.patches.len()
+        && ra
+            .patches
+            .iter()
+            .zip(&rb.patches)
+            .all(|(p, q)| same_patch(p, q))
+}
+
+fn same_glyph_run(a: &vello_encoding::GlyphRun, b: &vello_encoding::GlyphRun) -> bool {
+    let (oa, ob) = (&a.stream_offsets, &b.stream_offsets);
+    a.font == b.font
+        && a.transform == b.transform
+        && a.glyph_transform == b.glyph_transform
+        && a.brush_transform == b.brush_transform
+        && a.font_size == b.font_size
+        && a.font_embolden.amount.xx == b.font_embolden.amount.xx
+        && a.font_embolden.amount.yy == b.font_embolden.amount.yy
+        && a.font_embolden.join == b.font_embolden.join
+        && a.hint == b.hint
+        && a.normalized_coords == b.normalized_coords
+        && a.style == b.style
+        && a.glyphs == b.glyphs
+        && oa.path_tags == ob.path_tags
+        && oa.path_data == ob.path_data
+        && oa.draw_tags == ob.draw_tags
+        && oa.draw_data == ob.draw_data
+        && oa.transforms == ob.transforms
+        && oa.styles == ob.styles
+}
+
+fn same_patch(a: &vello_encoding::Patch, b: &vello_encoding::Patch) -> bool {
+    use vello_encoding::Patch;
+    match (a, b) {
+        (
+            Patch::Ramp {
+                draw_data_offset: o1,
+                stops: s1,
+                extend: e1,
+                interpolation_alpha_space: i1,
+            },
+            Patch::Ramp {
+                draw_data_offset: o2,
+                stops: s2,
+                extend: e2,
+                interpolation_alpha_space: i2,
+            },
+        ) => o1 == o2 && s1 == s2 && e1 == e2 && i1 == i2,
+        (Patch::GlyphRun { index: i1 }, Patch::GlyphRun { index: i2 }) => i1 == i2,
+        (
+            Patch::Image {
+                draw_data_offset: o1,
+                image: m1,
+            },
+            Patch::Image {
+                draw_data_offset: o2,
+                image: m2,
+            },
+        ) => o1 == o2 && m1 == m2,
+        _ => false,
+    }
+}
+
+/// The encoded size of a scene, for the profile line.
+fn scene_bytes(scene: &Scene) -> usize {
+    let e = scene.encoding();
+    e.path_tags.len()
+        + 4 * (e.path_data.len() + e.draw_tags.len() + e.draw_data.len())
+        + std::mem::size_of_val(e.transforms.as_slice())
+        + std::mem::size_of_val(e.styles.as_slice())
+        + std::mem::size_of_val(e.resources.glyphs.as_slice())
+}
 
 /// The application icon for the window: the title bar and taskbar on X11 and Windows
 /// (Wayland takes it from the desktop entry through the app id, macOS from the app
@@ -5614,18 +5735,34 @@ impl ApplicationHandler<WritEvent> for App {
                 };
 
                 // Vello has no render_to_surface: render into the intermediate
-                // STORAGE texture, then blit that into the swapchain frame.
-                self.renderer
-                    .as_mut()
-                    .expect("renderer missing")
-                    .render_to_texture(
-                        &dev.device,
-                        &dev.queue,
-                        &self.frame_scene,
-                        &state.surface.target_view,
-                        &params,
-                    )
-                    .expect("render_to_texture failed");
+                // STORAGE texture, then blit that into the swapchain frame. When nothing
+                // in the document changed (a menu, a dialog, a hover over the chrome)
+                // the texture still holds this very image: skip Vello, blit it again.
+                let with = RenderedWith {
+                    width: params.width,
+                    height: params.height,
+                    base_color: params.base_color.to_rgba8().to_u32(),
+                    target: state.surface.target_texture.clone(),
+                };
+                let t_compare = Instant::now();
+                let reuse = self.rendered_with.as_ref() == Some(&with)
+                    && same_scene(&self.frame_scene, &self.rendered_scene);
+                let compare_us = t_compare.elapsed().as_secs_f64() * 1e6;
+                if !reuse {
+                    self.renderer
+                        .as_mut()
+                        .expect("renderer missing")
+                        .render_to_texture(
+                            &dev.device,
+                            &dev.queue,
+                            &self.frame_scene,
+                            &state.surface.target_view,
+                            &params,
+                        )
+                        .expect("render_to_texture failed");
+                    std::mem::swap(&mut self.frame_scene, &mut self.rendered_scene);
+                    self.rendered_with = Some(with);
+                }
                 let t_rendered = Instant::now();
 
                 let mut encoder =
@@ -5690,11 +5827,14 @@ impl ApplicationHandler<WritEvent> for App {
                         eprintln!("[markdone-latency] input → present {lat:7.2} ms");
                     }
                     eprintln!(
-                        "[markdone-profile] acquire {:6.2} ms | rebuilds {n} = {:6.2} ms | input {:6.2} ms | scene+gpu {:6.2} ms | present {:6.2} ms | frame-tot {:6.2} ms",
+                        "[markdone-profile] acquire {:6.2} ms | rebuilds {n} = {:6.2} ms | input {:6.2} ms | scene+gpu {:6.2} ms ({}, compare {:5.0} µs, {} KB) | present {:6.2} ms | frame-tot {:6.2} ms",
                         ms(t_frame, t_acquired),
                         us as f64 / 1e3,
                         ms(t_acquired, t_input),
                         ms(t_input, t_rendered),
+                        if reuse { "reused" } else { "rendered" },
+                        compare_us,
+                        scene_bytes(&self.rendered_scene) / 1024,
                         ms(t_rendered, t_end),
                         ms(t_frame, t_end),
                     );
