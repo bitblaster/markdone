@@ -65,32 +65,68 @@ jobs:
       - name: Package
         shell: bash
         run: |
+          # The archive names carry the tag (or the commit, for a manual run); the app
+          # metadata (installer, Info.plist) carries Cargo.toml's numeric version.
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            version="$GITHUB_REF_NAME"
+            label="$GITHUB_REF_NAME"
           else
-            version="$(git rev-parse --short HEAD)"
+            label="$(git rev-parse --short HEAD)"
           fi
-          name="markdone-$version-${{ matrix.target }}"
-          mkdir -p "dist/$name"
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          # The packaged README: the archives don't carry the images or the example
+          # config, so point those at GitHub, pinned to this tag/commit (LICENSE is
+          # packaged and stays relative). Rewritten in the runner's checkout only.
+          ref="$GITHUB_SHA"
+          [[ "$GITHUB_REF" == refs/tags/* ]] && ref="$GITHUB_REF_NAME"
+          sed -E \
+            -e "s#\]\((assets/[^)]+)\)#](https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$ref/\1)#g" \
+            -e "s#\]\((config\.example\.toml)\)#](https://github.com/$GITHUB_REPOSITORY/blob/$ref/\1)#g" \
+            README.md > README.packaged.md
+          mv README.packaged.md README.md
+          name="markdone-$label-${{ matrix.target }}"
           bin="target/${{ matrix.target }}/release/markdone"
-          [ "$RUNNER_OS" = "Windows" ] && bin="$bin.exe"
-          cp "$bin" README.md LICENSE "dist/$name/"
-          # Linux: the desktop entry, icon and installer script.
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            cp packaging/* "dist/$name/"
-          fi
+          mkdir -p "dist/$name"
+          case "$RUNNER_OS" in
+            Linux)
+              # The binary, plus the desktop entry, icon and installer script.
+              cp "$bin" README.md LICENSE packaging/linux/* "dist/$name/"
+              (cd dist && tar -czf "$name.tar.gz" "$name" && rm -rf "$name")
+              ;;
+            Windows)
+              # A portable zip, and an installer (Inno Setup).
+              cp "$bin.exe" README.md LICENSE "dist/$name/"
+              (cd dist && 7z a -tzip "$name.zip" "$name" > /dev/null && rm -rf "$name")
+              # (ISCC options take `-`: Git Bash would rewrite a leading `/` as a path.)
+              choco install innosetup --no-progress -y > /dev/null
+              iscc=$(ls "/c/Program Files (x86)"/Inno\ Setup*/ISCC.exe \
+                "/c/Program Files"/Inno\ Setup*/ISCC.exe 2>/dev/null | head -1 || true)
+              "$iscc" -Q \
+                "-DAppVersion=$version" \
+                "-DSourceExe=$(cygpath -w "$PWD/$bin.exe")" \
+                "-O$(cygpath -w "$PWD/dist")" \
+                "-F$name-setup" \
+                packaging/windows/markdone.iss
+              ;;
+            macOS)
+              # A Markdone.app bundle (zipped with ditto, which keeps bundle metadata).
+              app="dist/$name/Markdone.app/Contents"
+              mkdir -p "$app/MacOS" "$app/Resources"
+              cp "$bin" "$app/MacOS/markdone"
+              cp packaging/macos/markdone.icns "$app/Resources/"
+              sed "s/__VERSION__/$version/g" packaging/macos/Info.plist > "$app/Info.plist"
+              cp README.md LICENSE "dist/$name/"
+              (cd dist && ditto -c -k --keepParent "$name" "$name.zip" && rm -rf "$name")
+              ;;
+          esac
           cd dist
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            tar -czf "$name.tar.gz" "$name"
-            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
-          elif [ "$RUNNER_OS" = "Windows" ]; then
-            7z a -tzip "$name.zip" "$name" > /dev/null
-            sha256sum "$name.zip" > "$name.zip.sha256"
-          else
-            zip -qr "$name.zip" "$name"
-            shasum -a 256 "$name.zip" > "$name.zip.sha256"
-          fi
-          rm -rf "$name"
+          for f in *; do
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              shasum -a 256 "$f" > "$f.sha256"
+            else
+              sha256sum "$f" > "$f.sha256"
+            fi
+          done
+          ls -l
 
       - uses: actions/upload-artifact@v7
         with:
