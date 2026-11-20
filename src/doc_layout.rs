@@ -1197,7 +1197,7 @@ pub struct DocLayout {
     /// `(cache key, source)` of each materialized mermaid diagram, for the shell to
     /// kick off off-thread rendering (mirrors `image_urls`).
     #[cfg(feature = "mermaid")]
-    mermaid_sources: Vec<(String, String)>,
+    mermaid_sources: Vec<(String, mermaid::MermaidJob)>,
     /// `(cache key, job)` of each materialized math render (block + inline), for the shell
     /// to kick off off-thread rendering.
     #[cfg(feature = "math")]
@@ -1431,7 +1431,7 @@ impl DocLayout {
         let mut bands = Bands::new(n, empty_layout.clone(), empty_render.clone());
         let mut image_urls: Vec<String> = Vec::new();
         #[cfg(feature = "mermaid")]
-        let mut mermaid_sources: Vec<(String, String)> = Vec::new();
+        let mut mermaid_sources: Vec<(String, mermaid::MermaidJob)> = Vec::new();
         #[cfg(feature = "math")]
         let mut math_sources: Vec<(String, math::MathJob)> = Vec::new();
         // Scan display-math blocks once (openers can be off-screen).
@@ -1552,9 +1552,14 @@ impl DocLayout {
                             ..snapshot.rope.byte_to_char(m.content.end),
                     )
                     .to_string();
-                let key = mermaid::key_for(&source);
+                // Mermaid's light theme on a light editor theme, its dark one otherwise.
+                let job = mermaid::MermaidJob {
+                    source,
+                    light: theme.is_light(),
+                };
+                let key = mermaid::key_for(&job);
                 if !mermaid_sources.iter().any(|(k, _)| k == &key) {
-                    mermaid_sources.push((key.clone(), source));
+                    mermaid_sources.push((key.clone(), job));
                 }
                 let img = ImageRef {
                     url: key,
@@ -2578,7 +2583,7 @@ impl DocLayout {
     /// `(cache key, source)` of each materialized mermaid diagram, for the shell to
     /// kick off off-thread rendering (mirrors `image_urls`).
     #[cfg(feature = "mermaid")]
-    pub fn mermaid_sources(&self) -> &[(String, String)] {
+    pub fn mermaid_sources(&self) -> &[(String, mermaid::MermaidJob)] {
         &self.mermaid_sources
     }
 
@@ -3589,7 +3594,10 @@ mod tests {
             height: 1,
         };
         images.set_loaded(
-            &mermaid::key_for(source),
+            &mermaid::key_for(&mermaid::MermaidJob {
+                source: source.to_string(),
+                light: theme.is_light(),
+            }),
             LoadedImage {
                 paint: ImagePaint::Raster(ImageBrush::new(pixel)),
                 width: 1,

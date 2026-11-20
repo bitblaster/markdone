@@ -50,7 +50,7 @@ math = ["dep:ratex-parser", "dep:ratex-layout", "dep:ratex-render", "dep:ratex-t
 editor = ["git", "github", "watch"]
 
 # the desktop editor application (winit shell). implies editor.
-app = ["editor", "remote-images", "mermaid", "math", "dep:winit", "dep:arboard", "dep:open", "dep:clap", "dep:toml", "dep:dirs", "dep:egui", "dep:egui-winit", "dep:egui-wgpu", "dep:rfd", "dep:toml_edit", "dep:skrifa", "dep:interprocess", "dep:pulldown-cmark", "dep:htmd", "dep:wayland-client", "dep:wayland-backend", "dep:libc"]
+app = ["editor", "remote-images", "mermaid", "math", "dep:winit", "dep:arboard", "dep:open", "dep:clap", "dep:toml", "dep:dirs", "dep:egui", "dep:egui-winit", "dep:egui-wgpu", "dep:rfd", "dep:toml_edit", "dep:skrifa", "dep:interprocess", "dep:pulldown-cmark", "dep:htmd", "dep:wayland-client", "dep:wayland-backend", "dep:libc", "dep:zbus", "dep:futures-util"]
 
 # the GhostText daemon (writd binary)
 ghosttext = ["app", "dep:tokio-tungstenite", "dep:futures"]
@@ -180,3 +180,7 @@ vello = "0.10"
 wayland-client = { version = "0.31", optional = true }
 wayland-backend = { version = "0.3", features = ["client_system"], optional = true }
 libc = { version = "0.2", optional = true }
+# The system light/dark preference: the XDG desktop portal over D-Bus (winit reports it
+# only on Windows/macOS). Pure-Rust client on the app's existing tokio runtime.
+zbus = { version = "6", default-features = false, features = ["tokio", "proxy"], optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true }

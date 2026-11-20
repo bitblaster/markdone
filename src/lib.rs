@@ -119,6 +119,8 @@ pub mod export;
 pub mod format;
 #[cfg(all(feature = "app", unix, not(target_os = "macos")))]
 pub mod wayland_dnd;
+#[cfg(all(feature = "app", unix, not(target_os = "macos")))]
+pub mod system_theme;
 pub mod paste;
 pub mod raster;
 pub mod render;

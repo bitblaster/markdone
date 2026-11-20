@@ -85,6 +85,31 @@ impl ExternalChange {
     }
 }
 
+/// Light or dark appearance: picks which of the two configured themes is shown.
+#[cfg(feature = "app")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeMode {
+    Light,
+    Dark,
+}
+
+#[cfg(feature = "app")]
+impl ThemeMode {
+    fn key(self) -> &'static str {
+        match self {
+            ThemeMode::Light => "light",
+            ThemeMode::Dark => "dark",
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            ThemeMode::Light => ThemeMode::Dark,
+            ThemeMode::Dark => ThemeMode::Light,
+        }
+    }
+}
+
 /// The settings editable in the Preferences window (saved to `config.toml`).
 #[cfg(feature = "app")]
 #[derive(Debug, Clone, PartialEq)]
@@ -104,8 +129,15 @@ pub struct Preferences {
     pub line_numbers: bool,
     /// Show the differences from the last git commit (View menu).
     pub git_diff: bool,
-    /// Theme name: a built-in or a `[themes.<name>]` of the config file.
-    pub theme: String,
+    /// Theme of dark mode: a built-in or a `[themes.<name>]` of the config file.
+    pub dark_theme: String,
+    /// Theme of light mode.
+    pub light_theme: String,
+    /// The chosen mode (View → Dark Mode); what is shown unless `follow_system_theme`
+    /// applies the desktop's preference instead.
+    pub theme_mode: ThemeMode,
+    /// Follow the desktop's light/dark preference when it reports one.
+    pub follow_system_theme: bool,
     pub external_change: ExternalChange,
     /// Compare the files with the disk when the window gets the focus or a tab is
     /// activated (catches changes the file watcher misses, e.g. on network shares).
@@ -126,11 +158,65 @@ impl Default for Preferences {
             max_width: crate::consts::MAX_CONTENT_WIDTH,
             line_numbers: false,
             git_diff: true,
-            theme: "dracula".to_string(),
+            dark_theme: "dracula".to_string(),
+            light_theme: "catppuccin-latte".to_string(),
+            theme_mode: ThemeMode::Dark,
+            follow_system_theme: false,
             external_change: ExternalChange::Reload,
             check_on_focus: true,
             github: false,
         }
+    }
+}
+
+#[cfg(feature = "app")]
+impl Preferences {
+    /// The theme name configured for `mode`.
+    pub fn theme_for(&self, mode: ThemeMode) -> &str {
+        match mode {
+            ThemeMode::Light => &self.light_theme,
+            ThemeMode::Dark => &self.dark_theme,
+        }
+    }
+
+    /// The mode to show: the desktop's preference when following it and it reports one,
+    /// else the chosen mode.
+    pub fn effective_mode(&self, system: Option<ThemeMode>) -> ThemeMode {
+        match system {
+            Some(mode) if self.follow_system_theme => mode,
+            _ => self.theme_mode,
+        }
+    }
+}
+
+/// Turns theme names into palettes: the config file's own `[themes.<name>]` (a custom
+/// theme shadows a built-in of the same name and inherits dracula for omitted colors),
+/// then the built-ins; `[theme.overrides]` goes on top of whichever is chosen.
+#[cfg(feature = "app")]
+#[derive(Debug, Clone, Default)]
+pub struct ThemeSet {
+    custom: HashMap<String, Palette>,
+    overrides: Option<Palette>,
+}
+
+#[cfg(feature = "app")]
+impl ThemeSet {
+    /// The palette for `name` (dracula, with a warning, if unknown).
+    pub fn resolve(&self, name: &str) -> EditorTheme {
+        let mut theme = if let Some(custom) = self.custom.get(name) {
+            let mut base = EditorTheme::dracula();
+            custom.apply(&mut base);
+            base
+        } else if let Some(builtin) = EditorTheme::by_name(name) {
+            builtin
+        } else {
+            eprintln!("[markdone] config: unknown theme '{name}', using dracula");
+            EditorTheme::dracula()
+        };
+        if let Some(overrides) = &self.overrides {
+            overrides.apply(&mut theme);
+        }
+        theme
     }
 }
 
@@ -139,7 +225,10 @@ impl Default for Preferences {
 #[cfg(feature = "app")]
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
+    /// The theme of the chosen mode (`prefs.theme_mode`), resolved through `themes`.
     pub theme: EditorTheme,
+    /// Resolves the theme names of both modes.
+    pub themes: ThemeSet,
     pub font_size: f32,
     pub prefs: Preferences,
     /// Theme names to offer: the built-ins, then the config's own `[themes.*]`.
@@ -151,6 +240,7 @@ impl Default for ResolvedConfig {
     fn default() -> Self {
         Self {
             theme: EditorTheme::dracula(),
+            themes: ThemeSet::default(),
             font_size: FONT_SIZE,
             prefs: Preferences::default(),
             theme_names: EditorTheme::BUILTIN_NAMES.iter().map(|n| n.to_string()).collect(),
@@ -215,14 +305,21 @@ struct NetworkSpec {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ThemeSpec {
+    /// The single theme of configs written before light/dark modes: becomes the theme
+    /// of the mode matching its background, and that mode is chosen.
     name: Option<String>,
+    dark: Option<String>,
+    light: Option<String>,
+    /// `"light"` or `"dark"`.
+    mode: Option<String>,
+    follow_system: Option<bool>,
     overrides: Option<Palette>,
 }
 
 /// A partial color palette: any omitted field inherits from the theme it overlays.
 /// Colors are `#RRGGBB` or `#RRGGBBAA` hex strings.
 #[cfg(feature = "app")]
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Palette {
     background: Option<String>,
@@ -341,23 +438,40 @@ fn resolve(file: FileConfig) -> ResolvedConfig {
         .collect();
     custom.sort();
     cfg.theme_names.extend(custom);
-    if let Some(theme) = &file.theme {
-        if let Some(name) = &theme.name {
-            cfg.prefs.theme = name.clone();
-            if let Some(custom) = file.themes.get(name) {
-                let mut base = EditorTheme::dracula();
-                custom.apply(&mut base);
-                cfg.theme = base;
-            } else if let Some(builtin) = EditorTheme::by_name(name) {
-                cfg.theme = builtin;
+    let spec = file.theme;
+    cfg.themes = ThemeSet {
+        custom: file.themes,
+        overrides: spec.as_ref().and_then(|s| s.overrides.clone()),
+    };
+    if let Some(spec) = &spec {
+        // A pre-modes config names one theme: it fills the slot of the mode matching its
+        // background, and that mode is chosen.
+        if let Some(name) = &spec.name {
+            if cfg.themes.resolve(name).is_light() {
+                cfg.prefs.light_theme = name.clone();
+                cfg.prefs.theme_mode = ThemeMode::Light;
             } else {
-                eprintln!("[markdone] config: unknown theme '{name}', using dracula");
+                cfg.prefs.dark_theme = name.clone();
+                cfg.prefs.theme_mode = ThemeMode::Dark;
             }
         }
-        if let Some(overrides) = &theme.overrides {
-            overrides.apply(&mut cfg.theme);
+        if let Some(dark) = &spec.dark {
+            cfg.prefs.dark_theme = dark.clone();
+        }
+        if let Some(light) = &spec.light {
+            cfg.prefs.light_theme = light.clone();
+        }
+        match spec.mode.as_deref() {
+            Some("light") => cfg.prefs.theme_mode = ThemeMode::Light,
+            Some("dark") => cfg.prefs.theme_mode = ThemeMode::Dark,
+            Some(other) => eprintln!("[markdone] config: unknown theme.mode '{other}'"),
+            None => {}
+        }
+        if let Some(follow) = spec.follow_system {
+            cfg.prefs.follow_system_theme = follow;
         }
     }
+    cfg.theme = cfg.themes.resolve(cfg.prefs.theme_for(cfg.prefs.theme_mode));
     if let Some(font) = &file.font {
         let name = |f: &Option<String>| {
             f.as_deref()
@@ -457,7 +571,10 @@ pub fn save_preferences(path: &Path, prefs: &Preferences) -> std::io::Result<()>
         }
     };
     set("font", "size", number(prefs.font_size));
-    set("theme", "name", value(prefs.theme.as_str()));
+    set("theme", "dark", value(prefs.dark_theme.as_str()));
+    set("theme", "light", value(prefs.light_theme.as_str()));
+    set("theme", "mode", value(prefs.theme_mode.key()));
+    set("theme", "follow_system", value(prefs.follow_system_theme));
     set("editor", "full_width", value(prefs.full_width));
     set("editor", "max_width", number(prefs.max_width));
     set("editor", "line_numbers", value(prefs.line_numbers));
@@ -465,6 +582,11 @@ pub fn save_preferences(path: &Path, prefs: &Preferences) -> std::io::Result<()>
     set("files", "on_external_change", value(prefs.external_change.key()));
     set("files", "check_on_focus", value(prefs.check_on_focus));
     set("network", "github", value(prefs.github));
+    // The pre-modes single theme name is superseded by `dark`/`light`/`mode` (left in place
+    // it would be re-read as the chosen theme).
+    if let Some(t) = doc.get_mut("theme").and_then(Item::as_table_like_mut) {
+        t.remove("name");
+    }
     // Font families: a family left at the system default is removed, not written empty.
     let font = doc.entry("font").or_insert_with(|| Item::Table(Table::new()));
     if let Some(t) = font.as_table_like_mut() {
@@ -616,6 +738,44 @@ mod tests {
     }
 
     #[test]
+    fn light_and_dark_themes_and_mode() {
+        let f: FileConfig = toml::from_str(
+            "[theme]\ndark = \"nord\"\nlight = \"solarized-light\"\nmode = \"light\"\n\
+             follow_system = true",
+        )
+        .unwrap();
+        let cfg = resolve(f);
+        assert_eq!(cfg.prefs.dark_theme, "nord");
+        assert_eq!(cfg.prefs.light_theme, "solarized-light");
+        assert_eq!(cfg.prefs.theme_mode, ThemeMode::Light);
+        assert!(cfg.prefs.follow_system_theme);
+        // The chosen mode's theme is the one resolved at startup.
+        assert_eq!(cfg.theme.background, EditorTheme::solarized_light().background);
+        // Following the system: its preference wins when known, else the chosen mode.
+        assert_eq!(cfg.prefs.effective_mode(Some(ThemeMode::Dark)), ThemeMode::Dark);
+        assert_eq!(cfg.prefs.effective_mode(None), ThemeMode::Light);
+        let fixed = Preferences {
+            follow_system_theme: false,
+            ..cfg.prefs.clone()
+        };
+        assert_eq!(fixed.effective_mode(Some(ThemeMode::Dark)), ThemeMode::Light);
+    }
+
+    /// A pre-modes config's single `name` fills the slot matching its background and
+    /// picks that mode; the other slot keeps its default.
+    #[test]
+    fn legacy_theme_name_maps_to_its_mode() {
+        let dark: FileConfig = toml::from_str("[theme]\nname = \"nord\"").unwrap();
+        let cfg = resolve(dark);
+        assert_eq!((cfg.prefs.dark_theme.as_str(), cfg.prefs.theme_mode), ("nord", ThemeMode::Dark));
+        assert_eq!(cfg.prefs.light_theme, Preferences::default().light_theme);
+        let light: FileConfig = toml::from_str("[theme]\nname = \"catppuccin-latte\"").unwrap();
+        let cfg = resolve(light);
+        assert_eq!(cfg.prefs.light_theme, "catppuccin-latte");
+        assert_eq!(cfg.prefs.theme_mode, ThemeMode::Light);
+    }
+
+    #[test]
     fn custom_themes_are_offered_after_the_builtins() {
         let file: FileConfig =
             toml::from_str("[themes.zeta]\nbackground = \"#000000\"\n[themes.alpha]\n").unwrap();
@@ -635,7 +795,7 @@ mod tests {
         std::fs::write(
             &path,
             "# my comment\n[font]\nfamily = \"JetBrains Mono\" # inline\nsize = 18\n\n\
-             [themes.mine]\nbackground = \"#101010\"\n",
+             [theme]\nname = \"nord\"\n\n[themes.mine]\nbackground = \"#101010\"\n",
         )
         .unwrap();
         let prefs = Preferences {
@@ -646,7 +806,10 @@ mod tests {
             max_width: 960.0,
             line_numbers: true,
             git_diff: false,
-            theme: "mine".into(),
+            dark_theme: "mine".into(),
+            light_theme: "solarized-light".into(),
+            theme_mode: ThemeMode::Dark,
+            follow_system_theme: true,
             external_change: ExternalChange::Ask,
             check_on_focus: false,
             github: true,
@@ -657,6 +820,8 @@ mod tests {
         assert!(text.contains("# inline"), "unchanged family keeps its comment: {text}");
         assert!(text.contains("code_family = \"Hack\""), "{text}");
         assert!(text.contains("[themes.mine]"));
+        assert!(!text.contains("name = \"nord\""), "legacy theme name removed: {text}");
+        assert!(text.contains("mode = \"dark\"") && text.contains("follow_system = true"));
         assert!(text.contains("size = 20\n"), "{text}");
         let loaded = load(Some(&path));
         assert_eq!(loaded.prefs, prefs);

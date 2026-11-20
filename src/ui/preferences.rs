@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use crate::config::{ExternalChange, FONT_SIZE_RANGE, MAX_WIDTH_RANGE, Preferences};
+use crate::config::{ExternalChange, FONT_SIZE_RANGE, MAX_WIDTH_RANGE, Preferences, ThemeMode};
 use crate::text_engine::FontFamilyInfo;
 
 /// Font sizes offered by the slider (the config file accepts a wider range).
@@ -30,15 +30,27 @@ pub fn show(
             .num_columns(2)
             .spacing([16.0, 10.0])
             .show(ui, |ui| {
-                ui.label("Theme");
-                egui::ComboBox::from_id_salt("prefs-theme")
-                    .selected_text(prefs.theme.as_str())
-                    .width(220.0)
-                    .show_ui(ui, |ui| {
-                        for name in theme_names {
-                            ui.selectable_value(&mut prefs.theme, name.clone(), name.as_str());
-                        }
+                ui.label("Dark theme");
+                theme_picker(ui, "prefs-dark-theme", &mut prefs.dark_theme, theme_names);
+                ui.end_row();
+
+                ui.label("Light theme");
+                theme_picker(ui, "prefs-light-theme", &mut prefs.light_theme, theme_names);
+                ui.end_row();
+
+                ui.label("Mode");
+                ui.vertical(|ui| {
+                    ui.checkbox(
+                        &mut prefs.follow_system_theme,
+                        "Follow the system light/dark setting",
+                    );
+                    ui.add_enabled_ui(!prefs.follow_system_theme, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut prefs.theme_mode, ThemeMode::Dark, "Dark");
+                            ui.radio_value(&mut prefs.theme_mode, ThemeMode::Light, "Light");
+                        });
                     });
+                });
                 ui.end_row();
 
                 ui.label("Text font");
@@ -155,6 +167,18 @@ pub fn show(
         .clamp(*MAX_WIDTH_RANGE.start(), *MAX_WIDTH_RANGE.end())
         .round();
     *prefs != before
+}
+
+/// A drop-down of the theme names (built-ins, then the config file's own).
+fn theme_picker(ui: &mut egui::Ui, id: &str, value: &mut String, names: &[String]) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(value.as_str())
+        .width(220.0)
+        .show_ui(ui, |ui| {
+            for name in names {
+                ui.selectable_value(value, name.clone(), name.as_str());
+            }
+        });
 }
 
 /// The default entry of the font pickers (`None`).

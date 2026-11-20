@@ -42,6 +42,8 @@ pub enum Command {
     ToggleOutline,
     ToggleLineNumbers,
     ToggleGitDiff,
+    /// Switch between the light and the dark theme (and stop following the system).
+    ToggleDarkMode,
     /// Jump to heading `i` of the active document (table of contents).
     GoToHeading(usize),
     ZoomIn,

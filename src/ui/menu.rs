@@ -10,6 +10,8 @@ pub struct MenuState {
     pub outline_open: bool,
     pub line_numbers: bool,
     pub git_diff: bool,
+    /// The dark theme is shown.
+    pub dark_mode: bool,
     /// The active document has a file (Reload is possible).
     pub has_file: bool,
     pub tab_count: usize,
@@ -93,6 +95,11 @@ pub fn menu_bar(ui: &mut egui::Ui, state: &MenuState) -> Option<Command> {
                         let diff = egui::Button::selectable(state.git_diff, "Git Differences");
                         if ui.add(diff).clicked() {
                             picked = Some(Command::ToggleGitDiff);
+                            ui.close();
+                        }
+                        let dark = egui::Button::selectable(state.dark_mode, "Dark Mode");
+                        if ui.add(dark).clicked() {
+                            picked = Some(Command::ToggleDarkMode);
                             ui.close();
                         }
                         ui.separator();

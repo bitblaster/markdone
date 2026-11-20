@@ -40,7 +40,9 @@ use winit::event_loop::ControlFlow;
 
 use crate::buffer::Buffer;
 use crate::chrome::{BarRect, FindButtonRects, StatusInfo, draw_find_bar, draw_status_bar};
-use crate::config::{self, Config, ExternalChange, Preferences, ResolvedConfig};
+use crate::config::{
+    self, Config, ExternalChange, Preferences, ResolvedConfig, ThemeMode, ThemeSet,
+};
 use crate::consts::{
     CARET_WIDTH, FIND_ROW_H, FONT_SIZE, LINE_HEIGHT, MAX_CONTENT_WIDTH, OUTLINE_WIDTH, PADDING,
     STATUS_BAR_H, WHEEL_LINE_STEP,
@@ -526,6 +528,8 @@ type AcSlot = Arc<Mutex<Option<FetchedSuggestions>>>;
 #[derive(Debug, Clone)]
 pub(crate) enum WritEvent {
     GithubUpdated,
+    /// The desktop's light/dark preference, read or changed (`None`: no preference).
+    SystemTheme(Option<ThemeMode>),
     /// A standalone image finished loading (local or remote). A load changes a line's
     /// height, so the loop rebuilds (not just redraws) to reflow around it.
     ImageLoaded,
@@ -902,6 +906,13 @@ struct App {
     config_path: Option<PathBuf>,
     /// The Preferences window is shown.
     prefs_open: bool,
+    /// Resolves theme names (built-ins, the config's `[themes.*]`, `[theme.overrides]`).
+    themes: ThemeSet,
+    /// The desktop's light/dark preference, when it reports one (Linux: XDG portal;
+    /// Windows/macOS: winit).
+    system_theme: Option<ThemeMode>,
+    /// Name of the theme currently shown, to apply a theme change only when it changes.
+    applied_theme: String,
     /// Installed font families for the font pickers, scanned when the Preferences window
     /// first opens.
     font_families: Option<Vec<FontFamilyInfo>>,
@@ -1051,6 +1062,36 @@ impl App {
         let title = window_title(&editor);
         let mut text_engine = TextEngine::new();
         apply_fonts(&mut text_engine, &config.prefs);
+        // The desktop's light/dark preference (Linux: the XDG portal; elsewhere winit
+        // reports it on the window). When following it, read it now — briefly bounded —
+        // so the first frame already has the right theme; then watch for changes (always,
+        // so turning "follow" on later needs no restart).
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let system_theme = {
+            let current = if config.prefs.follow_system_theme {
+                runtime
+                    .block_on(tokio::time::timeout(
+                        Duration::from_millis(300),
+                        crate::system_theme::current(),
+                    ))
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let proxy = proxy.clone();
+            runtime.spawn(crate::system_theme::watch(move |mode| {
+                let _ = proxy.send_event(WritEvent::SystemTheme(mode));
+            }));
+            current
+        };
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        let system_theme: Option<ThemeMode> = None;
+        let applied_theme = config
+            .prefs
+            .theme_for(config.prefs.effective_mode(system_theme))
+            .to_string();
+        let initial_theme = config.themes.resolve(&applied_theme);
         Self {
             context: RenderContext::new(),
             renderer: None,
@@ -1064,7 +1105,7 @@ impl App {
                 render_cache: RenderCache::new(),
                 height_cache: HeightCache::new(),
                 table_cache: TableCache::new(),
-                theme: config.theme,
+                theme: initial_theme,
                 font_size: config.font_size,
                 max_content_width: content_width(&config.prefs),
                 line_numbers: config.prefs.line_numbers,
@@ -1082,6 +1123,9 @@ impl App {
             session_saved: None,
             prefs: config.prefs.clone(),
             theme_names: config.theme_names.clone(),
+            themes: config.themes.clone(),
+            system_theme,
+            applied_theme,
             config_path,
             prefs_open: false,
             font_families: None,
@@ -1588,20 +1632,39 @@ impl App {
             self.doc_engine.max_content_width = content_width(&self.prefs);
             relayout = true;
         }
-        if old.theme != self.prefs.theme {
-            // The theme may be a custom one of the config file: save, then resolve it.
-            self.prefs_save_at = None;
-            self.save_preferences();
-            let theme = match self.config_path.as_deref() {
-                Some(path) if path.exists() => config::load(Some(path)).theme,
-                _ => EditorTheme::by_name(&self.prefs.theme).unwrap_or_else(EditorTheme::dracula),
-            };
-            self.set_theme(theme);
+        self.prefs_save_at = Some(Instant::now() + Duration::from_millis(500));
+        // A theme, mode or "follow the system" change may change the theme shown.
+        if self.update_theme() {
             relayout = true;
-        } else {
-            self.prefs_save_at = Some(Instant::now() + Duration::from_millis(500));
         }
         if relayout {
+            self.relayout_all();
+        }
+    }
+
+    /// Show the theme of the effective mode (the desktop's preference when following it,
+    /// else the chosen mode), if it isn't the one shown. Returns `true` when it changed
+    /// (the caller relayouts). The theme set is re-read from the config file, so a custom
+    /// `[themes.<name>]` edited there since startup applies too.
+    fn update_theme(&mut self) -> bool {
+        let mode = self.prefs.effective_mode(self.system_theme);
+        let name = self.prefs.theme_for(mode).to_string();
+        if name == self.applied_theme {
+            return false;
+        }
+        if let Some(path) = self.config_path.as_deref().filter(|p| p.exists()) {
+            self.themes = config::load(Some(path)).themes;
+        }
+        let theme = self.themes.resolve(&name);
+        self.applied_theme = name;
+        self.set_theme(theme);
+        true
+    }
+
+    /// The desktop's light/dark preference changed (or was first read).
+    fn on_system_theme(&mut self, mode: Option<ThemeMode>) {
+        self.system_theme = mode;
+        if self.update_theme() {
             self.relayout_all();
         }
     }
@@ -1635,6 +1698,9 @@ impl App {
             sync_find_chrome(&mut self.doc_engine, state);
             state.window.request_redraw();
         }
+        // The relayout may need renders it didn't have (a theme switch keys diagrams
+        // anew for the other mode): start them.
+        sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
     }
 
     /// Write the preferences to the config file now.
@@ -2162,6 +2228,15 @@ impl App {
             Command::ToggleLineNumbers => {
                 let mut prefs = self.prefs.clone();
                 prefs.line_numbers = !prefs.line_numbers;
+                self.apply_preferences(prefs);
+                return;
+            }
+            Command::ToggleDarkMode => {
+                // Flip what is shown now; an explicit choice stops following the system
+                // (else the toggle would do nothing while the desktop says otherwise).
+                let mut prefs = self.prefs.clone();
+                prefs.theme_mode = prefs.effective_mode(self.system_theme).toggled();
+                prefs.follow_system_theme = false;
                 self.apply_preferences(prefs);
                 return;
             }
@@ -3635,6 +3710,10 @@ impl ApplicationHandler<WritEvent> for App {
     /// A tokio task finished (validation/suggestion). Results are already in the
     /// shared caches; rebuild the doc (ref colors may have changed) and redraw.
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WritEvent) {
+        if let WritEvent::SystemTheme(mode) = event {
+            self.on_system_theme(mode);
+            return;
+        }
         if let WritEvent::SaveAsPicked { id, path, then } = event {
             self.file_dialog_open = false;
             // Cancelled: a close that was waiting for this save is abandoned too.
@@ -4016,6 +4095,16 @@ impl ApplicationHandler<WritEvent> for App {
                 if self.doc_engine.doc.is_some() {
                     state.window.request_redraw();
                 }
+            }
+            // Windows/macOS report the desktop's light/dark preference through winit (on
+            // Linux it comes from the XDG portal instead; winit there would only echo the
+            // decoration theme we set ourselves).
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            WindowEvent::ThemeChanged(theme) => {
+                self.on_system_theme(Some(match theme {
+                    Theme::Light => ThemeMode::Light,
+                    Theme::Dark => ThemeMode::Dark,
+                }));
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
@@ -5212,6 +5301,7 @@ impl ApplicationHandler<WritEvent> for App {
                     outline_open: self.doc_engine.editor.outline_open(),
                     line_numbers: self.prefs.line_numbers,
                     git_diff: self.prefs.git_diff,
+                    dark_mode: self.prefs.effective_mode(self.system_theme) == ThemeMode::Dark,
                     has_file: self.doc_engine.editor.file_path().is_some(),
                     has_selection: self.doc_engine.editor.selection_range().is_some(),
                     tab_count: self.tabs.len(),

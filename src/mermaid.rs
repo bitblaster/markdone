@@ -41,12 +41,28 @@ pub struct MermaidBlock {
     pub anchor_line: usize,
 }
 
-/// Synthetic cache key for a diagram, derived from its source only: the vector scene is
-/// resolution-independent, so one render serves every width and window scale.
-pub fn key_for(source: &str) -> String {
+/// A diagram to render: its source, and whether the editor shows a light theme (the
+/// diagram then uses Mermaid's light theme instead of the dark one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MermaidJob {
+    pub source: String,
+    pub light: bool,
+}
+
+/// Synthetic cache key for a diagram: its source and light/dark mode. The vector scene is
+/// resolution-independent, so one render serves every width and window scale; switching
+/// mode renders anew (and the other mode's render stays cached for switching back).
+pub fn key_for(job: &MermaidJob) -> String {
     let mut h = DefaultHasher::new();
-    source.hash(&mut h);
+    job.hash_into(&mut h);
     format!("mermaid:{:016x}", h.finish())
+}
+
+impl MermaidJob {
+    fn hash_into(&self, h: &mut DefaultHasher) {
+        self.source.hash(h);
+        self.light.hash(h);
+    }
 }
 
 /// Build a renderer whose site-wide defaults are `config` (a Mermaid config object). The
@@ -56,16 +72,28 @@ fn renderer_with(config: serde_json::Value) -> Renderer {
     Renderer::new().with_presentation_engine(MermaidEngine::new().with_site_config(site))
 }
 
-/// Screen renderer: Mermaid's `dark` theme, as Zettlr shows diagrams in its dark mode
-/// (labels `#ccc`, subgraphs `#474949`). Mermaid paints no backdrop of its own, so the
-/// diagram sits directly on the editor background.
-static SCREEN: LazyLock<Renderer> =
-    LazyLock::new(|| renderer_with(serde_json::json!({ "theme": "dark" })));
+/// Screen renderer for dark editor themes: Mermaid's `dark` theme, as Zettlr shows
+/// diagrams in its dark mode (labels `#ccc`, subgraphs `#474949`). Mermaid paints no
+/// backdrop of its own, so the diagram sits directly on the editor background.
+///
+/// The Gantt grid is made transparent: its `lightgrey` lines vanish on a light page but
+/// stand out on a dark one, cluttering the chart.
+static SCREEN_DARK: LazyLock<Renderer> = LazyLock::new(|| {
+    renderer_with(serde_json::json!({
+        "theme": "dark",
+        "themeVariables": { "gridColor": "transparent" },
+    }))
+});
 
-/// Print renderer (PDF export): Mermaid's `default` light theme, for a white page. The
-/// geometry is the same as on screen; only colors differ.
-static PRINT: LazyLock<Renderer> =
+/// Mermaid's `default` light theme: the screen renderer for light editor themes, and the
+/// print renderer (PDF export, a white page). The geometry is the same in every theme;
+/// only colors differ.
+static LIGHT: LazyLock<Renderer> =
     LazyLock::new(|| renderer_with(serde_json::json!({ "theme": "default" })));
+
+fn screen_renderer(light: bool) -> &'static Renderer {
+    if light { &LIGHT } else { &SCREEN_DARK }
+}
 
 /// Why a render produced no SVG: a message to show the author, or a renderer panic
 /// (adversarial input — no message, the placeholder stays generic).
@@ -101,16 +129,17 @@ fn render_svg(renderer: &Renderer, source: &str) -> Result<String, RenderFail> {
     }
 }
 
-/// Render a diagram to SVG markup for the screen (dark theme, transparent backdrop).
-/// `Err` carries the parse/render error message. Exposed for tests and the dev probe.
-pub fn render_svg_for_screen(source: &str) -> Result<String, String> {
-    render_svg(&SCREEN, source).map_err(RenderFail::into_message)
+/// Render a diagram to SVG markup for the screen, in Mermaid's light or dark theme to
+/// match the editor's, on a transparent backdrop. `Err` carries the parse/render error
+/// message.
+pub fn render_svg_for_screen(source: &str, light: bool) -> Result<String, String> {
+    render_svg(screen_renderer(light), source).map_err(RenderFail::into_message)
 }
 
 /// Render a diagram to SVG markup for printing (PDF export): Mermaid's light theme, for
 /// a white page. `Err` carries the parse/render error message.
 pub fn render_svg_for_print(source: &str) -> Result<String, String> {
-    render_svg(&PRINT, source).map_err(RenderFail::into_message)
+    render_svg(&LIGHT, source).map_err(RenderFail::into_message)
 }
 
 /// Turn SVG markup into a vector [`LoadedImage`]: parse it (text → outlines with the
@@ -267,9 +296,10 @@ fn blend_mode(mode: usvg::BlendMode) -> BlendMode {
 /// to a raster decode should the vector conversion ever fail). `Ok(img)` on success;
 /// `Err(Some(msg))` on a parse/render error (shown in the placeholder so the author sees
 /// what's wrong); `Err(None)` on a panic or an SVG that won't decode at all.
-fn render_to_image(source: &str) -> Result<LoadedImage, Option<String>> {
+fn render_to_image(job: &MermaidJob) -> Result<LoadedImage, Option<String>> {
+    let source = job.source.as_str();
     let t0 = std::time::Instant::now();
-    match render_svg(&SCREEN, source) {
+    match render_svg(screen_renderer(job.light), source) {
         Ok(svg) => {
             let t1 = std::time::Instant::now();
             let vector = catch_unwind(AssertUnwindSafe(|| svg_to_vector(&svg))).ok().flatten();
@@ -295,17 +325,17 @@ fn profiling() -> bool {
     *ON.get_or_init(|| std::env::var_os("MARKDONE_PROFILE").is_some_and(|v| v != "0"))
 }
 
-/// For each `(key, source)` with no cache entry, mark it loading and render on a worker
+/// For each `(key, job)` with no cache entry, mark it loading and render on a worker
 /// thread (mermaid layout is CPU-heavy — never on the render thread), then `notify()` so
 /// the event-driven shell rebuilds around the now-known diagram size. Mirrors
 /// `image_load::spawn_image_loads`, but the "load" is a local CPU render, so a plain OS
 /// thread suffices (no async runtime).
 pub fn spawn_mermaid_renders(
-    sources: &[(String, String)],
+    sources: &[(String, MermaidJob)],
     cache: &ImageCache,
     notify: impl Fn() + Send + Clone + 'static,
 ) {
-    for (key, source) in sources {
+    for (key, job) in sources {
         // Skips renders already in flight/loaded/failed; redoes evicted ones.
         if !cache.begin_render(key) {
             continue;
@@ -313,21 +343,21 @@ pub fn spawn_mermaid_renders(
         let cache = cache.clone();
         let notify = notify.clone();
         let key = key.clone();
-        let source = source.clone();
+        let job = job.clone();
         std::thread::spawn(move || {
-            cache.store_render(&key, render_to_image(&source));
+            cache.store_render(&key, render_to_image(&job));
             notify();
         });
     }
 }
 
 /// Synchronously render diagrams into the cache for the headless snapshot frame.
-pub fn render_mermaid_blocking(sources: &[(String, String)], cache: &ImageCache) {
-    for (key, source) in sources {
+pub fn render_mermaid_blocking(sources: &[(String, MermaidJob)], cache: &ImageCache) {
+    for (key, job) in sources {
         if cache.contains(key) {
             continue;
         }
-        cache.store_render(key, render_to_image(source));
+        cache.store_render(key, render_to_image(job));
     }
 }
 
@@ -336,10 +366,18 @@ mod tests {
     use super::*;
     use crate::image_cache::ImageState;
 
+    fn job(src: &str, light: bool) -> MermaidJob {
+        MermaidJob {
+            source: src.to_string(),
+            light,
+        }
+    }
+
     fn render_into_cache(src: &str) -> Option<ImageState> {
-        let key = key_for(src);
+        let job = job(src, false);
+        let key = key_for(&job);
         let cache = ImageCache::new();
-        render_mermaid_blocking(&[(key.clone(), src.to_string())], &cache);
+        render_mermaid_blocking(&[(key.clone(), job)], &cache);
         cache.get(&key)
     }
 
@@ -368,7 +406,7 @@ mod tests {
     /// Labels are drawn as glyph outlines, placed inside the diagram.
     #[test]
     fn labels_are_drawn_as_outlines_inside_the_diagram() {
-        let svg = render_svg_for_screen("flowchart LR\n  A[Uno] --> B[Due]").unwrap();
+        let svg = render_svg_for_screen("flowchart LR\n  A[Uno] --> B[Due]", false).unwrap();
         let bare = svg.replace(">Uno<", "><").replace(">Due<", "><");
         let with = vector_scene(&svg);
         let without = vector_scene(&bare);
@@ -396,7 +434,7 @@ mod tests {
     #[test]
     fn plain_groups_open_no_layers() {
         let src = "flowchart TB\n  subgraph X\n    A --> B --> C\n  end\n  subgraph Y\n    D --> E\n  end\n  A --> E";
-        let svg = render_svg_for_screen(src).unwrap();
+        let svg = render_svg_for_screen(src, false).unwrap();
         let ours = vector_scene(&svg).encoding().n_clips;
         // vello_svg's one-layer-per-group encoding of the same SVG, for scale.
         let tree = usvg::Tree::from_str(
@@ -436,10 +474,13 @@ mod tests {
         }
     }
 
+    /// One key per source and mode: switching light/dark renders anew.
     #[test]
-    fn key_is_stable_per_source() {
-        assert_eq!(key_for("graph LR; A-->B"), key_for("graph LR; A-->B"));
-        assert_ne!(key_for("graph LR; A-->B"), key_for("graph LR; A-->C"));
+    fn key_depends_on_source_and_mode() {
+        let a = "graph LR; A-->B";
+        assert_eq!(key_for(&job(a, false)), key_for(&job(a, false)));
+        assert_ne!(key_for(&job(a, false)), key_for(&job("graph LR; A-->C", false)));
+        assert_ne!(key_for(&job(a, false)), key_for(&job(a, true)));
     }
 
     /// The old engine dropped the whole line on an ASCII apostrophe inside a bracketed
@@ -447,7 +488,7 @@ mod tests {
     #[test]
     fn apostrophe_in_chained_label_renders_verbatim() {
         let src = "flowchart TB\n  C2 --> C4[C4 Parametri dell'esito] --> C5";
-        let svg = render_svg_for_screen(src).expect("flowchart should render");
+        let svg = render_svg_for_screen(src, false).expect("flowchart should render");
         assert!(svg.contains(">dell'esito<"), "apostrophe label must render as written");
         assert!(!svg.contains("C4[C4"), "raw source text leaked into the diagram");
     }
@@ -455,7 +496,7 @@ mod tests {
     /// usvg draws no `<foreignObject>`: the screen SVG must carry its labels as `<text>`.
     #[test]
     fn screen_svg_has_no_foreign_object() {
-        let svg = render_svg_for_screen("flowchart LR\n  A[Uno] --> B[Due]").unwrap();
+        let svg = render_svg_for_screen("flowchart LR\n  A[Uno] --> B[Due]", false).unwrap();
         assert!(!svg.contains("<foreignObject"), "labels must be plain <text>");
         assert!(svg.contains("<text"), "labels must still be present");
     }
@@ -463,31 +504,42 @@ mod tests {
     /// No backdrop: the editor background shows through, as in Zettlr.
     #[test]
     fn screen_svg_has_transparent_background() {
-        let svg = render_svg_for_screen("flowchart LR\n  A --> B").unwrap();
+        let svg = render_svg_for_screen("flowchart LR\n  A --> B", false).unwrap();
         assert!(!svg.contains("class=\"background"), "no background rect");
         let root = &svg[..svg.find('>').unwrap()];
         assert!(!root.contains("background"), "root must not paint a background: {root}");
     }
 
-    /// Dark theme on screen (Zettlr's dark mode), light theme on paper.
+    /// The screen follows the editor's light/dark mode (Zettlr's dark mode uses Mermaid's
+    /// dark theme); paper is always light, like the light screen.
     #[test]
-    fn screen_is_dark_print_is_light() {
+    fn screen_follows_mode_print_is_light() {
         let src = "flowchart LR\n  A --> B";
-        let screen = render_svg_for_screen(src).unwrap();
+        let dark = render_svg_for_screen(src, false).unwrap();
+        let light = render_svg_for_screen(src, true).unwrap();
         let print = render_svg_for_print(src).unwrap();
-        assert!(screen.contains("#ccc"), "dark theme labels are #ccc");
-        assert!(!print.contains("fill:#ccc"), "print must not use the dark label color");
-        assert_ne!(screen, print);
+        assert!(dark.contains("#ccc"), "dark theme labels are #ccc");
+        assert!(!light.contains("fill:#ccc"), "the light screen must not use dark colors");
+        assert_ne!(dark, light);
+        assert_eq!(light, print, "light screen and paper share Mermaid's default theme");
     }
 
     /// Gantt honours `axisFormat` (the old engine ignored it).
     #[test]
     fn gantt_axis_format_is_applied() {
         let src = "gantt\n  dateFormat YYYY-MM-DD\n  axisFormat S%V\n  section S\n  task :a1, 2026-01-05, 30d";
-        let svg = render_svg_for_screen(src).expect("gantt should render");
+        let svg = render_svg_for_screen(src, false).expect("gantt should render");
         // 2026-01-05 is a Monday of ISO week 2; a 30-day task spans weeks 2–6.
         assert!(svg.contains(">S02<"), "ISO-week tick labels expected (S%V)");
         assert!(svg.contains(">S04<"));
+    }
+
+    /// No Gantt grid lines on the dark screen (they only show up there).
+    #[test]
+    fn dark_gantt_has_no_grid_lines() {
+        let src = "gantt\n  dateFormat YYYY-MM-DD\n  section S\n  task :a1, 2026-01-05, 30d";
+        let dark = render_svg_for_screen(src, false).unwrap();
+        assert!(dark.contains(".grid .tick{stroke:transparent"), "grid must be hidden");
     }
 
     /// A `%%{init}%%` directive overrides the site config: the same flowchart laid out with
@@ -495,9 +547,9 @@ mod tests {
     #[test]
     fn init_directive_selects_layout() {
         let body = "flowchart TB\n  subgraph X\n    A --> B --> C\n  end\n  subgraph Y\n    D --> E\n  end\n  A --> E\n  B --> D\n";
-        let elk = render_svg_for_screen(body).unwrap();
+        let elk = render_svg_for_screen(body, false).unwrap();
         let dagre =
-            render_svg_for_screen(&format!("%%{{init: {{\"layout\": \"dagre\"}}}}%%\n{body}"))
+            render_svg_for_screen(&format!("%%{{init: {{\"layout\": \"dagre\"}}}}%%\n{body}"), false)
                 .unwrap();
         assert_ne!(elk, dagre, "the dagre directive must change the layout");
     }
@@ -505,8 +557,8 @@ mod tests {
     #[test]
     fn user_theme_directive_wins_over_site_config() {
         let src = "%%{init: {\"theme\": \"forest\"}}%%\nflowchart LR\n  A --> B";
-        let forest = render_svg_for_screen(src).unwrap();
-        let dark = render_svg_for_screen("flowchart LR\n  A --> B").unwrap();
+        let forest = render_svg_for_screen(src, false).unwrap();
+        let dark = render_svg_for_screen("flowchart LR\n  A --> B", false).unwrap();
         assert_ne!(forest, dark, "the author's theme must override the dark site theme");
     }
 }
