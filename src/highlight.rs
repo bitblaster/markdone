@@ -125,6 +125,66 @@ impl Highlighter {
             );
         }
 
+        // Grammars with the queries bundled in their crates.
+        let grammars: [(&[&str], tree_sitter::Language, &str, String); 4] = [
+            (
+                &["java"],
+                tree_sitter_java::LANGUAGE.into(),
+                "java",
+                tree_sitter_java::HIGHLIGHTS_QUERY.to_string(),
+            ),
+            (
+                &["python", "py", "python3"],
+                tree_sitter_python::LANGUAGE.into(),
+                "python",
+                tree_sitter_python::HIGHLIGHTS_QUERY.to_string(),
+            ),
+            (
+                &["c", "h"],
+                tree_sitter_c::LANGUAGE.into(),
+                "c",
+                tree_sitter_c::HIGHLIGHT_QUERY.to_string(),
+            ),
+            // C++'s query only adds to C's (its grammar extends C's); C++ captures last.
+            (
+                &["cpp", "c++", "cc", "cxx", "hpp"],
+                tree_sitter_cpp::LANGUAGE.into(),
+                "cpp",
+                format!(
+                    "{}\n{}",
+                    tree_sitter_c::HIGHLIGHT_QUERY,
+                    tree_sitter_cpp::HIGHLIGHT_QUERY
+                ),
+            ),
+        ];
+        for (aliases, language, name, query) in grammars {
+            if let Some(config) = Self::create_config(language, name, &query) {
+                register(aliases, Backend::TreeSitter(Box::new(config)));
+            }
+        }
+        // PHP: the `php_only` grammar parses bare PHP code, as a Markdown snippet usually
+        // is; the `php` one expects a `<?php` tag and treats the rest as HTML text.
+        if let Some(config) = Self::create_config(
+            tree_sitter_php::LANGUAGE_PHP_ONLY.into(),
+            "php",
+            tree_sitter_php::HIGHLIGHTS_QUERY,
+        ) {
+            register(&["php"], Backend::TreeSitter(Box::new(config)));
+        }
+        // JavaScript (the grammar is already linked for TypeScript), JSX included.
+        let javascript_query =
+            format!("{JAVASCRIPT_HIGHLIGHT_QUERY}\n{}", tree_sitter_javascript::JSX_HIGHLIGHT_QUERY);
+        if let Some(config) = Self::create_config(
+            tree_sitter_javascript::LANGUAGE.into(),
+            "javascript",
+            &javascript_query,
+        ) {
+            register(
+                &["javascript", "js", "jsx", "mjs", "cjs"],
+                Backend::TreeSitter(Box::new(config)),
+            );
+        }
+
         // TypeScript's query only covers its extensions to JavaScript. Later patterns
         // win in tree-sitter-highlight, so keep the TypeScript-specific captures last.
         let typescript_query =
@@ -257,7 +317,7 @@ mod tests {
         assert!(highlighter.supports_language("typescript"));
         assert!(highlighter.supports_language("ts"));
         assert!(highlighter.supports_language("TypeScript"));
-        assert!(!highlighter.supports_language("python"));
+        assert!(!highlighter.supports_language("haskell"));
     }
 
     fn assert_highlight(code: &str, spans: &[HighlightSpan], token: &str, capture: &str) {
@@ -325,6 +385,36 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].range.end <= pair[1].range.start)
         );
+    }
+
+    /// Every added grammar is registered under its aliases and its bundled query compiles
+    /// against it (a query that doesn't would leave the language unregistered): a typical
+    /// snippet gets a keyword and a comment highlighted.
+    #[test]
+    fn added_languages_highlight() {
+        let mut highlighter = Highlighter::new();
+        let cases: [(&[&str], &str, &str, &str); 7] = [
+            (&["java"], "// c\npublic class A { int x = 1; }", "class", "// c"),
+            (&["python", "py"], "# c\ndef f(x):\n    return x\n", "def", "# c"),
+            (&["c", "h"], "/* c */\nint main(void) { return 0; }", "return", "/* c */"),
+            (
+                &["cpp", "c++", "cc"],
+                "// c\nclass A { public: int x; };",
+                "class",
+                "// c",
+            ),
+            (&["php"], "// c\nfunction f($x) { return $x; }", "function", "// c"),
+            (&["php"], "<?php\n// c\nfunction f() {}", "function", "// c"),
+            (&["javascript", "js", "jsx"], "// c\nconst f = () => 1;", "const", "// c"),
+        ];
+        for (aliases, code, keyword, comment) in cases {
+            for alias in aliases {
+                assert!(highlighter.supports_language(alias), "{alias} not registered");
+                let spans = highlighter.highlight(code, alias);
+                assert_highlight(code, &spans, keyword, "keyword");
+                assert_highlight(code, &spans, comment, "comment");
+            }
+        }
     }
 
     #[test]
