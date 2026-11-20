@@ -532,6 +532,8 @@ type AcSlot = Arc<Mutex<Option<FetchedSuggestions>>>;
 pub(crate) enum WritEvent {
     GithubUpdated,
     /// The desktop's light/dark preference, read or changed (`None`: no preference).
+    /// Sent by the XDG portal watcher (Linux/BSD only; elsewhere winit reports it).
+    #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
     SystemTheme(Option<ThemeMode>),
     /// A standalone image finished loading (local or remote). A load changes a line's
     /// height, so the loop rebuilds (not just redraws) to reflow around it.
@@ -556,6 +558,7 @@ pub(crate) enum WritEvent {
     /// Another launch handed over these files (empty: just raise the window).
     InstanceOpen(Vec<PathBuf>),
     /// Files dropped on the window (Wayland; winit reports them itself elsewhere).
+    #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
     FilesDropped(Vec<PathBuf>),
     /// The Insert → Image dialog for tab `id` closed (`None`: cancelled).
     ImagePicked {
