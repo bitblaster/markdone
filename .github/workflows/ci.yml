@@ -57,4 +57,4 @@ jobs:
 
       # The `github::` tests call api.github.com with a token; skipped here.
       - name: Test
-        run: cargo test --locked -- --skip github::
+        run: "cargo test --locked -- --skip github::"
