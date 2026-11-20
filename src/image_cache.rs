@@ -40,8 +40,71 @@ pub fn set_max_raster_width(px: u32) {
 static SVG_FONTS: LazyLock<Arc<fontdb::Database>> = LazyLock::new(|| {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
+    ensure_generic_families(&mut db);
     Arc::new(db)
 });
+
+/// Point every generic family (`sans-serif`, `serif`, `monospace`) that resolves to no
+/// installed font at a common one that is installed. fontdb maps them to fixed names
+/// ("Arial", "Times New Roman", "Courier New") unless fontconfig says otherwise, and SVG
+/// text whose font stack resolves to nothing is dropped — on a system without those
+/// fonts, mermaid labels (`"trebuchet ms", verdana, arial, sans-serif`) would vanish.
+fn ensure_generic_families(db: &mut fontdb::Database) {
+    use fontdb::{Family, Query};
+    fn resolves(db: &fontdb::Database, family: Family<'_>) -> bool {
+        db.query(&Query {
+            families: &[family],
+            ..Default::default()
+        })
+        .is_some()
+    }
+    fn first_installed(db: &fontdb::Database, names: &[&str]) -> Option<String> {
+        names
+            .iter()
+            .find(|n| resolves(db, Family::Name(n)))
+            .map(|n| n.to_string())
+            // None of the usual ones: any installed family beats dropping the text.
+            .or_else(|| {
+                db.faces()
+                    .find_map(|f| f.families.first().map(|(name, _)| name.clone()))
+            })
+    }
+    const SANS: &[&str] = &[
+        "DejaVu Sans",
+        "Liberation Sans",
+        "Noto Sans",
+        "FreeSans",
+        "Cantarell",
+        "Ubuntu",
+    ];
+    const SERIF: &[&str] = &[
+        "DejaVu Serif",
+        "Liberation Serif",
+        "Noto Serif",
+        "FreeSerif",
+    ];
+    const MONO: &[&str] = &[
+        "DejaVu Sans Mono",
+        "Liberation Mono",
+        "Noto Sans Mono",
+        "FreeMono",
+    ];
+    if !resolves(db, Family::SansSerif)
+        && let Some(name) = first_installed(db, SANS)
+    {
+        db.set_sans_serif_family(name);
+    }
+    if !resolves(db, Family::Serif)
+        && let Some(name) = first_installed(db, SERIF)
+    {
+        db.set_serif_family(name);
+    }
+    if !resolves(db, Family::Monospace)
+        && let Some(name) = first_installed(db, MONO)
+    {
+        db.set_monospace_family(name);
+    }
+}
 
 /// The shared system-font database, for other SVG parsers (mermaid's vector path).
 pub fn svg_fonts() -> Arc<fontdb::Database> {
