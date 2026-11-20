@@ -1110,7 +1110,7 @@ impl App {
             .to_string();
         let initial_theme = config.themes.resolve(&applied_theme);
         Self {
-            context: RenderContext::new(),
+            context: crate::raster::render_context(),
             renderer: None,
             state: None,
             scene: Scene::new(),

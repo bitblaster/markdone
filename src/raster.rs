@@ -15,6 +15,32 @@ use vello::wgpu::{
 };
 use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
 
+/// A wgpu context for Vello, like [`RenderContext::new`] but without the OpenGL backend
+/// on Windows (`WGPU_BACKEND` still overrides the choice). Vello needs no OpenGL there:
+/// DirectX 12 is always available, with the WARP software renderer when no GPU driver is.
+/// Enumerating OpenGL, instead, loads every installed OpenGL driver into the process,
+/// and a broken one takes it down before any window shows: the leftover VMware Tools
+/// driver in a VM moved to QEMU dies on a privileged instruction.
+pub fn render_context() -> RenderContext {
+    let default_backends = if cfg!(windows) {
+        vello::wgpu::Backends::PRIMARY
+    } else {
+        vello::wgpu::Backends::default()
+    };
+    let backends = vello::wgpu::Backends::from_env().unwrap_or(default_backends);
+    let instance = vello::wgpu::Instance::new(vello::wgpu::InstanceDescriptor {
+        display: None,
+        backends,
+        flags: vello::wgpu::InstanceFlags::from_build_config().with_env(),
+        memory_budget_thresholds: vello::wgpu::MemoryBudgetThresholds::default(),
+        backend_options: vello::wgpu::BackendOptions::from_env_or_default(),
+    });
+    RenderContext {
+        instance,
+        devices: Vec::new(),
+    }
+}
+
 /// Render `scene` onto a `base_color` background of `width`×`height` device px to an
 /// offscreen texture, read the pixels back, and write them to `path` as a PNG. Creates
 /// its own wgpu device (no surface/window), so it runs headlessly; on Asahi set
@@ -26,7 +52,7 @@ pub fn rasterize_scene_to_png(
     base_color: Color,
     path: &str,
 ) -> Result<()> {
-    let mut context = RenderContext::new();
+    let mut context = render_context();
     let dev_id = pollster::block_on(context.device(None))
         .ok_or_else(|| anyhow!("no wgpu device (set WGPU_BACKEND=vulkan on Asahi)"))?;
     let device = &context.devices[dev_id].device;
