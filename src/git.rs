@@ -185,10 +185,26 @@ mod tests {
 
     #[test]
     fn test_detect_github_context_in_repo() {
-        // This test runs from within the writ repo itself
-        let ctx = detect_github_context(std::path::Path::new(".")).unwrap();
-        assert_eq!(ctx.owner, "wilfreddenton");
-        assert_eq!(ctx.repo, "writ");
+        // A throwaway repository with a known `origin`, so the test doesn't depend on the
+        // remotes of the checkout it runs in.
+        let dir = std::env::temp_dir().join(format!("markdone_gitctx_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        gix::init(&dir).unwrap();
+        let config = dir.join(".git").join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(
+            "[remote \"origin\"]\n\turl = git@github.com:acme/widgets.git\n\
+             \tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+        );
+        std::fs::write(&config, text).unwrap();
+        // Started from a document inside the repository (a file: discovery uses its folder).
+        let doc = dir.join("notes.md");
+        std::fs::write(&doc, "# notes\n").unwrap();
+        let ctx = detect_github_context(&doc).unwrap();
+        assert_eq!(ctx.owner, "acme");
+        assert_eq!(ctx.repo, "widgets");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 
