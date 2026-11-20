@@ -92,7 +92,7 @@ pub fn menu_bar(ui: &mut egui::Ui, state: &MenuState) -> Option<Command> {
                         ui.menu_button("View", |ui| {
                             let toc =
                                 egui::Button::selectable(state.outline_open, "Table of Contents")
-                                    .shortcut_text(Command::ToggleOutline.shortcut());
+                                    .shortcut_text(Command::ToggleOutline.shortcut_label());
                             if ui.add(toc).clicked() {
                                 picked = Some(Command::ToggleOutline);
                                 ui.close();
@@ -150,7 +150,7 @@ fn switch_on_hover(ctx: &egui::Context, titles: &[egui::Response]) {
 }
 
 fn item(ui: &mut egui::Ui, label: &str, cmd: Command, enabled: bool, picked: &mut Option<Command>) {
-    let button = egui::Button::new(label).shortcut_text(cmd.shortcut());
+    let button = egui::Button::new(label).shortcut_text(cmd.shortcut_label());
     if ui.add_enabled(enabled, button).clicked() {
         *picked = Some(cmd);
         ui.close();

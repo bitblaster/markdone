@@ -116,6 +116,23 @@ impl Command {
     }
 }
 
+impl Command {
+    /// The shortcut as shown on this platform: macOS menus name Cmd (which the shell
+    /// accepts wherever Ctrl is) and Option instead of Ctrl and Alt. Tab switching keeps
+    /// Ctrl, the key it uses on every platform (as browsers do).
+    pub fn shortcut_label(self) -> std::borrow::Cow<'static, str> {
+        let label = self.shortcut();
+        if cfg!(target_os = "macos") && !matches!(self, Command::NextTab | Command::PrevTab) {
+            label
+                .replace("Ctrl+", "Cmd+")
+                .replace("Alt+", "Option+")
+                .into()
+        } else {
+            label.into()
+        }
+    }
+}
+
 /// The formatting / clipboard command for a key press in the document, if any.
 /// `key` is the logical key, `code` the physical one (digits and the backquote are read
 /// physically: with Shift or AltGr layouts turn them into other characters).

@@ -1659,6 +1659,24 @@ impl App {
             relayout = true;
         }
         self.prefs_save_at = Some(Instant::now() + Duration::from_millis(500));
+        if old.follow_system_theme != self.prefs.follow_system_theme {
+            // Windows/macOS: (un)set the explicit window theme, which decides whether winit
+            // reports the desktop's preference, then read it (Linux: the portal watcher
+            // keeps `system_theme` current regardless).
+            if let Some(state) = self.state.as_ref() {
+                state
+                    .window
+                    .set_theme(decoration_theme(&self.prefs, &self.doc_engine.theme));
+            }
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            {
+                let mode = self.state.as_ref().and_then(|s| s.window.theme());
+                self.system_theme = mode.map(|t| match t {
+                    Theme::Light => ThemeMode::Light,
+                    Theme::Dark => ThemeMode::Dark,
+                });
+            }
+        }
         // A theme, mode or "follow the system" change may change the theme shown.
         if self.update_theme() {
             relayout = true;
@@ -1687,6 +1705,22 @@ impl App {
         true
     }
 
+    /// Windows/macOS: read the desktop's light/dark preference from the window. winit
+    /// reports it only while no explicit window theme is set — i.e. while following the
+    /// system (see [`decoration_theme`]); otherwise it echoes the theme we set, which
+    /// `effective_mode` ignores anyway.
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    fn read_window_system_theme(&mut self) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let mode = state.window.theme().map(|t| match t {
+            Theme::Light => ThemeMode::Light,
+            Theme::Dark => ThemeMode::Dark,
+        });
+        self.on_system_theme(mode);
+    }
+
     /// The desktop's light/dark preference changed (or was first read).
     fn on_system_theme(&mut self, mode: Option<ThemeMode>) {
         self.system_theme = mode;
@@ -1698,11 +1732,9 @@ impl App {
     /// Install a new editor theme: document, chrome and window decoration.
     fn set_theme(&mut self, theme: EditorTheme) {
         if let Some(state) = self.state.as_ref() {
-            state.window.set_theme(Some(if theme.is_light() {
-                Theme::Light
-            } else {
-                Theme::Dark
-            }));
+            state
+                .window
+                .set_theme(decoration_theme(&self.prefs, &theme));
             if let Some(ui) = self.ui.as_mut() {
                 ui.set_theme(&state.window, &theme);
             }
@@ -2515,6 +2547,35 @@ impl App {
 /// demand. ~10 downscaled 1024×728 screenshots.
 const IMAGE_MEMORY_BUDGET: usize = 32 * 1024 * 1024;
 
+/// The application icon for the window: the title bar and taskbar on X11 and Windows
+/// (Wayland takes it from the desktop entry through the app id, macOS from the app
+/// bundle, so winit ignores it there).
+fn app_icon() -> Option<winit::window::Icon> {
+    const PNG: &[u8] = include_bytes!("../packaging/icons/markdone-128.png");
+    let image = image::load_from_memory_with_format(PNG, image::ImageFormat::Png)
+        .ok()?
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    winit::window::Icon::from_rgba(image.into_raw(), width, height).ok()
+}
+
+/// The theme to request for the window decorations: the editor theme's light/dark —
+/// except on Windows/macOS while following the system, where none is requested. The
+/// decorations then follow the desktop by themselves, and only then does winit report the
+/// desktop's preference (`Window::theme`, `ThemeChanged`); an explicit theme silences it.
+/// (Linux takes the preference from the XDG portal and draws its own decorations, so it
+/// always gets the editor's.)
+fn decoration_theme(prefs: &Preferences, theme: &EditorTheme) -> Option<Theme> {
+    if cfg!(not(all(unix, not(target_os = "macos")))) && prefs.follow_system_theme {
+        return None;
+    }
+    Some(if theme.is_light() {
+        Theme::Light
+    } else {
+        Theme::Dark
+    })
+}
+
 /// Install the preferences' text and code fonts. The code font must render fixed-pitch
 /// (code relies on column alignment): a proportional or unloadable family falls back to
 /// the system monospace. Returns `false` when the code font was rejected.
@@ -2901,6 +2962,12 @@ fn apply_key(
     let shift = modifiers.shift_key();
     let alt = modifiers.alt_key();
     let ctrl = modifiers.control_key() || modifiers.super_key();
+    // Text navigation follows the platform: Ctrl moves/deletes by word on Windows and
+    // Linux; on macOS Option does, and Cmd goes to the line (←/→, Backspace/Delete) or
+    // document (↑/↓) boundary.
+    let mac = cfg!(target_os = "macos");
+    let by_word = if mac { alt } else { ctrl };
+    let to_boundary = mac && modifiers.super_key();
     match &event.logical_key {
         Key::Named(NamedKey::Enter) => {
             if shift && alt {
@@ -2912,11 +2979,22 @@ fn apply_key(
             }
             true
         }
-        Key::Named(NamedKey::Backspace) if ctrl => {
+        // macOS Cmd+Backspace / Cmd+Delete: delete to the line start / end.
+        Key::Named(NamedKey::Backspace) if to_boundary => {
+            editor.move_in_direction(Direction::LineStart, true);
+            editor.backspace();
+            true
+        }
+        Key::Named(NamedKey::Delete) if to_boundary => {
+            editor.move_in_direction(Direction::LineEnd, true);
+            editor.delete_forward();
+            true
+        }
+        Key::Named(NamedKey::Backspace) if by_word => {
             editor.delete_word(false);
             true
         }
-        Key::Named(NamedKey::Delete) if ctrl => {
+        Key::Named(NamedKey::Delete) if by_word => {
             editor.delete_word(true);
             true
         }
@@ -2945,11 +3023,27 @@ fn apply_key(
             editor.try_insert_space();
             true
         }
-        Key::Named(NamedKey::ArrowLeft) if ctrl => {
+        // macOS Cmd+arrows: line / document boundaries (Shift extends).
+        Key::Named(
+            arrow @ (NamedKey::ArrowLeft
+            | NamedKey::ArrowRight
+            | NamedKey::ArrowUp
+            | NamedKey::ArrowDown),
+        ) if to_boundary => {
+            let dir = match arrow {
+                NamedKey::ArrowLeft => Direction::LineStart,
+                NamedKey::ArrowRight => Direction::LineEnd,
+                NamedKey::ArrowUp => Direction::DocStart,
+                _ => Direction::DocEnd,
+            };
+            editor.move_in_direction(dir, shift);
+            true
+        }
+        Key::Named(NamedKey::ArrowLeft) if by_word => {
             editor.move_word(false, shift);
             true
         }
-        Key::Named(NamedKey::ArrowRight) if ctrl => {
+        Key::Named(NamedKey::ArrowRight) if by_word => {
             editor.move_word(true, shift);
             true
         }
@@ -3876,7 +3970,7 @@ impl ApplicationHandler<WritEvent> for App {
             // Without unsaved changes, ask only if the preferences say so.
             let editor = &self.doc_engine.editor;
             let ask = editor.is_dirty() || self.prefs.external_change == ExternalChange::Ask;
-            if self.ui.is_some() && ask && !editor.state.buffer.content_eq(&data.0) {
+            if self.ui.is_some() && ask && !editor.matches_disk_text(&data.0) {
                 // A newer disk version replaces the one still waiting for an answer.
                 self.tabs[self.active_tab].conflict = Some(DiskConflict { ticket, data });
                 self.redraw();
@@ -3923,13 +4017,18 @@ impl ApplicationHandler<WritEvent> for App {
         // Native decorations (shadow, rounded corners, resize, snap — all free), but
         // request a dark title bar to match the editor instead of a bright one over
         // dark content. On Wayland CSD this also honors WINIT_WAYLAND_CSD_THEME.
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title(self.title.clone())
-            .with_theme(Some(if self.doc_engine.theme.is_light() {
-                Theme::Light
-            } else {
-                Theme::Dark
-            }));
+            .with_window_icon(app_icon())
+            .with_theme(decoration_theme(&self.prefs, &self.doc_engine.theme));
+        // MARKDONE_WINDOW_SIZE=<width>x<height> (logical px): the initial window size, for
+        // screenshots at a known size.
+        if let Some((w, h)) = std::env::var("MARKDONE_WINDOW_SIZE").ok().and_then(|v| {
+            let (w, h) = v.split_once('x')?;
+            Some((w.trim().parse::<f64>().ok()?, h.trim().parse::<f64>().ok()?))
+        }) {
+            attrs = attrs.with_inner_size(winit::dpi::LogicalSize::new(w, h));
+        }
         // Application id (Wayland app_id / X11 WM_CLASS): matches `markdone.desktop`,
         // so the desktop shows the right icon and groups the windows.
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -4005,6 +4104,9 @@ impl ApplicationHandler<WritEvent> for App {
             find_bar_h: 0.0,
             menu_bar,
         });
+        // Windows/macOS: the desktop's light/dark preference comes from the window.
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        self.read_window_system_theme();
         // Validate refs already present in the loaded file, and start loading images
         // (spawn_validations already calls sync_images).
         self.spawn_validations();

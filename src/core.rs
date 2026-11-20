@@ -128,9 +128,38 @@ pub struct FindState {
     scanned: Option<(u64, String, bool, bool)>,
 }
 
+/// A file's line-ending convention. The buffer always holds `\n` line breaks; a CRLF
+/// file (Windows) is converted on load and written back as CRLF on save, so editing it
+/// doesn't rewrite every line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineEnding {
+    #[default]
+    Lf,
+    Crlf,
+}
+
+/// Split a file's text into the buffer form (`\n` breaks only) and its convention: CRLF
+/// when its first line break is `\r\n`. Any `\r\n` or lone `\r` becomes `\n` (a `\r`
+/// left in the buffer would count as an extra line break). Borrows when already LF.
+pub fn normalize_line_endings(text: &str) -> (std::borrow::Cow<'_, str>, LineEnding) {
+    let ending = match text.find(['\r', '\n']) {
+        Some(i) if text[i..].starts_with("\r\n") => LineEnding::Crlf,
+        _ => LineEnding::Lf,
+    };
+    if !text.contains('\r') {
+        return (std::borrow::Cow::Borrowed(text), ending);
+    }
+    (
+        std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n")),
+        ending,
+    )
+}
+
 pub struct Editor {
     pub state: EditorState,
     file_path: Option<PathBuf>,
+    /// Line endings of the file, restored on save (the buffer holds `\n` only).
+    line_ending: LineEnding,
     input_blocked: bool,
     /// When set (via `--autosave`, used by the GhostText daemon), every buffer edit
     /// writes back to `file_path` so an external watcher sees the change immediately.
@@ -245,6 +274,7 @@ impl Editor {
         Self {
             state: EditorState::new(content),
             file_path: None,
+            line_ending: LineEnding::Lf,
             input_blocked: false,
             autosave: false,
             github_context: None,
@@ -271,8 +301,10 @@ impl Editor {
     /// Open a file from disk into a fresh editor. Loads content and refreshes the
     /// git diff base. Returns an empty buffer if the file can't be read.
     pub fn open(path: &Path) -> Self {
-        let content = std::fs::read_to_string(path).unwrap_or_default();
+        let raw = std::fs::read_to_string(path).unwrap_or_default();
+        let (content, line_ending) = normalize_line_endings(&raw);
         let mut editor = Self::new(&content);
+        editor.line_ending = line_ending;
         editor.file_path = Some(path.to_path_buf());
         editor.note_disk_state();
         editor.refresh_git_base();
@@ -286,6 +318,16 @@ impl Editor {
 
     pub fn set_file_path(&mut self, path: PathBuf) {
         self.file_path = Some(path);
+    }
+
+    /// The file's line-ending convention (written back on save).
+    pub fn line_ending(&self) -> LineEnding {
+        self.line_ending
+    }
+
+    /// Whether the raw text of the file on disk matches the buffer, line endings aside.
+    pub fn matches_disk_text(&self, raw: &str) -> bool {
+        self.state.buffer.content_eq(&normalize_line_endings(raw).0)
     }
 
     // --- buffer queries -----------------------------------------------------
@@ -1764,6 +1806,12 @@ impl Editor {
     /// Build a diff-base entry — the base text paired with its render snapshot — parsing
     /// and snapshotting `text`. Parsing a `Buffer` is infallible.
     fn make_head_base(text: String) -> (String, RenderSnapshot) {
+        // Compare like with like: the buffer holds `\n` breaks, whatever HEAD stores.
+        let text = if text.contains('\r') {
+            normalize_line_endings(&text).0.into_owned()
+        } else {
+            text
+        };
         let mut base: Buffer = text.parse().expect("Buffer parsing is infallible");
         let snapshot = base.render_snapshot();
         (text, snapshot)
@@ -1795,9 +1843,24 @@ impl Editor {
             return Ok(());
         };
         // Stream the rope's chunks straight to the file — no whole-document String alloc.
+        // A CRLF file gets its `\r\n` breaks back (a chunk never splits a `\n`).
         let file = std::fs::File::create(&path)?;
         let mut writer = std::io::BufWriter::new(file);
-        self.state.buffer.rope().write_to(&mut writer)?;
+        match self.line_ending {
+            LineEnding::Lf => self.state.buffer.rope().write_to(&mut writer)?,
+            LineEnding::Crlf => {
+                for chunk in self.state.buffer.rope().chunks() {
+                    let mut lines = chunk.split('\n');
+                    if let Some(first) = lines.next() {
+                        writer.write_all(first.as_bytes())?;
+                    }
+                    for line in lines {
+                        writer.write_all(b"\r\n")?;
+                        writer.write_all(line.as_bytes())?;
+                    }
+                }
+            }
+        }
         // BufWriter's drop ignores flush errors; only a confirmed write is a save.
         writer.flush()?;
         if let Ok(metadata) = std::fs::metadata(&path) {
@@ -1891,7 +1954,9 @@ impl Editor {
         self.apply_git_base(base_text);
     }
 
-    pub(crate) fn apply_file_content(&mut self, content: String) {
+    pub(crate) fn apply_file_content(&mut self, raw: String) {
+        let (content, line_ending) = normalize_line_endings(&raw);
+        self.line_ending = line_ending;
         if !self.state.buffer.content_eq(&content) {
             // Persist folds across the reload: remap their offsets from the actual
             // splice (external edits are usually a localized change), the same way a
@@ -2341,6 +2406,62 @@ let code = target(); // fenced block line
         );
         // Plain text position → no link.
         assert_eq!(e.link_at(0), None);
+    }
+
+    /// A CRLF file (Windows) opens with `\n` breaks only — no stray `\r` counted as extra
+    /// lines — and is written back as CRLF, edits included; a reload keeps the
+    /// convention, and comparing with the disk ignores it.
+    #[test]
+    fn crlf_files_round_trip() {
+        let dir = std::env::temp_dir().join(format!("markdone_crlf_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("win.md");
+        std::fs::write(&path, "# Title\r\n\r\n- one\r\n- two\r\n").unwrap();
+
+        let mut e = Editor::open(&path);
+        assert_eq!(e.text(), "# Title\n\n- one\n- two\n");
+        assert_eq!(e.line_ending(), LineEnding::Crlf);
+        assert!(e.matches_disk_text("# Title\r\n\r\n- one\r\n- two\r\n"));
+
+        let end = e.text().len();
+        e.set_cursor(end);
+        e.insert_str("- three\n");
+        e.save().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# Title\r\n\r\n- one\r\n- two\r\n- three\r\n"
+        );
+
+        e.apply_file_content("# New\r\nbody\r\n".to_string());
+        assert_eq!(e.text(), "# New\nbody\n");
+        assert_eq!(e.line_ending(), LineEnding::Crlf);
+        // An LF file stays LF.
+        e.apply_file_content("# Unix\n".to_string());
+        assert_eq!(e.line_ending(), LineEnding::Lf);
+        e.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# Unix\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn line_endings_normalize() {
+        assert_eq!(
+            normalize_line_endings("a\nb"),
+            ("a\nb".into(), LineEnding::Lf)
+        );
+        assert_eq!(
+            normalize_line_endings("a\r\nb\r\n"),
+            ("a\nb\n".into(), LineEnding::Crlf)
+        );
+        // Mixed: the first break decides; every `\r` goes.
+        assert_eq!(
+            normalize_line_endings("a\nb\r\n"),
+            ("a\nb\n".into(), LineEnding::Lf)
+        );
+        assert_eq!(
+            normalize_line_endings("a\rb"),
+            ("a\nb".into(), LineEnding::Lf)
+        );
     }
 
     /// Ctrl-click resolution: a relative link/image target resolves against the doc's
