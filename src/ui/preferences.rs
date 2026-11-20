@@ -144,6 +144,26 @@ pub fn show(
             "Reads the repository from .git/config and contacts api.github.com. \
                  Applies to documents opened after the change.",
         );
+        // Always shown; editable only while the lookups are on.
+        ui.add_enabled_ui(prefs.github, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("GitHub token");
+                let mut token = prefs.github_token.clone().unwrap_or_default();
+                let field = egui::TextEdit::singleline(&mut token)
+                    .password(true)
+                    .hint_text("needed to check the references")
+                    .desired_width(260.0);
+                if ui.add(field).changed() {
+                    let token = token.trim();
+                    prefs.github_token = (!token.is_empty()).then(|| token.to_string());
+                }
+            });
+            note(
+                ui,
+                "Stored in plain text in the configuration file. --github-token or the \
+                 GITHUB_TOKEN variable take precedence.",
+            );
+        });
 
         ui.add_space(6.0);
         ui.separator();

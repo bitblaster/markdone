@@ -145,6 +145,9 @@ pub struct Preferences {
     /// Look up GitHub references (issues, PRs, users) found in documents: reads the
     /// repository from `.git/config` and calls api.github.com.
     pub github: bool,
+    /// GitHub API token for those lookups (validation, hover cards, autocomplete); stored
+    /// in plain text in the config file. `--github-token` / `GITHUB_TOKEN` take precedence.
+    pub github_token: Option<String>,
 }
 
 #[cfg(feature = "app")]
@@ -165,6 +168,7 @@ impl Default for Preferences {
             external_change: ExternalChange::Reload,
             check_on_focus: true,
             github: false,
+            github_token: None,
         }
     }
 }
@@ -302,6 +306,8 @@ struct FilesSpec {
 #[serde(deny_unknown_fields)]
 struct NetworkSpec {
     github: Option<bool>,
+    /// GitHub API token for the reference lookups (stored in plain text).
+    github_token: Option<String>,
 }
 
 #[cfg(feature = "app")]
@@ -535,10 +541,16 @@ fn resolve(file: FileConfig) -> ResolvedConfig {
             cfg.prefs.check_on_focus = check;
         }
     }
-    if let Some(network) = &file.network
-        && let Some(github) = network.github
-    {
-        cfg.prefs.github = github;
+    if let Some(network) = &file.network {
+        if let Some(github) = network.github {
+            cfg.prefs.github = github;
+        }
+        cfg.prefs.github_token = network
+            .github_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
     }
     cfg
 }
@@ -598,24 +610,27 @@ pub fn save_preferences(path: &Path, prefs: &Preferences) -> std::io::Result<()>
     if let Some(t) = doc.get_mut("theme").and_then(Item::as_table_like_mut) {
         t.remove("name");
     }
-    // Font families: a family left at the system default is removed, not written empty.
-    let font = doc
-        .entry("font")
-        .or_insert_with(|| Item::Table(Table::new()));
-    if let Some(t) = font.as_table_like_mut() {
-        for (key, family) in [
-            ("family", &prefs.font_family),
-            ("code_family", &prefs.code_font_family),
-        ] {
-            match family {
-                // Rewrite only a changed value, so an inline comment on it survives.
-                Some(f) if t.get(key).and_then(Item::as_str) != Some(f.as_str()) => {
-                    t.insert(key, value(f.as_str()));
-                }
-                Some(_) => {}
-                None => {
-                    t.remove(key);
-                }
+    // Optional strings (font families, the GitHub token): one left at its default is
+    // removed rather than written empty; an unchanged value isn't rewritten, so an inline
+    // comment on it survives.
+    for (table, key, setting) in [
+        ("font", "family", &prefs.font_family),
+        ("font", "code_family", &prefs.code_font_family),
+        ("network", "github_token", &prefs.github_token),
+    ] {
+        let entry = doc
+            .entry(table)
+            .or_insert_with(|| Item::Table(Table::new()));
+        let Some(t) = entry.as_table_like_mut() else {
+            continue;
+        };
+        match setting {
+            Some(v) if t.get(key).and_then(Item::as_str) != Some(v.as_str()) => {
+                t.insert(key, value(v.as_str()));
+            }
+            Some(_) => {}
+            None => {
+                t.remove(key);
             }
         }
     }
@@ -753,6 +768,20 @@ mod tests {
         assert!(!d.github);
     }
 
+    /// The documented example must stay a valid config (unknown keys are rejected).
+    #[test]
+    fn example_config_parses() {
+        let text = include_str!("../config.example.toml");
+        let file: FileConfig = toml::from_str(text).expect("config.example.toml must parse");
+        let cfg = resolve(file);
+        assert_eq!(
+            cfg.prefs.code_font_family.as_deref(),
+            Some("JetBrains Mono")
+        );
+        assert_eq!(cfg.prefs.light_theme, "catppuccin-latte");
+        assert!(cfg.theme_names.iter().any(|n| n == "my-midnight"));
+    }
+
     #[test]
     fn light_and_dark_themes_and_mode() {
         let f: FileConfig = toml::from_str(
@@ -847,6 +876,7 @@ mod tests {
             external_change: ExternalChange::Ask,
             check_on_focus: false,
             github: true,
+            github_token: Some("ghp_example".into()),
         };
         save_preferences(&path, &prefs).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -856,6 +886,7 @@ mod tests {
             "unchanged family keeps its comment: {text}"
         );
         assert!(text.contains("code_family = \"Hack\""), "{text}");
+        assert!(text.contains("github_token = \"ghp_example\""), "{text}");
         assert!(text.contains("[themes.mine]"));
         assert!(
             !text.contains("name = \"nord\""),
@@ -871,11 +902,15 @@ mod tests {
         let defaults = Preferences {
             font_family: None,
             code_font_family: None,
+            github_token: None,
             ..prefs.clone()
         };
         save_preferences(&path, &defaults).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("family"), "{text}");
+        assert!(
+            !text.contains("family") && !text.contains("github_token"),
+            "{text}"
+        );
         assert_eq!(load(Some(&path)).prefs, defaults);
 
         // A file that is not valid TOML is never overwritten.

@@ -1633,6 +1633,7 @@ impl App {
             return;
         }
         self.github.enabled = self.prefs.github;
+        self.github.pref_token = self.prefs.github_token.clone();
         let mut relayout = false;
         if old.font_size != self.prefs.font_size {
             self.doc_engine.font_size = self.prefs.font_size;
@@ -5906,6 +5907,7 @@ fn startup_from_cli() -> Option<Startup> {
         enabled: app_config.prefs.github,
         repo: config.github_repo.clone(),
         token: config.github_token.clone(),
+        pref_token: app_config.prefs.github_token.clone(),
     };
     // `--demo`: showcase doc with a synthetic HEAD diff (no file needed).
     if config.demo {
@@ -6035,8 +6037,10 @@ struct GithubSetup {
     enabled: bool,
     /// `--github-repo`: the repository, instead of detecting it from `.git/config`.
     repo: Option<String>,
-    /// `--github-token` / `GITHUB_TOKEN`.
+    /// `--github-token` / `GITHUB_TOKEN`; takes precedence over `pref_token`.
     token: Option<String>,
+    /// The token set in the preferences.
+    pref_token: Option<String>,
 }
 
 /// Open a document: load it, set up GitHub lookups if enabled, detect links and watch
@@ -6054,7 +6058,7 @@ fn open_document(path: &Path, github: &GithubSetup, autosave: bool) -> Editor {
         if let Some(ctx) = context {
             editor.set_github_context(ctx);
         }
-        if let Some(token) = github.token.clone() {
+        if let Some(token) = github.token.clone().or_else(|| github.pref_token.clone()) {
             editor.set_github_client(GitHubClient::new(token));
         }
     }
