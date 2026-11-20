@@ -177,8 +177,8 @@ pub type LineCache = SweptCache<Rc<parley::Layout<Brush>>>;
 /// cursor sits on it (`cursor_key` = the offset when on-line, else a sentinel — an
 /// off-line render is cursor-independent). Lines carrying GitHub `extra_regions`
 /// bypass the cache (those can change without a version bump, on validation).
-/// Half-open range overlap: do `a` and `b` share at least one offset?
-#[cfg(any(feature = "mermaid", feature = "math"))]
+/// Half-open range overlap: do `a` and `b` share at least one offset? (The reveal rule of
+/// code blocks, mermaid and math blocks.)
 fn ranges_overlap(a: &Range<usize>, b: &Range<usize>) -> bool {
     a.start < b.end && b.start < a.end
 }
@@ -1303,9 +1303,6 @@ impl DocLayout {
         // Inline `$…$` math spans per line (empty when the `math` feature is off).
         math_spans: &HashMap<usize, Vec<MathSpan>>,
     ) -> Self {
-        // `selection` is only read by the mermaid/math reveal predicates.
-        #[cfg(not(any(feature = "mermaid", feature = "math")))]
-        let _ = selection;
         let LayoutParams {
             content_x0,
             content_w,
@@ -2066,7 +2063,9 @@ impl DocLayout {
         self.tops[line] + self.ghost_height[line]
     }
 
-    /// The materialized band `[measured_start, measured_count)`, for diagnostics.
+    /// The materialized band `[measured_start, measured_count)`, for diagnostics (the
+    /// shell's scroll trace).
+    #[cfg(feature = "app")]
     pub(crate) fn measured_band(&self) -> (usize, usize) {
         (self.measured_start, self.measured_count)
     }
