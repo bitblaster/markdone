@@ -41,7 +41,9 @@ fn socket_name() -> io::Result<Name<'static>> {
         std::env::temp_dir().join(format!("markdone-{user}"))
     });
     std::fs::create_dir_all(&dir)?;
-    dir.join("markdone.sock").to_fs_name::<GenericFilePath>().map(|n| n.into_owned())
+    dir.join("markdone.sock")
+        .to_fs_name::<GenericFilePath>()
+        .map(|n| n.into_owned())
 }
 
 #[cfg(windows)]
@@ -66,13 +68,19 @@ pub fn claim(paths: &[PathBuf]) -> Instance {
         return match forward(stream, paths) {
             Ok(()) => Instance::Forwarded,
             Err(e) => {
-                eprintln!("[markdone] the running instance did not answer ({e}); starting a new one");
+                eprintln!(
+                    "[markdone] the running instance did not answer ({e}); starting a new one"
+                );
                 Instance::Standalone
             }
         };
     }
     // Nobody listening: take the name over (a stale socket file is replaced).
-    match ListenerOptions::new().name(name).try_overwrite(true).create_sync() {
+    match ListenerOptions::new()
+        .name(name)
+        .try_overwrite(true)
+        .create_sync()
+    {
         Ok(listener) => Instance::Primary(listener),
         Err(e) => {
             eprintln!("[markdone] cannot listen for other launches: {e}");
@@ -88,7 +96,9 @@ fn forward(mut stream: Stream, paths: &[PathBuf]) -> io::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut answer = String::new();
-        let result = BufReader::new(stream).read_line(&mut answer).map(|_| answer);
+        let result = BufReader::new(stream)
+            .read_line(&mut answer)
+            .map(|_| answer);
         let _ = tx.send(result);
     });
     match rx.recv_timeout(ACK_TIMEOUT) {
@@ -137,7 +147,10 @@ fn read_paths(reader: &mut impl BufRead) -> io::Result<Vec<PathBuf>> {
         let mut record = Vec::new();
         let n = reader.read_until(0, &mut record)?;
         if n == 0 || record.last() != Some(&0) {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated request"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated request",
+            ));
         }
         record.pop();
         if record.is_empty() {
@@ -186,7 +199,10 @@ mod tests {
         let bytes = encode(&paths);
         assert_eq!(read_paths(&mut &bytes[..]).unwrap(), paths);
         // No files: just the end record.
-        assert_eq!(read_paths(&mut &encode(&[])[..]).unwrap(), Vec::<PathBuf>::new());
+        assert_eq!(
+            read_paths(&mut &encode(&[])[..]).unwrap(),
+            Vec::<PathBuf>::new()
+        );
         // A truncated request is an error, not a partial open.
         assert!(read_paths(&mut &bytes[..bytes.len() - 1]).is_err());
     }
@@ -197,7 +213,11 @@ mod tests {
     fn a_second_launch_forwards_its_files() {
         use interprocess::local_socket::GenericFilePath;
         let path = std::env::temp_dir().join(format!("markdone-test-{}.sock", std::process::id()));
-        let name = path.clone().to_fs_name::<GenericFilePath>().unwrap().into_owned();
+        let name = path
+            .clone()
+            .to_fs_name::<GenericFilePath>()
+            .unwrap()
+            .into_owned();
         let listener = ListenerOptions::new()
             .name(name.clone())
             .try_overwrite(true)

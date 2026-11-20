@@ -193,13 +193,13 @@ impl MarkdownParser {
             key.clear();
             key.extend(ranges.iter().map(|r| (r.start_byte, r.end_byte)));
             let (inline_tree, styles) = match (reusable.get(key.as_slice()), old_tree) {
-                (Some(&j), Some(old)) => (old.inline_trees[j].clone(), old.inline_styles[j].clone()),
+                (Some(&j), Some(old)) => {
+                    (old.inline_trees[j].clone(), old.inline_styles[j].clone())
+                }
                 _ => {
                     parser.set_included_ranges(&ranges).ok()?;
                     let tree = parser.parse_with_options(
-                        callback,
-                        None,
-                        None, // No progress callback
+                        callback, None, None, // No progress callback
                     )?;
                     (tree, OnceLock::new())
                 }
@@ -255,7 +255,12 @@ mod tests {
     /// with equal dumps are indistinguishable to every consumer.
     fn dump(tree: &MarkdownTree) -> String {
         fn walk(node: tree_sitter::Node, out: &mut String) {
-            out.push_str(&format!("{}[{}..{}]", node.kind(), node.start_byte(), node.end_byte()));
+            out.push_str(&format!(
+                "{}[{}..{}]",
+                node.kind(),
+                node.start_byte(),
+                node.end_byte()
+            ));
             let mut c = node.walk();
             for child in node.children(&mut c) {
                 out.push('(');
@@ -294,7 +299,9 @@ mod tests {
             .unwrap_or_else(|| base.repeat(4));
         let mut parser = MarkdownParser::default();
         let mut tree = parser.parse(text.as_bytes(), None).unwrap();
-        let inserts = ["a", " ", "\n", "|", "*", "`", "**b**", "\n\n", "# ", "> ", "x | y"];
+        let inserts = [
+            "a", " ", "\n", "|", "*", "`", "**b**", "\n\n", "# ", "> ", "x | y",
+        ];
         let mut seed: u64 = 0x9e3779b97f4a7c15;
         let mut rnd = |n: usize| {
             seed ^= seed << 13;
@@ -331,7 +338,9 @@ mod tests {
                 new_end_position,
             });
             tree = parser.parse(text.as_bytes(), Some(&tree)).unwrap();
-            let fresh = MarkdownParser::default().parse(text.as_bytes(), None).unwrap();
+            let fresh = MarkdownParser::default()
+                .parse(text.as_bytes(), None)
+                .unwrap();
             assert_eq!(
                 dump(&tree),
                 dump(&fresh),

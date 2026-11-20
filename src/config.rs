@@ -243,7 +243,10 @@ impl Default for ResolvedConfig {
             themes: ThemeSet::default(),
             font_size: FONT_SIZE,
             prefs: Preferences::default(),
-            theme_names: EditorTheme::BUILTIN_NAMES.iter().map(|n| n.to_string()).collect(),
+            theme_names: EditorTheme::BUILTIN_NAMES
+                .iter()
+                .map(|n| n.to_string())
+                .collect(),
         }
     }
 }
@@ -471,7 +474,9 @@ fn resolve(file: FileConfig) -> ResolvedConfig {
             cfg.prefs.follow_system_theme = follow;
         }
     }
-    cfg.theme = cfg.themes.resolve(cfg.prefs.theme_for(cfg.prefs.theme_mode));
+    cfg.theme = cfg
+        .themes
+        .resolve(cfg.prefs.theme_for(cfg.prefs.theme_mode));
     if let Some(font) = &file.font {
         let name = |f: &Option<String>| {
             f.as_deref()
@@ -557,7 +562,9 @@ pub fn save_preferences(path: &Path, prefs: &Preferences) -> std::io::Result<()>
         )
     })?;
     let mut set = |table: &str, key: &str, item: Item| {
-        let entry = doc.entry(table).or_insert_with(|| Item::Table(Table::new()));
+        let entry = doc
+            .entry(table)
+            .or_insert_with(|| Item::Table(Table::new()));
         if let Some(t) = entry.as_table_like_mut() {
             t.insert(key, item);
         }
@@ -579,7 +586,11 @@ pub fn save_preferences(path: &Path, prefs: &Preferences) -> std::io::Result<()>
     set("editor", "max_width", number(prefs.max_width));
     set("editor", "line_numbers", value(prefs.line_numbers));
     set("editor", "git_diff", value(prefs.git_diff));
-    set("files", "on_external_change", value(prefs.external_change.key()));
+    set(
+        "files",
+        "on_external_change",
+        value(prefs.external_change.key()),
+    );
     set("files", "check_on_focus", value(prefs.check_on_focus));
     set("network", "github", value(prefs.github));
     // The pre-modes single theme name is superseded by `dark`/`light`/`mode` (left in place
@@ -588,7 +599,9 @@ pub fn save_preferences(path: &Path, prefs: &Preferences) -> std::io::Result<()>
         t.remove("name");
     }
     // Font families: a family left at the system default is removed, not written empty.
-    let font = doc.entry("font").or_insert_with(|| Item::Table(Table::new()));
+    let font = doc
+        .entry("font")
+        .or_insert_with(|| Item::Table(Table::new()));
     if let Some(t) = font.as_table_like_mut() {
         for (key, family) in [
             ("family", &prefs.font_family),
@@ -695,7 +708,10 @@ mod tests {
         let cfg = resolve(f);
         assert_eq!(cfg.prefs.font_family.as_deref(), Some("JetBrains Mono"));
         // An old config (no `code_family`): `family` was the whole document's font.
-        assert_eq!(cfg.prefs.code_font_family.as_deref(), Some("JetBrains Mono"));
+        assert_eq!(
+            cfg.prefs.code_font_family.as_deref(),
+            Some("JetBrains Mono")
+        );
         assert_eq!(cfg.font_size, 20.0);
     }
 
@@ -750,15 +766,24 @@ mod tests {
         assert_eq!(cfg.prefs.theme_mode, ThemeMode::Light);
         assert!(cfg.prefs.follow_system_theme);
         // The chosen mode's theme is the one resolved at startup.
-        assert_eq!(cfg.theme.background, EditorTheme::solarized_light().background);
+        assert_eq!(
+            cfg.theme.background,
+            EditorTheme::solarized_light().background
+        );
         // Following the system: its preference wins when known, else the chosen mode.
-        assert_eq!(cfg.prefs.effective_mode(Some(ThemeMode::Dark)), ThemeMode::Dark);
+        assert_eq!(
+            cfg.prefs.effective_mode(Some(ThemeMode::Dark)),
+            ThemeMode::Dark
+        );
         assert_eq!(cfg.prefs.effective_mode(None), ThemeMode::Light);
         let fixed = Preferences {
             follow_system_theme: false,
             ..cfg.prefs.clone()
         };
-        assert_eq!(fixed.effective_mode(Some(ThemeMode::Dark)), ThemeMode::Light);
+        assert_eq!(
+            fixed.effective_mode(Some(ThemeMode::Dark)),
+            ThemeMode::Light
+        );
     }
 
     /// A pre-modes config's single `name` fills the slot matching its background and
@@ -767,7 +792,10 @@ mod tests {
     fn legacy_theme_name_maps_to_its_mode() {
         let dark: FileConfig = toml::from_str("[theme]\nname = \"nord\"").unwrap();
         let cfg = resolve(dark);
-        assert_eq!((cfg.prefs.dark_theme.as_str(), cfg.prefs.theme_mode), ("nord", ThemeMode::Dark));
+        assert_eq!(
+            (cfg.prefs.dark_theme.as_str(), cfg.prefs.theme_mode),
+            ("nord", ThemeMode::Dark)
+        );
         assert_eq!(cfg.prefs.light_theme, Preferences::default().light_theme);
         let light: FileConfig = toml::from_str("[theme]\nname = \"catppuccin-latte\"").unwrap();
         let cfg = resolve(light);
@@ -781,7 +809,13 @@ mod tests {
             toml::from_str("[themes.zeta]\nbackground = \"#000000\"\n[themes.alpha]\n").unwrap();
         let names = resolve(file).theme_names;
         let n = EditorTheme::BUILTIN_NAMES.len();
-        assert_eq!(names[..n], EditorTheme::BUILTIN_NAMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()[..]);
+        assert_eq!(
+            names[..n],
+            EditorTheme::BUILTIN_NAMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()[..]
+        );
         assert_eq!(names[n..], ["alpha".to_string(), "zeta".to_string()]);
     }
 
@@ -817,10 +851,16 @@ mod tests {
         save_preferences(&path, &prefs).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# my comment"));
-        assert!(text.contains("# inline"), "unchanged family keeps its comment: {text}");
+        assert!(
+            text.contains("# inline"),
+            "unchanged family keeps its comment: {text}"
+        );
         assert!(text.contains("code_family = \"Hack\""), "{text}");
         assert!(text.contains("[themes.mine]"));
-        assert!(!text.contains("name = \"nord\""), "legacy theme name removed: {text}");
+        assert!(
+            !text.contains("name = \"nord\""),
+            "legacy theme name removed: {text}"
+        );
         assert!(text.contains("mode = \"dark\"") && text.contains("follow_system = true"));
         assert!(text.contains("size = 20\n"), "{text}");
         let loaded = load(Some(&path));

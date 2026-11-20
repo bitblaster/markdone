@@ -659,7 +659,10 @@ mod tests {
         // A plain egui context does zoom on this event (so the test exercises it)…
         let plain = egui::Context::default();
         press(&plain);
-        assert!(plain.zoom_factor() > 1.0, "the event should trigger egui's zoom");
+        assert!(
+            plain.zoom_factor() > 1.0,
+            "the event should trigger egui's zoom"
+        );
         // …ours does not.
         let ctx = new_context();
         press(&ctx);

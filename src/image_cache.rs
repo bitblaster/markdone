@@ -117,10 +117,7 @@ pub fn draw_paint(
         return;
     }
     let transform = vello::kurbo::Affine::translate((x, y))
-        * vello::kurbo::Affine::scale_non_uniform(
-            (dest_w / nat_w) as f64,
-            (dest_h / nat_h) as f64,
-        );
+        * vello::kurbo::Affine::scale_non_uniform((dest_w / nat_w) as f64, (dest_h / nat_h) as f64);
     match paint {
         ImagePaint::Raster(brush) => scene.draw_image(brush, transform),
         ImagePaint::Vector(fragment) => scene.append(fragment, Some(transform)),
@@ -235,7 +232,10 @@ impl ImageCache {
         for state in inner.states.values_mut() {
             if let ImageState::Loaded(img) = state {
                 let (display_w, display_h) = (img.display_w, img.display_h);
-                *state = ImageState::Evicted { display_w, display_h };
+                *state = ImageState::Evicted {
+                    display_w,
+                    display_h,
+                };
             }
         }
     }
@@ -327,7 +327,13 @@ impl ImageCache {
         for url in evict {
             if let Some(ImageState::Loaded(img)) = states.get(&url) {
                 let (display_w, display_h) = (img.display_w, img.display_h);
-                states.insert(url, ImageState::Evicted { display_w, display_h });
+                states.insert(
+                    url,
+                    ImageState::Evicted {
+                        display_w,
+                        display_h,
+                    },
+                );
             }
         }
         (total, evicted)
@@ -522,13 +528,19 @@ mod tests {
         // An evicted image reports its size and can be reloaded once.
         let url = evicted[0];
         match cache.get(url) {
-            Some(ImageState::Evicted { display_w, display_h }) => {
+            Some(ImageState::Evicted {
+                display_w,
+                display_h,
+            }) => {
                 assert_eq!((display_w, display_h), (10.0, 10.0))
             }
             _ => unreachable!(),
         }
         assert!(cache.begin_evictable_load(url));
-        assert!(!cache.begin_evictable_load(url), "second claim while in flight");
+        assert!(
+            !cache.begin_evictable_load(url),
+            "second claim while in flight"
+        );
         assert!(matches!(cache.get(url), Some(ImageState::Evicted { .. })));
     }
 
@@ -542,17 +554,29 @@ mod tests {
         assert!(cache.begin_render("mermaid:2")); // still rendering when parked
         cache.park();
         for key in ["img", "mermaid:1"] {
-            assert!(matches!(cache.get(key), Some(ImageState::Evicted { .. })), "{key}");
+            assert!(
+                matches!(cache.get(key), Some(ImageState::Evicted { .. })),
+                "{key}"
+            );
         }
         cache.set_loaded("mermaid:2", decode(&tiny_png(8, 8)).unwrap());
-        assert!(matches!(cache.get("mermaid:2"), Some(ImageState::Evicted { .. })));
+        assert!(matches!(
+            cache.get("mermaid:2"),
+            Some(ImageState::Evicted { .. })
+        ));
         assert_eq!(cache.memory_stats(), (0, 0));
         // Active again: evicted renders can be re-rendered and are kept.
         cache.unpark();
         assert!(cache.begin_render("mermaid:1"));
         cache.set_loaded("mermaid:1", decode(&tiny_png(8, 8)).unwrap());
-        assert!(matches!(cache.get("mermaid:1"), Some(ImageState::Loaded(_))));
-        assert!(!cache.begin_render("mermaid:1"), "loaded renders are not redone");
+        assert!(matches!(
+            cache.get("mermaid:1"),
+            Some(ImageState::Loaded(_))
+        ));
+        assert!(
+            !cache.begin_render("mermaid:1"),
+            "loaded renders are not redone"
+        );
     }
 
     #[test]

@@ -34,83 +34,96 @@ pub fn menu_bar(ui: &mut egui::Ui, state: &MenuState) -> Option<Command> {
                 .config(config)
                 .ui(ui, |ui| {
                     let mut titles: Vec<egui::Response> = Vec::with_capacity(4);
-                    titles.push(ui.menu_button("File", |ui| {
-                        item(ui, "New", Command::New, true, &mut picked);
-                        item(ui, "Open…", Command::Open, true, &mut picked);
-                        ui.menu_button("Open Recent", |ui| {
-                            if state.recent.is_empty() {
-                                ui.add_enabled(false, egui::Button::new("No Recent Files"));
-                            }
-                            for (i, (name, dir)) in state.recent.iter().enumerate() {
-                                let button =
-                                    egui::Button::new(name.as_str()).shortcut_text(dir.as_str());
-                                if ui.add(button).clicked() {
-                                    picked = Some(Command::OpenRecent(i));
-                                    ui.close();
+                    titles.push(
+                        ui.menu_button("File", |ui| {
+                            item(ui, "New", Command::New, true, &mut picked);
+                            item(ui, "Open…", Command::Open, true, &mut picked);
+                            ui.menu_button("Open Recent", |ui| {
+                                if state.recent.is_empty() {
+                                    ui.add_enabled(false, egui::Button::new("No Recent Files"));
                                 }
+                                for (i, (name, dir)) in state.recent.iter().enumerate() {
+                                    let button = egui::Button::new(name.as_str())
+                                        .shortcut_text(dir.as_str());
+                                    if ui.add(button).clicked() {
+                                        picked = Some(Command::OpenRecent(i));
+                                        ui.close();
+                                    }
+                                }
+                                ui.separator();
+                                let any = !state.recent.is_empty();
+                                item(ui, "Clear Recent", Command::ClearRecent, any, &mut picked);
+                            });
+                            ui.separator();
+                            item(ui, "Save", Command::Save, true, &mut picked);
+                            item(ui, "Save As…", Command::SaveAs, true, &mut picked);
+                            item(ui, "Reload", Command::Reload, state.has_file, &mut picked);
+                            item(ui, "Export as PDF…", Command::ExportPdf, true, &mut picked);
+                            ui.separator();
+                            item(ui, "Close Tab", Command::CloseTab, true, &mut picked);
+                            item(ui, "Quit", Command::Quit, true, &mut picked);
+                        })
+                        .response,
+                    );
+                    titles.push(
+                        ui.menu_button("Edit", |ui| {
+                            item(ui, "Undo", Command::Undo, true, &mut picked);
+                            item(ui, "Redo", Command::Redo, true, &mut picked);
+                            ui.separator();
+                            item(ui, "Cut", Command::Cut, true, &mut picked);
+                            item(ui, "Copy", Command::Copy, true, &mut picked);
+                            item(ui, "Paste", Command::Paste, true, &mut picked);
+                            item(ui, "Select All", Command::SelectAll, true, &mut picked);
+                            ui.separator();
+                            item(ui, "Find…", Command::Find, true, &mut picked);
+                            item(ui, "Replace…", Command::Replace, true, &mut picked);
+                            ui.separator();
+                            item(ui, "Preferences…", Command::Preferences, true, &mut picked);
+                        })
+                        .response,
+                    );
+                    titles.push(
+                        ui.menu_button("Format", |ui| {
+                            format_items(ui, &mut picked);
+                        })
+                        .response,
+                    );
+                    titles.push(
+                        ui.menu_button("View", |ui| {
+                            let toc =
+                                egui::Button::selectable(state.outline_open, "Table of Contents")
+                                    .shortcut_text(Command::ToggleOutline.shortcut());
+                            if ui.add(toc).clicked() {
+                                picked = Some(Command::ToggleOutline);
+                                ui.close();
+                            }
+                            let numbers =
+                                egui::Button::selectable(state.line_numbers, "Show Line Numbers");
+                            if ui.add(numbers).clicked() {
+                                picked = Some(Command::ToggleLineNumbers);
+                                ui.close();
+                            }
+                            let diff = egui::Button::selectable(state.git_diff, "Git Differences");
+                            if ui.add(diff).clicked() {
+                                picked = Some(Command::ToggleGitDiff);
+                                ui.close();
+                            }
+                            let dark = egui::Button::selectable(state.dark_mode, "Dark Mode");
+                            if ui.add(dark).clicked() {
+                                picked = Some(Command::ToggleDarkMode);
+                                ui.close();
                             }
                             ui.separator();
-                            let any = !state.recent.is_empty();
-                            item(ui, "Clear Recent", Command::ClearRecent, any, &mut picked);
-                        });
-                        ui.separator();
-                        item(ui, "Save", Command::Save, true, &mut picked);
-                        item(ui, "Save As…", Command::SaveAs, true, &mut picked);
-                        item(ui, "Reload", Command::Reload, state.has_file, &mut picked);
-                        item(ui, "Export as PDF…", Command::ExportPdf, true, &mut picked);
-                        ui.separator();
-                        item(ui, "Close Tab", Command::CloseTab, true, &mut picked);
-                        item(ui, "Quit", Command::Quit, true, &mut picked);
-                    }).response);
-                    titles.push(ui.menu_button("Edit", |ui| {
-                        item(ui, "Undo", Command::Undo, true, &mut picked);
-                        item(ui, "Redo", Command::Redo, true, &mut picked);
-                        ui.separator();
-                        item(ui, "Cut", Command::Cut, true, &mut picked);
-                        item(ui, "Copy", Command::Copy, true, &mut picked);
-                        item(ui, "Paste", Command::Paste, true, &mut picked);
-                        item(ui, "Select All", Command::SelectAll, true, &mut picked);
-                        ui.separator();
-                        item(ui, "Find…", Command::Find, true, &mut picked);
-                        item(ui, "Replace…", Command::Replace, true, &mut picked);
-                        ui.separator();
-                        item(ui, "Preferences…", Command::Preferences, true, &mut picked);
-                    }).response);
-                    titles.push(ui.menu_button("Format", |ui| {
-                        format_items(ui, &mut picked);
-                    }).response);
-                    titles.push(ui.menu_button("View", |ui| {
-                        let toc = egui::Button::selectable(state.outline_open, "Table of Contents")
-                            .shortcut_text(Command::ToggleOutline.shortcut());
-                        if ui.add(toc).clicked() {
-                            picked = Some(Command::ToggleOutline);
-                            ui.close();
-                        }
-                        let numbers =
-                            egui::Button::selectable(state.line_numbers, "Show Line Numbers");
-                        if ui.add(numbers).clicked() {
-                            picked = Some(Command::ToggleLineNumbers);
-                            ui.close();
-                        }
-                        let diff = egui::Button::selectable(state.git_diff, "Git Differences");
-                        if ui.add(diff).clicked() {
-                            picked = Some(Command::ToggleGitDiff);
-                            ui.close();
-                        }
-                        let dark = egui::Button::selectable(state.dark_mode, "Dark Mode");
-                        if ui.add(dark).clicked() {
-                            picked = Some(Command::ToggleDarkMode);
-                            ui.close();
-                        }
-                        ui.separator();
-                        item(ui, "Zoom In", Command::ZoomIn, true, &mut picked);
-                        item(ui, "Zoom Out", Command::ZoomOut, true, &mut picked);
-                        item(ui, "Reset Zoom", Command::ResetZoom, true, &mut picked);
-                        ui.separator();
-                        let multi = state.tab_count > 1;
-                        item(ui, "Next Tab", Command::NextTab, multi, &mut picked);
-                        item(ui, "Previous Tab", Command::PrevTab, multi, &mut picked);
-                    }).response);
+                            item(ui, "Zoom In", Command::ZoomIn, true, &mut picked);
+                            item(ui, "Zoom Out", Command::ZoomOut, true, &mut picked);
+                            item(ui, "Reset Zoom", Command::ResetZoom, true, &mut picked);
+                            ui.separator();
+                            let multi = state.tab_count > 1;
+                            item(ui, "Next Tab", Command::NextTab, multi, &mut picked);
+                            item(ui, "Previous Tab", Command::PrevTab, multi, &mut picked);
+                        })
+                        .response,
+                    );
                     switch_on_hover(ui.ctx(), &titles);
                 });
         });
@@ -162,11 +175,29 @@ pub fn format_items(ui: &mut egui::Ui, picked: &mut Option<Command>) {
         item(ui, "Normal", Command::Block(Block::Normal), true, picked);
         for level in 1..=5u8 {
             let label = format!("Heading {level}");
-            item(ui, &label, Command::Block(Block::Heading(level)), true, picked);
+            item(
+                ui,
+                &label,
+                Command::Block(Block::Heading(level)),
+                true,
+                picked,
+            );
         }
         ui.separator();
-        item(ui, "Bulleted List", Command::Block(Block::Bulleted), true, picked);
-        item(ui, "Numbered List", Command::Block(Block::Numbered), true, picked);
+        item(
+            ui,
+            "Bulleted List",
+            Command::Block(Block::Bulleted),
+            true,
+            picked,
+        );
+        item(
+            ui,
+            "Numbered List",
+            Command::Block(Block::Numbered),
+            true,
+            picked,
+        );
         item(ui, "Quote", Command::Block(Block::Quote), true, picked);
     });
     ui.menu_button("Insert", |ui| {
@@ -200,9 +231,21 @@ pub fn context_menu(
         ui.set_min_width(240.0);
         item(ui, "Cut", Command::Cut, has_selection, &mut picked);
         item(ui, "Copy", Command::Copy, has_selection, &mut picked);
-        item(ui, "Copy as HTML", Command::CopyAsHtml, has_selection, &mut picked);
+        item(
+            ui,
+            "Copy as HTML",
+            Command::CopyAsHtml,
+            has_selection,
+            &mut picked,
+        );
         item(ui, "Paste", Command::Paste, true, &mut picked);
-        item(ui, "Paste without Style", Command::PasteWithoutStyle, true, &mut picked);
+        item(
+            ui,
+            "Paste without Style",
+            Command::PasteWithoutStyle,
+            true,
+            &mut picked,
+        );
         ui.separator();
         format_items(ui, &mut picked);
     });
@@ -217,7 +260,10 @@ mod tests {
     /// open after it.
     fn bar_frame(ctx: &egui::Context, events: Vec<egui::Event>) -> (Vec<egui::Rect>, Vec<bool>) {
         let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
             events,
             ..Default::default()
         };

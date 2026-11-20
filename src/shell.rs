@@ -203,17 +203,17 @@ mod profile {
     }
 }
 use crate::commands::Command;
-use crate::text_engine::{FontFamilyInfo, TextEngine, peniko_color, peniko_color_alpha};
-use crate::text_input;
 use crate::links::{self, LinkTarget};
 use crate::session::Session;
 use crate::single_instance::{self, Instance};
+use crate::text_engine::{FontFamilyInfo, TextEngine, peniko_color, peniko_color_alpha};
+use crate::text_input;
 use crate::ui::UiLayer;
 use crate::ui::dialogs::{self, Answer, DialogView};
-use crate::ui::preferences;
-use crate::ui::toc::{self, TocEntry};
 use crate::ui::menu::{MenuState, menu_bar};
+use crate::ui::preferences;
 use crate::ui::tabs::{TabInfo, tab_strip};
+use crate::ui::toc::{self, TocEntry};
 use crate::validation::{GitHubValidationCache, IssueOrPr, MentionableUser, ValidatedRefData};
 
 /// Chrome layout in device px: y where editor content begins, and its height. The
@@ -236,7 +236,10 @@ fn toc_width() -> f32 {
 }
 
 fn set_toc_width(width: f32) {
-    TOC_WIDTH.store(width.clamp(toc::MIN_W, toc::MAX_W).to_bits(), Ordering::Relaxed);
+    TOC_WIDTH.store(
+        width.clamp(toc::MIN_W, toc::MAX_W).to_bits(),
+        Ordering::Relaxed,
+    );
 }
 
 /// Device-px width of the right-docked table of contents (0 when closed). Mirrors
@@ -365,10 +368,10 @@ fn content_width(prefs: &Preferences) -> Option<f32> {
 
 /// The document's display name: its file name, or "Untitled".
 fn doc_name(editor: &Editor) -> String {
-    editor
-        .file_path()
-        .and_then(Path::file_name)
-        .map_or_else(|| "Untitled".to_string(), |n| n.to_string_lossy().into_owned())
+    editor.file_path().and_then(Path::file_name).map_or_else(
+        || "Untitled".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
 }
 
 /// Nearest heading level at or above `line`, if any.
@@ -555,9 +558,15 @@ pub(crate) enum WritEvent {
     /// Files dropped on the window (Wayland; winit reports them itself elsewhere).
     FilesDropped(Vec<PathBuf>),
     /// The Insert → Image dialog for tab `id` closed (`None`: cancelled).
-    ImagePicked { id: u64, path: Option<PathBuf> },
+    ImagePicked {
+        id: u64,
+        path: Option<PathBuf>,
+    },
     /// The export dialog for tab `id` closed (`None`: cancelled).
-    ExportPicked { id: u64, path: Option<PathBuf> },
+    ExportPicked {
+        id: u64,
+        path: Option<PathBuf>,
+    },
     /// A PDF export finished: the file, or an error for the user.
     ExportDone(Result<PathBuf, String>),
 }
@@ -572,12 +581,22 @@ pub(crate) struct CloseRequest {
 /// A dialog waiting for the user, with the state needed to act on the answer.
 enum PendingModal {
     /// Some tabs of `req` have unsaved changes (`dirty`, by id in tab order).
-    Unsaved { req: CloseRequest, dirty: Vec<u64> },
-    Message { title: String, text: String },
+    Unsaved {
+        req: CloseRequest,
+        dirty: Vec<u64>,
+    },
+    Message {
+        title: String,
+        text: String,
+    },
     /// A PDF export finished.
-    Exported { path: PathBuf },
+    Exported {
+        path: PathBuf,
+    },
     /// Reloading tab `id` would discard its unsaved changes.
-    ConfirmReload { id: u64 },
+    ConfirmReload {
+        id: u64,
+    },
 }
 
 /// A tab's file changed on disk and the user must choose between the disk version
@@ -1378,10 +1397,10 @@ impl App {
             return;
         };
         let editor = self.tab_editor(i);
-        let name = editor
-            .file_path()
-            .and_then(Path::file_name)
-            .map_or_else(|| "untitled.md".to_string(), |n| n.to_string_lossy().into_owned());
+        let name = editor.file_path().and_then(Path::file_name).map_or_else(
+            || "untitled.md".to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
         let mut dialog = rfd::FileDialog::new()
             .set_title("Save As")
             .add_filter("Markdown", &["md", "markdown"])
@@ -1440,10 +1459,10 @@ impl App {
             return;
         };
         let editor = self.tab_editor(i);
-        let stem = editor
-            .file_path()
-            .and_then(Path::file_stem)
-            .map_or_else(|| "untitled".to_string(), |s| s.to_string_lossy().into_owned());
+        let stem = editor.file_path().and_then(Path::file_stem).map_or_else(
+            || "untitled".to_string(),
+            |s| s.to_string_lossy().into_owned(),
+        );
         let mut dialog = rfd::FileDialog::new()
             .set_title("Export as PDF")
             .add_filter("PDF", &["pdf"])
@@ -1477,10 +1496,10 @@ impl App {
                 .file_path()
                 .and_then(|p| std::path::absolute(p).ok())
                 .and_then(|p| p.parent().map(Path::to_path_buf)),
-            title: editor
-                .file_path()
-                .and_then(Path::file_stem)
-                .map_or_else(|| "Untitled".to_string(), |s| s.to_string_lossy().into_owned()),
+            title: editor.file_path().and_then(Path::file_stem).map_or_else(
+                || "Untitled".to_string(),
+                |s| s.to_string_lossy().into_owned(),
+            ),
             output: path.clone(),
         };
         self.export_running = Some(
@@ -1568,7 +1587,11 @@ impl App {
             let key = path.canonicalize().ok();
             let open = (0..self.tabs.len()).find(|&i| {
                 key.is_some()
-                    && self.tab_editor(i).file_path().and_then(|p| p.canonicalize().ok()) == key
+                    && self
+                        .tab_editor(i)
+                        .file_path()
+                        .and_then(|p| p.canonicalize().ok())
+                        == key
             });
             if let Some(i) = open {
                 last = Some(i);
@@ -1720,8 +1743,10 @@ impl App {
     fn zoom(&mut self, delta: Option<f32>) {
         let mut prefs = self.prefs.clone();
         prefs.font_size = match delta {
-            Some(d) => (prefs.font_size + d)
-                .clamp(*config::FONT_SIZE_RANGE.start(), *config::FONT_SIZE_RANGE.end()),
+            Some(d) => (prefs.font_size + d).clamp(
+                *config::FONT_SIZE_RANGE.start(),
+                *config::FONT_SIZE_RANGE.end(),
+            ),
             None => FONT_SIZE,
         };
         self.apply_preferences(prefs);
@@ -1811,14 +1836,10 @@ impl App {
                 .iter()
                 .map(|p| crate::format::image_markdown(p, doc_dir.as_deref()))
                 .collect();
-            let selection = self
-                .doc_engine
-                .editor
-                .selection_range()
-                .unwrap_or_else(|| {
-                    let c = self.doc_engine.editor.cursor_position();
-                    c..c
-                });
+            let selection = self.doc_engine.editor.selection_range().unwrap_or_else(|| {
+                let c = self.doc_engine.editor.cursor_position();
+                c..c
+            });
             let text = links.join("\n");
             let end = selection.start + text.len();
             self.apply_format(crate::format::TextEdit {
@@ -1920,7 +1941,10 @@ impl App {
         };
         let mut dialog = rfd::FileDialog::new()
             .set_title("Insert Image")
-            .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"])
+            .add_filter(
+                "Images",
+                &["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"],
+            )
             .set_parent(&*state.window);
         if let Some(dir) = self.dialog_dir(self.active_tab) {
             dialog = dialog.set_directory(dir);
@@ -1964,7 +1988,10 @@ impl App {
                 if !path.is_file() {
                     self.show_message(
                         "File not found",
-                        format!("The link points to “{}”, which does not exist.", path.display()),
+                        format!(
+                            "The link points to “{}”, which does not exist.",
+                            path.display()
+                        ),
                     );
                     return;
                 }
@@ -2037,7 +2064,10 @@ impl App {
             return;
         }
         if let Err(e) = current.save(&path) {
-            eprintln!("[markdone] failed to save the session to {}: {e}", path.display());
+            eprintln!(
+                "[markdone] failed to save the session to {}: {e}",
+                path.display()
+            );
         }
         self.session_saved = Some(current);
     }
@@ -2054,7 +2084,10 @@ impl App {
             self.session.recent.remove(i);
             self.show_message(
                 "File not found",
-                format!("“{}” no longer exists; it was removed from the recent files.", path.display()),
+                format!(
+                    "“{}” no longer exists; it was removed from the recent files.",
+                    path.display()
+                ),
             );
         }
     }
@@ -2075,9 +2108,10 @@ impl App {
                 name: name(*id).unwrap_or_default(),
             },
             PendingModal::Exported { path } => DialogView::Exported {
-                name: path
-                    .file_name()
-                    .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()),
+                name: path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                ),
             },
         })
     }
@@ -2139,12 +2173,14 @@ impl App {
         editor.note_disk_state();
         if answer == Answer::Reload {
             editor.apply_file_content(data.0);
-            self.reloads.apply_base(editor, ticket.base_generation, data.1);
+            self.reloads
+                .apply_base(editor, ticket.base_generation, data.1);
             self.after_reload();
         } else {
             // Keep the buffer: it now differs from the file, so it is unsaved.
             editor.mark_dirty();
-            self.reloads.apply_base(editor, ticket.base_generation, data.1);
+            self.reloads
+                .apply_base(editor, ticket.base_generation, data.1);
         }
         self.redraw();
     }
@@ -2361,7 +2397,12 @@ impl App {
             Command::CloseOtherTabs(keep) => {
                 if let Some(keep_id) = self.tabs.get(keep).map(|t| t.id) {
                     self.switch_tab(keep);
-                    let ids = self.tabs.iter().map(|t| t.id).filter(|&id| id != keep_id).collect();
+                    let ids = self
+                        .tabs
+                        .iter()
+                        .map(|t| t.id)
+                        .filter(|&id| id != keep_id)
+                        .collect();
                     self.request_close(CloseRequest { ids, quit: false }, event_loop);
                 }
                 return;
@@ -3529,7 +3570,9 @@ fn paint_document(
     }
     let fold_rects = draw_fold_chevrons(scene, theme, editor, doc, editor_h, gutter_hover, scale);
     if let Some(font_size) = line_numbers {
-        draw_line_numbers(scene, engine, theme, editor, doc, editor_h, font_size, scale);
+        draw_line_numbers(
+            scene, engine, theme, editor, doc, editor_h, font_size, scale,
+        );
     }
     scene.pop_layer();
 
@@ -4015,7 +4058,10 @@ impl ApplicationHandler<WritEvent> for App {
                 return;
             }
             if self.tabs[self.active_tab].conflict.is_some()
-                && matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_))
+                && matches!(
+                    event,
+                    WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
+                )
             {
                 state.window.request_redraw();
                 return;
@@ -5305,7 +5351,12 @@ impl ApplicationHandler<WritEvent> for App {
                     has_file: self.doc_engine.editor.file_path().is_some(),
                     has_selection: self.doc_engine.editor.selection_range().is_some(),
                     tab_count: self.tabs.len(),
-                    recent: self.session.recent.iter().map(|p| recent_label(p)).collect(),
+                    recent: self
+                        .session
+                        .recent
+                        .iter()
+                        .map(|p| recent_label(p))
+                        .collect(),
                 };
                 let tab_infos: Vec<TabInfo> = self
                     .tabs
@@ -5411,7 +5462,8 @@ impl ApplicationHandler<WritEvent> for App {
                         if let Some((name, unsaved)) = &conflict {
                             let mut rect = ui.ctx().content_rect();
                             rect.min.y += top_points;
-                            conflict_answer = dialogs::disk_conflict(ui.ctx(), rect, name, *unsaved);
+                            conflict_answer =
+                                dialogs::disk_conflict(ui.ctx(), rect, name, *unsaved);
                         }
                         if let Some(view) = &dialog_view {
                             answer = dialogs::show(ui.ctx(), view);
@@ -5765,7 +5817,10 @@ fn startup_from_cli() -> Option<Startup> {
         });
     }
     let session_path = Session::default_path();
-    let mut session = session_path.as_deref().map(Session::load).unwrap_or_default();
+    let mut session = session_path
+        .as_deref()
+        .map(Session::load)
+        .unwrap_or_default();
     let paths: Vec<PathBuf> = config
         .file
         .iter()
@@ -5827,9 +5882,10 @@ fn startup_from_cli() -> Option<Startup> {
 /// Label of a recent file in the menu: the file name, and its folder shortened (home as
 /// `~`, long paths cut to their last two folders).
 fn recent_label(path: &Path) -> (String, String) {
-    let name = path
-        .file_name()
-        .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
     let dir = path.parent().unwrap_or(Path::new(""));
     let home = dirs::home_dir();
     let dir_text = match home.as_deref().and_then(|h| dir.strip_prefix(h).ok()) {
@@ -5850,7 +5906,10 @@ fn missing_files_notice(missing: &[PathBuf]) -> Option<PendingModal> {
     if missing.is_empty() {
         return None;
     }
-    let list: Vec<String> = missing.iter().map(|p| format!("•  {}", p.display())).collect();
+    let list: Vec<String> = missing
+        .iter()
+        .map(|p| format!("•  {}", p.display()))
+        .collect();
     let (title, intro) = if missing.len() == 1 {
         ("File not found", "This file does not exist")
     } else {
@@ -5951,7 +6010,10 @@ pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()
     let env_usize = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok());
     editor.set_cursor(env_usize("MARKDONE_SHELL_CURSOR").unwrap_or(0));
     // Optional selection A..B (via click+drag) to exercise selection rendering.
-    if let (Some(a), Some(b)) = (env_usize("MARKDONE_SHELL_SEL_A"), env_usize("MARKDONE_SHELL_SEL_B")) {
+    if let (Some(a), Some(b)) = (
+        env_usize("MARKDONE_SHELL_SEL_A"),
+        env_usize("MARKDONE_SHELL_SEL_B"),
+    ) {
         editor.click(a, false, 1);
         editor.drag(b);
     }

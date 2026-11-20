@@ -54,7 +54,13 @@ pub fn show(
                 ui.end_row();
 
                 ui.label("Text font");
-                font_picker(ui, "prefs-text-font", &mut prefs.font_family, font_families, false);
+                font_picker(
+                    ui,
+                    "prefs-text-font",
+                    &mut prefs.font_family,
+                    font_families,
+                    false,
+                );
                 ui.end_row();
 
                 ui.label("Code font");
@@ -92,7 +98,6 @@ pub fn show(
                     ui.radio_value(&mut prefs.full_width, true, "Full window width");
                 });
                 ui.end_row();
-
             });
 
         section(ui, "Files");

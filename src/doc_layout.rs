@@ -1404,8 +1404,8 @@ impl DocLayout {
         let mut collapsed_fences: HashSet<usize> = HashSet::new();
         let mut code_boxes: Vec<CodeBox> = Vec::new();
         for fb in snapshot.fenced_blocks() {
-            let revealed = ranges_overlap(&fb.block, selection)
-                || fb.block.contains(&cursor_line_start);
+            let revealed =
+                ranges_overlap(&fb.block, selection) || fb.block.contains(&cursor_line_start);
             #[cfg(feature = "mermaid")]
             if !revealed && mermaid_blocks.iter().any(|m| m.block == fb.block) {
                 continue;
@@ -1585,8 +1585,9 @@ impl DocLayout {
                 let rkey = render_key(version, i, cursor_component(i, &range));
                 let h = height_cache.get(rkey).unwrap_or_else(|| {
                     // A grid table row: estimate it as a grid row, not as one long text line.
-                    if let Some((t, kind)) =
-                        snapshot.table_row_at_line(i).filter(|(t, _)| table_grid_ok(t))
+                    if let Some((t, kind)) = snapshot
+                        .table_row_at_line(i)
+                        .filter(|(t, _)| table_grid_ok(t))
                     {
                         let rows = table_estimates.entry(t.block.start).or_insert_with(|| {
                             estimate_table_rows(snapshot, t, k, min_row, scale, max_advance)
@@ -2613,13 +2614,7 @@ impl DocLayout {
                     dest_w,
                     dest_h,
                 } => {
-                    draw_paint(
-                        scene,
-                        paint,
-                        (*nat_w, *nat_h),
-                        (x, top),
-                        (*dest_w, *dest_h),
-                    );
+                    draw_paint(scene, paint, (*nat_w, *nat_h), (x, top), (*dest_w, *dest_h));
                 }
                 ImageBlockKind::Loading | ImageBlockKind::Failed { .. } => {
                     let line_bottom = (self.tops[i + 1] - self.scroll_y) as f64;
@@ -2684,7 +2679,13 @@ impl DocLayout {
             let y0 = (self.real_top(cb.first) - self.scroll_y) as f64 - pad;
             let y1 = (self.tops[cb.last + 1] - self.scroll_y) as f64 + pad;
             let rect = Rect::new(x0, y0, x1, y1).to_rounded_rect(pad);
-            scene.fill(Fill::NonZero, Affine::IDENTITY, self.code_box_bg, None, &rect);
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                self.code_box_bg,
+                None,
+                &rect,
+            );
             if let Some(lang) = &cb.lang {
                 let layout = engine.build_line(
                     lang,
@@ -3641,7 +3642,10 @@ mod tests {
         // collapse (so the gutter skips their numbers); the text after it doesn't.
         assert!(!doc.line_is_collapsed(fence));
         for line in fence + 1..=fence + 3 {
-            assert!(doc.line_is_collapsed(line), "fence line {line} should collapse");
+            assert!(
+                doc.line_is_collapsed(line),
+                "fence line {line} should collapse"
+            );
         }
         assert!(!doc.line_is_collapsed(fence + 4));
         let mut prev = -1.0f32;

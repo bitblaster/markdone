@@ -46,10 +46,11 @@ pub fn classify(url: &str) -> LinkTarget {
         None => (local, None),
     };
     let path = PathBuf::from(percent_decode(path));
-    let is_markdown = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| MARKDOWN_EXTENSIONS.iter().any(|m| m.eq_ignore_ascii_case(e)));
+    let is_markdown = path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        MARKDOWN_EXTENSIONS
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(e))
+    });
     if is_markdown {
         LinkTarget::Document {
             path,
@@ -121,7 +122,10 @@ mod tests {
 
     #[test]
     fn classifies_links() {
-        assert_eq!(classify("#stato-attuale"), LinkTarget::Anchor("stato-attuale".into()));
+        assert_eq!(
+            classify("#stato-attuale"),
+            LinkTarget::Anchor("stato-attuale".into())
+        );
         assert_eq!(
             classify("/docs/a b/Analisi%20Match.md#regole-g3"),
             LinkTarget::Document {
@@ -131,18 +135,30 @@ mod tests {
         );
         assert_eq!(
             classify("file:///docs/README.MD"),
-            LinkTarget::Document { path: "/docs/README.MD".into(), anchor: None }
+            LinkTarget::Document {
+                path: "/docs/README.MD".into(),
+                anchor: None
+            }
         );
         assert_eq!(
             classify("/docs/x.md#"),
-            LinkTarget::Document { path: "/docs/x.md".into(), anchor: None }
+            LinkTarget::Document {
+                path: "/docs/x.md".into(),
+                anchor: None
+            }
         );
         assert_eq!(
             classify("https://example.com/a.md"),
             LinkTarget::External("https://example.com/a.md".into())
         );
-        assert_eq!(classify("mailto:a@b.c"), LinkTarget::External("mailto:a@b.c".into()));
-        assert_eq!(classify("/docs/schema.png"), LinkTarget::External("/docs/schema.png".into()));
+        assert_eq!(
+            classify("mailto:a@b.c"),
+            LinkTarget::External("mailto:a@b.c".into())
+        );
+        assert_eq!(
+            classify("/docs/schema.png"),
+            LinkTarget::External("/docs/schema.png".into())
+        );
         assert_eq!(
             classify("file://server/share/x.md"),
             LinkTarget::External("file://server/share/x.md".into())

@@ -2237,7 +2237,11 @@ let code = target(); // fenced block line
         e.move_word(false, false);
         assert_eq!(e.cursor_position(), 20, "start of `next`");
         e.move_word(false, true);
-        assert_eq!(e.selection_range(), Some(17..20), "back over `);` + newline");
+        assert_eq!(
+            e.selection_range(),
+            Some(17..20),
+            "back over `);` + newline"
+        );
 
         let mut e = Editor::new("alpha beta gamma");
         e.set_cursor(10);

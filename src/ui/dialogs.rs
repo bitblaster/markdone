@@ -21,7 +21,9 @@ pub enum DialogView {
         name: String,
     },
     /// Reloading would discard the document's unsaved changes.
-    ConfirmReload { name: String },
+    ConfirmReload {
+        name: String,
+    },
 }
 
 /// The user's choice.
@@ -98,7 +100,10 @@ pub fn show(ctx: &egui::Context, view: &DialogView) -> Option<Answer> {
                 answer = buttons(
                     ui,
                     &[],
-                    &[("Cancel", Answer::Cancel), ("Discard and Reload", Answer::Reload)],
+                    &[
+                        ("Cancel", Answer::Cancel),
+                        ("Discard and Reload", Answer::Reload),
+                    ],
                 );
             }
             DialogView::Exported { name } => {

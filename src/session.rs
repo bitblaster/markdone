@@ -46,7 +46,10 @@ impl Session {
             return Self::default();
         };
         toml::from_str(&text).unwrap_or_else(|e| {
-            eprintln!("[markdone] ignoring invalid session file {}: {e}", path.display());
+            eprintln!(
+                "[markdone] ignoring invalid session file {}: {e}",
+                path.display()
+            );
             Self::default()
         })
     }
@@ -96,7 +99,13 @@ mod tests {
         assert_eq!(s.recent[0], Path::new("/d/11.md"));
         s.touch_recent(Path::new("/d/5.md"));
         assert_eq!(s.recent[0], Path::new("/d/5.md"));
-        assert_eq!(s.recent.iter().filter(|p| *p == Path::new("/d/5.md")).count(), 1);
+        assert_eq!(
+            s.recent
+                .iter()
+                .filter(|p| *p == Path::new("/d/5.md"))
+                .count(),
+            1
+        );
         assert_eq!(s.recent.len(), MAX_RECENT);
     }
 

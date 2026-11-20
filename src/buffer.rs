@@ -265,7 +265,11 @@ impl RenderSnapshot {
             .iter()
             .map(|cb| {
                 let open_line = self.rope.byte_to_line(cb.block_range.start);
-                let last_byte = cb.block_range.end.saturating_sub(1).max(cb.block_range.start);
+                let last_byte = cb
+                    .block_range
+                    .end
+                    .saturating_sub(1)
+                    .max(cb.block_range.start);
                 let last_line = self.rope.byte_to_line(last_byte);
                 let close_line = (last_line > open_line
                     && closes_fence(&line_text(open_line), &line_text(last_line)))
@@ -607,7 +611,10 @@ impl BufferContent {
         }
         self.tree = self.parser.parse_rope(&self.text, self.tree.as_ref());
         if edit_profile_enabled() {
-            eprintln!("[markdone-edit] parse {:6.2} ms", t_parse.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "[markdone-edit] parse {:6.2} ms",
+                t_parse.elapsed().as_secs_f64() * 1e3
+            );
         }
 
         // Renumbering only matters when the edit lands inside an ordered list, which

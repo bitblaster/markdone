@@ -58,7 +58,10 @@ pub enum Command {
     CloseAllTabs,
     CopyPath(usize),
     RevealInFileManager(usize),
-    MoveTab { from: usize, to: usize },
+    MoveTab {
+        from: usize,
+        to: usize,
+    },
 }
 
 impl Command {
@@ -188,14 +191,35 @@ mod tests {
         let code = |c| PhysicalKey::Code(c);
         let none = PhysicalKey::Code(KeyCode::KeyQ);
         let f = |k: &Key, p, shift, alt| format_shortcut(k, p, true, shift, alt);
-        assert_eq!(f(&ch("b"), code(KeyCode::KeyB), false, false), Some(Command::Inline(Inline::Bold)));
-        assert_eq!(f(&ch("X"), code(KeyCode::KeyX), true, false), Some(Command::Inline(Inline::Strikethrough)));
-        assert_eq!(f(&ch("V"), code(KeyCode::KeyV), true, false), Some(Command::PasteWithoutStyle));
-        assert_eq!(f(&ch("v"), code(KeyCode::KeyV), false, false), Some(Command::Paste));
+        assert_eq!(
+            f(&ch("b"), code(KeyCode::KeyB), false, false),
+            Some(Command::Inline(Inline::Bold))
+        );
+        assert_eq!(
+            f(&ch("X"), code(KeyCode::KeyX), true, false),
+            Some(Command::Inline(Inline::Strikethrough))
+        );
+        assert_eq!(
+            f(&ch("V"), code(KeyCode::KeyV), true, false),
+            Some(Command::PasteWithoutStyle)
+        );
+        assert_eq!(
+            f(&ch("v"), code(KeyCode::KeyV), false, false),
+            Some(Command::Paste)
+        );
         // Digits are physical: Ctrl+Shift+8 is "(" on an Italian layout.
-        assert_eq!(f(&ch("("), code(KeyCode::Digit8), true, false), Some(Command::Block(Block::Bulleted)));
-        assert_eq!(f(&ch("3"), code(KeyCode::Digit3), false, true), Some(Command::Block(Block::Heading(3))));
-        assert_eq!(f(&ch("0"), code(KeyCode::Digit0), false, true), Some(Command::Block(Block::Normal)));
+        assert_eq!(
+            f(&ch("("), code(KeyCode::Digit8), true, false),
+            Some(Command::Block(Block::Bulleted))
+        );
+        assert_eq!(
+            f(&ch("3"), code(KeyCode::Digit3), false, true),
+            Some(Command::Block(Block::Heading(3)))
+        );
+        assert_eq!(
+            f(&ch("0"), code(KeyCode::Digit0), false, true),
+            Some(Command::Block(Block::Normal))
+        );
         // Not ours: Ctrl+0 (reset zoom), Ctrl+Shift+1..6 (fold levels), plain Ctrl+X/C.
         assert_eq!(f(&ch("0"), code(KeyCode::Digit0), false, false), None);
         assert_eq!(f(&ch("!"), code(KeyCode::Digit1), true, false), None);
@@ -203,6 +227,9 @@ mod tests {
         assert_eq!(f(&ch("c"), code(KeyCode::KeyC), false, false), None);
         assert_eq!(f(&ch("s"), none, false, false), None);
         // Without Ctrl nothing is a shortcut.
-        assert_eq!(format_shortcut(&ch("b"), code(KeyCode::KeyB), false, false, false), None);
+        assert_eq!(
+            format_shortcut(&ch("b"), code(KeyCode::KeyB), false, false, false),
+            None
+        );
     }
 }

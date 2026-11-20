@@ -101,7 +101,8 @@ fn surrounding_markers(text: &str, sel: &Range<usize>, style: Inline) -> Option<
         }
         _ => {
             let (open, close) = style.markers();
-            (before.ends_with(open) && after.starts_with(close)).then_some((open.len(), close.len()))
+            (before.ends_with(open) && after.starts_with(close))
+                .then_some((open.len(), close.len()))
         }
     }
 }
@@ -142,13 +143,17 @@ pub fn set_block(text: &str, selection: Range<usize>, style: Block) -> TextEdit 
     } else {
         selection.end
     };
-    let end = text[end_pos..].find('\n').map_or(text.len(), |i| end_pos + i);
+    let end = text[end_pos..]
+        .find('\n')
+        .map_or(text.len(), |i| end_pos + i);
     let block = &text[start..end];
     let lines: Vec<&str> = block.split('\n').collect();
 
     let parsed: Vec<(&str, Block, &str)> = lines.iter().map(|l| split_marker(l)).collect();
-    let content_lines: Vec<&(&str, Block, &str)> =
-        parsed.iter().filter(|(_, _, rest)| !rest.is_empty()).collect();
+    let content_lines: Vec<&(&str, Block, &str)> = parsed
+        .iter()
+        .filter(|(_, _, rest)| !rest.is_empty())
+        .collect();
     let all_have = !content_lines.is_empty()
         && content_lines.iter().all(|(_, b, _)| *b == style)
         && style != Block::Normal;
@@ -193,7 +198,11 @@ pub fn set_block(text: &str, selection: Range<usize>, style: Block) -> TextEdit 
     } else {
         start..start + new.len()
     };
-    TextEdit { range: start..end, text: new, selection }
+    TextEdit {
+        range: start..end,
+        text: new,
+        selection,
+    }
 }
 
 /// Split a line into indentation, its block marker (as a style), and the rest.
@@ -205,7 +214,11 @@ fn split_marker(line: &str) -> (&str, Block, &str) {
     if (1..=6).contains(&hashes) {
         let after = &body[hashes..];
         if after.is_empty() || after.starts_with(' ') {
-            return (indent, Block::Heading(hashes as u8), after.trim_start_matches(' '));
+            return (
+                indent,
+                Block::Heading(hashes as u8),
+                after.trim_start_matches(' '),
+            );
         }
     }
     if let Some(rest) = body.strip_prefix("> ").or_else(|| body.strip_prefix('>')) {
@@ -220,7 +233,10 @@ fn split_marker(line: &str) -> (&str, Block, &str) {
     let digits = body.bytes().take_while(u8::is_ascii_digit).count();
     if digits > 0 && digits <= 9 {
         let after = &body[digits..];
-        if let Some(rest) = after.strip_prefix(". ").or_else(|| after.strip_prefix(") ")) {
+        if let Some(rest) = after
+            .strip_prefix(". ")
+            .or_else(|| after.strip_prefix(") "))
+        {
             return (indent, Block::Numbered, rest);
         }
     }
@@ -234,18 +250,30 @@ pub fn insert_link(text: &str, selection: Range<usize>) -> TextEdit {
     let start = selection.start;
     if inner.contains("://") && !inner.contains(char::is_whitespace) {
         let new = format!("[]({inner})");
-        return TextEdit { range: selection, text: new, selection: start + 1..start + 1 };
+        return TextEdit {
+            range: selection,
+            text: new,
+            selection: start + 1..start + 1,
+        };
     }
     let new = format!("[{inner}]()");
     let caret = start + inner.len() + 3;
-    TextEdit { range: selection, text: new, selection: caret..caret }
+    TextEdit {
+        range: selection,
+        text: new,
+        selection: caret..caret,
+    }
 }
 
 /// Insert (or replace the selection with) an image link to `target`.
 pub fn insert_image(selection: Range<usize>, target: &Path, doc_dir: Option<&Path>) -> TextEdit {
     let text = image_markdown(target, doc_dir);
     let end = selection.start + text.len();
-    TextEdit { range: selection, text, selection: end..end }
+    TextEdit {
+        range: selection,
+        text,
+        selection: end..end,
+    }
 }
 
 /// Wrap the lines of the selection in a fenced code block (or insert an empty one with
@@ -256,14 +284,28 @@ pub fn insert_code_block(text: &str, selection: Range<usize>) -> TextEdit {
         let lead = if at_line_start { "" } else { "\n" };
         let new = format!("{lead}```\n\n```\n");
         let caret = selection.start + lead.len() + 4;
-        return TextEdit { range: selection, text: new, selection: caret..caret };
+        return TextEdit {
+            range: selection,
+            text: new,
+            selection: caret..caret,
+        };
     }
     let start = text[..selection.start].rfind('\n').map_or(0, |i| i + 1);
-    let end_pos = if text[..selection.end].ends_with('\n') { selection.end - 1 } else { selection.end };
-    let end = text[end_pos..].find('\n').map_or(text.len(), |i| end_pos + i);
+    let end_pos = if text[..selection.end].ends_with('\n') {
+        selection.end - 1
+    } else {
+        selection.end
+    };
+    let end = text[end_pos..]
+        .find('\n')
+        .map_or(text.len(), |i| end_pos + i);
     let body = &text[start..end];
     let new = format!("```\n{body}\n```");
-    TextEdit { range: start..end, text: new.clone(), selection: start..start + new.len() }
+    TextEdit {
+        range: start..end,
+        text: new.clone(),
+        selection: start..start + new.len(),
+    }
 }
 
 /// `![name](path)` for an image file, the path relative to the document's folder when
@@ -317,7 +359,12 @@ mod tests {
     use super::*;
 
     fn apply(text: &str, e: &TextEdit) -> String {
-        format!("{}{}{}", &text[..e.range.start], e.text, &text[e.range.end..])
+        format!(
+            "{}{}{}",
+            &text[..e.range.start],
+            e.text,
+            &text[e.range.end..]
+        )
     }
 
     #[test]
@@ -407,8 +454,14 @@ mod tests {
             image_markdown(Path::new("/docs/img/a b.png"), Some(Path::new("/docs/sub"))),
             "![a b](<../img/a b.png>)"
         );
-        assert_eq!(image_markdown(Path::new("/docs/x.png"), Some(Path::new("/docs"))), "![x](x.png)");
-        assert_eq!(image_markdown(Path::new("/i/x.png"), None), "![x](/i/x.png)");
+        assert_eq!(
+            image_markdown(Path::new("/docs/x.png"), Some(Path::new("/docs"))),
+            "![x](x.png)"
+        );
+        assert_eq!(
+            image_markdown(Path::new("/i/x.png"), None),
+            "![x](/i/x.png)"
+        );
         assert!(is_image(Path::new("a.PNG")) && !is_image(Path::new("a.md")));
     }
 }

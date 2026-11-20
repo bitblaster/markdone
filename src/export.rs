@@ -117,7 +117,10 @@ fn print_to_pdf(browser: &Path, page: &Path, output: &Path, work: &Path) -> Resu
         .arg("--print-to-pdf-no-header")
         // Wait for images (local and remote) before printing.
         .arg("--virtual-time-budget=15000")
-        .arg(format!("--user-data-dir={}", work.join("profile").display()))
+        .arg(format!(
+            "--user-data-dir={}",
+            work.join("profile").display()
+        ))
         .arg(format!("--print-to-pdf={}", output.display()))
         .arg(crate::platform::file_url(page))
         .stdin(Stdio::null())
@@ -146,9 +149,17 @@ fn print_to_pdf(browser: &Path, page: &Path, output: &Path, work: &Path) -> Resu
     if let Some(mut pipe) = child.stderr.take() {
         let _ = std::io::Read::read_to_string(&mut pipe, &mut stderr);
     }
-    let detail = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let detail = stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
     Err(if detail.is_empty() {
-        format!("The browser could not write {} ({status}).", output.display())
+        format!(
+            "The browser could not write {} ({status}).",
+            output.display()
+        )
     } else {
         format!("The browser could not write {}: {detail}", output.display())
     })
@@ -226,7 +237,9 @@ fn render_body(markdown: &str, base_dir: Option<&Path>) -> String {
                 let n = slugs.entry(base.clone()).or_insert(0);
                 let id = if *n == 0 { base } else { format!("{base}-{n}") };
                 *n += 1;
-                out.push(Event::Html(format!("<{level} id=\"{}\">", escape(&id)).into()));
+                out.push(Event::Html(
+                    format!("<{level} id=\"{}\">", escape(&id)).into(),
+                ));
                 out.extend(inner.into_iter().map(|e| rewrite_image(e, base_dir)));
                 out.push(Event::Html(format!("</{level}>\n").into()));
             }
@@ -250,7 +263,9 @@ fn render_body(markdown: &str, base_dir: Option<&Path>) -> String {
                 };
                 out.push(Event::Html(html.into()));
             }
-            Event::InlineMath(latex) => out.push(Event::InlineHtml(math_html(&latex, false).into())),
+            Event::InlineMath(latex) => {
+                out.push(Event::InlineHtml(math_html(&latex, false).into()))
+            }
             Event::DisplayMath(latex) => out.push(Event::Html(math_html(&latex, true).into())),
             Event::Start(Tag::BlockQuote(kind)) => {
                 // Obsidian callout: `> [!type] Title` on the quote's first line.
@@ -263,7 +278,10 @@ fn render_body(markdown: &str, base_dir: Option<&Path>) -> String {
                             }
                             _ => None,
                         }
-                        .or(Some(((CalloutKind::Note, String::new(), false, false), false)))
+                        .or(Some((
+                            (CalloutKind::Note, String::new(), false, false),
+                            false,
+                        )))
                     }
                     _ => None,
                 };
@@ -321,7 +339,13 @@ fn render_body(markdown: &str, base_dir: Option<&Path>) -> String {
 
 /// Point a relative image at its absolute `file://` location.
 fn rewrite_image<'a>(event: Event<'a>, base_dir: Option<&Path>) -> Event<'a> {
-    let Event::Start(Tag::Image { link_type, dest_url, title, id }) = event else {
+    let Event::Start(Tag::Image {
+        link_type,
+        dest_url,
+        title,
+        id,
+    }) = event
+    else {
         return event;
     };
     let url = dest_url.as_ref();
@@ -340,7 +364,12 @@ fn rewrite_image<'a>(event: Event<'a>, base_dir: Option<&Path>) -> Event<'a> {
         Some(path) => CowStr::from(crate::platform::file_url(&path)),
         None => dest_url,
     };
-    Event::Start(Tag::Image { link_type, dest_url, title, id })
+    Event::Start(Tag::Image {
+        link_type,
+        dest_url,
+        title,
+        id,
+    })
 }
 
 fn mermaid_html(source: &str) -> String {
@@ -383,7 +412,11 @@ fn math_html(latex: &str, display: bool) -> String {
 /// A code block with the editor's syntax colors (a light theme for paper).
 fn code_html(highlighter: &mut Highlighter, theme: &EditorTheme, code: &str, lang: &str) -> String {
     let mut html = String::from("<pre><code>");
-    let spans = if lang.is_empty() { Vec::new() } else { highlighter.highlight(code, lang) };
+    let spans = if lang.is_empty() {
+        Vec::new()
+    } else {
+        highlighter.highlight(code, lang)
+    };
     let mut pos = 0;
     for span in spans {
         if span.range.start < pos || span.range.end > code.len() {
@@ -437,7 +470,11 @@ fn base64(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         for i in 0..4 {
             if i <= chunk.len() {
@@ -509,7 +546,10 @@ mod tests {
         )
         .unwrap();
         assert!(md.contains("## Titolo"), "{md}");
-        assert!(md.contains("**forte**") && md.contains("[link](https://e.com)"), "{md}");
+        assert!(
+            md.contains("**forte**") && md.contains("[link](https://e.com)"),
+            "{md}"
+        );
         assert!(md.contains("- uno\n- due"), "{md}");
         assert!(md.contains("```\nlet x = 1;\n```"), "{md}");
         assert_eq!(html_to_markdown("<p> </p>"), None);
@@ -527,7 +567,10 @@ mod tests {
     #[test]
     fn headings_get_github_ids_deduplicated() {
         let html = render_body("# Stato attuale\n\n## Note\n\n## Note\n", None);
-        assert!(html.contains("<h1 id=\"stato-attuale\">Stato attuale</h1>"), "{html}");
+        assert!(
+            html.contains("<h1 id=\"stato-attuale\">Stato attuale</h1>"),
+            "{html}"
+        );
         assert!(html.contains("<h2 id=\"note\">Note</h2>"));
         assert!(html.contains("<h2 id=\"note-1\">Note</h2>"));
     }
@@ -541,10 +584,16 @@ mod tests {
         assert!(!html.contains("[!warning]"));
         // Default title, header-only first paragraph.
         let html = render_body("> [!tip]\n>\n> Corpo.\n", None);
-        assert!(html.contains("callout-success") && html.contains("Tip</div>"), "{html}");
+        assert!(
+            html.contains("callout-success") && html.contains("Tip</div>"),
+            "{html}"
+        );
         // A plain quote stays a quote, its text intact.
         let html = render_body("> Solo una citazione.\n", None);
-        assert!(html.contains("<blockquote>\n<p>Solo una citazione.</p>"), "{html}");
+        assert!(
+            html.contains("<blockquote>\n<p>Solo una citazione.</p>"),
+            "{html}"
+        );
     }
 
     #[test]
@@ -571,8 +620,14 @@ mod tests {
             "![x](<img/a b.png>) ![w](img/c%20d.png) ![y](https://e.com/z.png)",
             Some(Path::new("/docs")),
         );
-        assert!(html.contains("src=\"file:///docs/img/a%20b.png\""), "{html}");
-        assert!(html.contains("src=\"file:///docs/img/c%20d.png\""), "{html}");
+        assert!(
+            html.contains("src=\"file:///docs/img/a%20b.png\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("src=\"file:///docs/img/c%20d.png\""),
+            "{html}"
+        );
         assert!(html.contains("src=\"https://e.com/z.png\""));
     }
 

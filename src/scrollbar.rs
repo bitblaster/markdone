@@ -45,7 +45,10 @@ impl Geometry {
 
     /// Whether `pos` falls inside the pointer hit zone (full track height).
     pub fn hit(&self, pos: (f32, f32)) -> bool {
-        pos.0 >= self.hit_x0 && pos.0 < self.hit_x1 && pos.1 >= self.track_y0 && pos.1 < self.track_y1
+        pos.0 >= self.hit_x0
+            && pos.0 < self.hit_x1
+            && pos.1 >= self.track_y0
+            && pos.1 < self.track_y1
     }
 
     /// Whether `y` falls on the thumb.

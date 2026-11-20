@@ -126,12 +126,26 @@ pub struct MathPng {
 
 /// Render `latex` in black on transparent at `font_px`, rasterized at `dpr` × for print
 /// sharpness. `Err` carries a LaTeX error message.
-pub fn render_png_for_print(latex: &str, display: bool, font_px: f32, dpr: f32) -> Result<MathPng, String> {
+pub fn render_png_for_print(
+    latex: &str,
+    display: bool,
+    font_px: f32,
+    dpr: f32,
+) -> Result<MathPng, String> {
     let out = catch_unwind(AssertUnwindSafe(|| -> Result<MathPng, String> {
         let nodes = parse(latex).map_err(|e| e.to_string())?;
         let opts = LayoutOptions {
-            style: if display { MathStyle::Display } else { MathStyle::Text },
-            color: Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+            style: if display {
+                MathStyle::Display
+            } else {
+                MathStyle::Text
+            },
+            color: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            },
             ..Default::default()
         };
         let dl = to_display_list(&layout(&nodes, &opts));
@@ -146,13 +160,23 @@ pub fn render_png_for_print(latex: &str, display: bool, font_px: f32, dpr: f32) 
         let ropts = RenderOptions {
             font_size: font_px,
             padding: PAD,
-            background_color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+            background_color: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            },
             font_dir: String::new(),
             device_pixel_ratio: dpr,
         };
         let png = render_to_png(&dl, &ropts).map_err(|e| format!("{e:?}"))?;
         let baseline = dl.height as f32 * font_px + PAD;
-        Ok(MathPng { png, width, height, depth: height - baseline })
+        Ok(MathPng {
+            png,
+            width,
+            height,
+            depth: height - baseline,
+        })
     }));
     out.unwrap_or_else(|_| Err("the formula renderer failed on this input".into()))
 }

@@ -87,7 +87,9 @@ pub unsafe fn start(
     let manager: WlDataDeviceManager = globals
         .bind(&qh, 1..=3, ())
         .map_err(|e| format!("no data device manager: {e}"))?;
-    let seat: WlSeat = globals.bind(&qh, 1..=7, ()).map_err(|e| format!("no seat: {e}"))?;
+    let seat: WlSeat = globals
+        .bind(&qh, 1..=7, ())
+        .map_err(|e| format!("no seat: {e}"))?;
     let _device = manager.get_data_device(&seat, &qh, ());
     let mut state = State {
         conn: conn.clone(),
@@ -326,7 +328,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(150));
         let t = std::time::Instant::now();
         listener.stop();
-        assert!(t.elapsed() < std::time::Duration::from_millis(500), "stops within a poll");
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(500),
+            "stops within a poll"
+        );
         assert!(listener.thread.is_none());
         drop(conn); // disconnect only now, like winit after `exiting`
     }

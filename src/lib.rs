@@ -85,7 +85,10 @@ pub mod cursor;
 pub mod diff;
 pub mod doc_layout;
 pub mod editor;
+#[cfg(feature = "app")]
+pub mod export;
 pub mod fold;
+pub mod format;
 #[cfg(feature = "git")]
 pub mod git;
 #[cfg(feature = "github")]
@@ -95,6 +98,8 @@ pub mod image_cache;
 #[cfg(feature = "remote-images")]
 pub mod image_load;
 pub mod inline;
+#[cfg(feature = "app")]
+pub mod links;
 pub mod markdown_view;
 pub mod marker;
 #[cfg(feature = "math")]
@@ -106,30 +111,23 @@ pub mod outline;
 #[cfg(feature = "app")]
 pub mod overlay;
 pub mod parser;
+pub mod paste;
 #[cfg(feature = "app")]
 pub mod platform;
-#[cfg(feature = "app")]
-pub mod session;
-#[cfg(feature = "app")]
-pub mod single_instance;
-#[cfg(feature = "app")]
-pub mod links;
-#[cfg(feature = "app")]
-pub mod export;
-pub mod format;
-#[cfg(all(feature = "app", unix, not(target_os = "macos")))]
-pub mod wayland_dnd;
-#[cfg(all(feature = "app", unix, not(target_os = "macos")))]
-pub mod system_theme;
-pub mod paste;
 pub mod raster;
 pub mod render;
 #[cfg(feature = "app")]
 pub mod scrollbar;
 pub mod segment_map;
 #[cfg(feature = "app")]
+pub mod session;
+#[cfg(feature = "app")]
 pub mod shell;
+#[cfg(feature = "app")]
+pub mod single_instance;
 pub mod status_bar;
+#[cfg(all(feature = "app", unix, not(target_os = "macos")))]
+pub mod system_theme;
 pub mod table;
 pub mod text_engine;
 pub mod text_input;
@@ -137,3 +135,5 @@ pub mod tokenize;
 #[cfg(feature = "app")]
 pub mod ui;
 pub mod validation;
+#[cfg(all(feature = "app", unix, not(target_os = "macos")))]
+pub mod wayland_dnd;

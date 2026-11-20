@@ -204,7 +204,13 @@ fn encode_group(scene: &mut vello::Scene, group: &usvg::Group, base: Affine) {
                 // A single-path clip is exact; anything else clips to the layer bounds.
                 match g.clip_path().and_then(|c| c.root().children().first()) {
                     Some(usvg::Node::Path(clip)) => {
-                        scene.push_layer(Fill::NonZero, blend, alpha, transform, &to_bez_path(clip));
+                        scene.push_layer(
+                            Fill::NonZero,
+                            blend,
+                            alpha,
+                            transform,
+                            &to_bez_path(clip),
+                        );
                     }
                     _ => {
                         let b = g.layer_bounding_box();
@@ -302,7 +308,9 @@ fn render_to_image(job: &MermaidJob) -> Result<LoadedImage, Option<String>> {
     match render_svg(screen_renderer(job.light), source) {
         Ok(svg) => {
             let t1 = std::time::Instant::now();
-            let vector = catch_unwind(AssertUnwindSafe(|| svg_to_vector(&svg))).ok().flatten();
+            let vector = catch_unwind(AssertUnwindSafe(|| svg_to_vector(&svg)))
+                .ok()
+                .flatten();
             if profiling() {
                 eprintln!(
                     "[markdone] mermaid render {:.1} ms (merman {:.1} ms, vector {:.1} ms), {} bytes of source",
@@ -479,7 +487,10 @@ mod tests {
     fn key_depends_on_source_and_mode() {
         let a = "graph LR; A-->B";
         assert_eq!(key_for(&job(a, false)), key_for(&job(a, false)));
-        assert_ne!(key_for(&job(a, false)), key_for(&job("graph LR; A-->C", false)));
+        assert_ne!(
+            key_for(&job(a, false)),
+            key_for(&job("graph LR; A-->C", false))
+        );
         assert_ne!(key_for(&job(a, false)), key_for(&job(a, true)));
     }
 
@@ -489,15 +500,24 @@ mod tests {
     fn apostrophe_in_chained_label_renders_verbatim() {
         let src = "flowchart TB\n  C2 --> C4[C4 Parametri dell'esito] --> C5";
         let svg = render_svg_for_screen(src, false).expect("flowchart should render");
-        assert!(svg.contains(">dell'esito<"), "apostrophe label must render as written");
-        assert!(!svg.contains("C4[C4"), "raw source text leaked into the diagram");
+        assert!(
+            svg.contains(">dell'esito<"),
+            "apostrophe label must render as written"
+        );
+        assert!(
+            !svg.contains("C4[C4"),
+            "raw source text leaked into the diagram"
+        );
     }
 
     /// usvg draws no `<foreignObject>`: the screen SVG must carry its labels as `<text>`.
     #[test]
     fn screen_svg_has_no_foreign_object() {
         let svg = render_svg_for_screen("flowchart LR\n  A[Uno] --> B[Due]", false).unwrap();
-        assert!(!svg.contains("<foreignObject"), "labels must be plain <text>");
+        assert!(
+            !svg.contains("<foreignObject"),
+            "labels must be plain <text>"
+        );
         assert!(svg.contains("<text"), "labels must still be present");
     }
 
@@ -507,7 +527,10 @@ mod tests {
         let svg = render_svg_for_screen("flowchart LR\n  A --> B", false).unwrap();
         assert!(!svg.contains("class=\"background"), "no background rect");
         let root = &svg[..svg.find('>').unwrap()];
-        assert!(!root.contains("background"), "root must not paint a background: {root}");
+        assert!(
+            !root.contains("background"),
+            "root must not paint a background: {root}"
+        );
     }
 
     /// The screen follows the editor's light/dark mode (Zettlr's dark mode uses Mermaid's
@@ -519,9 +542,15 @@ mod tests {
         let light = render_svg_for_screen(src, true).unwrap();
         let print = render_svg_for_print(src).unwrap();
         assert!(dark.contains("#ccc"), "dark theme labels are #ccc");
-        assert!(!light.contains("fill:#ccc"), "the light screen must not use dark colors");
+        assert!(
+            !light.contains("fill:#ccc"),
+            "the light screen must not use dark colors"
+        );
         assert_ne!(dark, light);
-        assert_eq!(light, print, "light screen and paper share Mermaid's default theme");
+        assert_eq!(
+            light, print,
+            "light screen and paper share Mermaid's default theme"
+        );
     }
 
     /// Gantt honours `axisFormat` (the old engine ignored it).
@@ -539,7 +568,10 @@ mod tests {
     fn dark_gantt_has_no_grid_lines() {
         let src = "gantt\n  dateFormat YYYY-MM-DD\n  section S\n  task :a1, 2026-01-05, 30d";
         let dark = render_svg_for_screen(src, false).unwrap();
-        assert!(dark.contains(".grid .tick{stroke:transparent"), "grid must be hidden");
+        assert!(
+            dark.contains(".grid .tick{stroke:transparent"),
+            "grid must be hidden"
+        );
     }
 
     /// A `%%{init}%%` directive overrides the site config: the same flowchart laid out with
@@ -548,9 +580,11 @@ mod tests {
     fn init_directive_selects_layout() {
         let body = "flowchart TB\n  subgraph X\n    A --> B --> C\n  end\n  subgraph Y\n    D --> E\n  end\n  A --> E\n  B --> D\n";
         let elk = render_svg_for_screen(body, false).unwrap();
-        let dagre =
-            render_svg_for_screen(&format!("%%{{init: {{\"layout\": \"dagre\"}}}}%%\n{body}"), false)
-                .unwrap();
+        let dagre = render_svg_for_screen(
+            &format!("%%{{init: {{\"layout\": \"dagre\"}}}}%%\n{body}"),
+            false,
+        )
+        .unwrap();
         assert_ne!(elk, dagre, "the dagre directive must change the layout");
     }
 
@@ -559,6 +593,9 @@ mod tests {
         let src = "%%{init: {\"theme\": \"forest\"}}%%\nflowchart LR\n  A --> B";
         let forest = render_svg_for_screen(src, false).unwrap();
         let dark = render_svg_for_screen("flowchart LR\n  A --> B", false).unwrap();
-        assert_ne!(forest, dark, "the author's theme must override the dark site theme");
+        assert_ne!(
+            forest, dark,
+            "the author's theme must override the dark site theme"
+        );
     }
 }

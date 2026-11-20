@@ -172,8 +172,10 @@ impl Highlighter {
             register(&["php"], Backend::TreeSitter(Box::new(config)));
         }
         // JavaScript (the grammar is already linked for TypeScript), JSX included.
-        let javascript_query =
-            format!("{JAVASCRIPT_HIGHLIGHT_QUERY}\n{}", tree_sitter_javascript::JSX_HIGHLIGHT_QUERY);
+        let javascript_query = format!(
+            "{JAVASCRIPT_HIGHLIGHT_QUERY}\n{}",
+            tree_sitter_javascript::JSX_HIGHLIGHT_QUERY
+        );
         if let Some(config) = Self::create_config(
             tree_sitter_javascript::LANGUAGE.into(),
             "javascript",
@@ -394,22 +396,50 @@ mod tests {
     fn added_languages_highlight() {
         let mut highlighter = Highlighter::new();
         let cases: [(&[&str], &str, &str, &str); 7] = [
-            (&["java"], "// c\npublic class A { int x = 1; }", "class", "// c"),
-            (&["python", "py"], "# c\ndef f(x):\n    return x\n", "def", "# c"),
-            (&["c", "h"], "/* c */\nint main(void) { return 0; }", "return", "/* c */"),
+            (
+                &["java"],
+                "// c\npublic class A { int x = 1; }",
+                "class",
+                "// c",
+            ),
+            (
+                &["python", "py"],
+                "# c\ndef f(x):\n    return x\n",
+                "def",
+                "# c",
+            ),
+            (
+                &["c", "h"],
+                "/* c */\nint main(void) { return 0; }",
+                "return",
+                "/* c */",
+            ),
             (
                 &["cpp", "c++", "cc"],
                 "// c\nclass A { public: int x; };",
                 "class",
                 "// c",
             ),
-            (&["php"], "// c\nfunction f($x) { return $x; }", "function", "// c"),
+            (
+                &["php"],
+                "// c\nfunction f($x) { return $x; }",
+                "function",
+                "// c",
+            ),
             (&["php"], "<?php\n// c\nfunction f() {}", "function", "// c"),
-            (&["javascript", "js", "jsx"], "// c\nconst f = () => 1;", "const", "// c"),
+            (
+                &["javascript", "js", "jsx"],
+                "// c\nconst f = () => 1;",
+                "const",
+                "// c",
+            ),
         ];
         for (aliases, code, keyword, comment) in cases {
             for alias in aliases {
-                assert!(highlighter.supports_language(alias), "{alias} not registered");
+                assert!(
+                    highlighter.supports_language(alias),
+                    "{alias} not registered"
+                );
                 let spans = highlighter.highlight(code, alias);
                 assert_highlight(code, &spans, keyword, "keyword");
                 assert_highlight(code, &spans, comment, "comment");

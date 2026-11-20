@@ -489,14 +489,21 @@ mod tests {
     fn text_and_code_fonts_are_independent() {
         let mut engine = TextEngine::new();
         let families = engine.font_families();
-        assert!(families.iter().any(|f| f.monospace), "no monospace font detected");
+        assert!(
+            families.iter().any(|f| f.monospace),
+            "no monospace font detected"
+        );
         let Some(proportional) = families.iter().find(|f| !f.monospace) else {
             return;
         };
         engine.set_font_family(Some(proportional.name.clone()));
-        assert!(engine.code_font_is_monospace(), "code stays on the system monospace");
+        assert!(
+            engine.code_font_is_monospace(),
+            "code stays on the system monospace"
+        );
         let plain = |e: &mut TextEngine, t: &str| {
-            e.build_line(t, 1.0, 16.0, 1.0, Color::WHITE, None, &[]).width()
+            e.build_line(t, 1.0, 16.0, 1.0, Color::WHITE, None, &[])
+                .width()
         };
         assert_ne!(
             plain(&mut engine, "iiiiiiiiii"),
@@ -505,7 +512,10 @@ mod tests {
             proportional.name
         );
         engine.set_code_font_family(Some(proportional.name.clone()));
-        assert!(!engine.code_font_is_monospace(), "a proportional code font is rejected");
+        assert!(
+            !engine.code_font_is_monospace(),
+            "a proportional code font is rejected"
+        );
     }
 
     /// The visual byte-range covered by each laid-out line (union of its glyph runs).
