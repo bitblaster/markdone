@@ -91,6 +91,11 @@ impl ExternalChange {
 pub struct Preferences {
     /// Document font size, logical px.
     pub font_size: f32,
+    /// Font family of the text (any installed font); `None` = system monospace.
+    pub font_family: Option<String>,
+    /// Font family of code blocks and inline code (fixed-pitch only); `None` = system
+    /// monospace.
+    pub code_font_family: Option<String>,
     /// Text spans the whole window width instead of `max_width`.
     pub full_width: bool,
     /// Maximum text width (logical px) when not `full_width`.
@@ -115,6 +120,8 @@ impl Default for Preferences {
     fn default() -> Self {
         Self {
             font_size: FONT_SIZE,
+            font_family: None,
+            code_font_family: None,
             full_width: false,
             max_width: crate::consts::MAX_CONTENT_WIDTH,
             line_numbers: false,
@@ -133,8 +140,6 @@ impl Default for Preferences {
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
     pub theme: EditorTheme,
-    /// The document font family; `None` = system monospace.
-    pub font_family: Option<String>,
     pub font_size: f32,
     pub prefs: Preferences,
     /// Theme names to offer: the built-ins, then the config's own `[themes.*]`.
@@ -146,7 +151,6 @@ impl Default for ResolvedConfig {
     fn default() -> Self {
         Self {
             theme: EditorTheme::dracula(),
-            font_family: None,
             font_size: FONT_SIZE,
             prefs: Preferences::default(),
             theme_names: EditorTheme::BUILTIN_NAMES.iter().map(|n| n.to_string()).collect(),
@@ -174,7 +178,10 @@ struct FileConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FontSpec {
+    /// Text font. Before `code_family` existed it set the font of the whole document.
     family: Option<String>,
+    /// Code font (fixed-pitch).
+    code_family: Option<String>,
     size: Option<f32>,
 }
 
@@ -352,12 +359,20 @@ fn resolve(file: FileConfig) -> ResolvedConfig {
         }
     }
     if let Some(font) = &file.font {
-        if let Some(family) = &font.family {
-            let f = family.trim();
-            if !f.is_empty() {
-                cfg.font_family = Some(f.to_string());
-            }
-        }
+        let name = |f: &Option<String>| {
+            f.as_deref()
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+                .map(str::to_string)
+        };
+        cfg.prefs.font_family = name(&font.family);
+        // A config written before `code_family` existed: `family` was the font of the
+        // whole document, code included, so keep it for code too.
+        cfg.prefs.code_font_family = if font.code_family.is_some() {
+            name(&font.code_family)
+        } else {
+            cfg.prefs.font_family.clone()
+        };
         if let Some(size) = font.size {
             if size.is_finite() && FONT_SIZE_RANGE.contains(&size) {
                 cfg.font_size = size;
@@ -450,6 +465,25 @@ pub fn save_preferences(path: &Path, prefs: &Preferences) -> std::io::Result<()>
     set("files", "on_external_change", value(prefs.external_change.key()));
     set("files", "check_on_focus", value(prefs.check_on_focus));
     set("network", "github", value(prefs.github));
+    // Font families: a family left at the system default is removed, not written empty.
+    let font = doc.entry("font").or_insert_with(|| Item::Table(Table::new()));
+    if let Some(t) = font.as_table_like_mut() {
+        for (key, family) in [
+            ("family", &prefs.font_family),
+            ("code_family", &prefs.code_font_family),
+        ] {
+            match family {
+                // Rewrite only a changed value, so an inline comment on it survives.
+                Some(f) if t.get(key).and_then(Item::as_str) != Some(f.as_str()) => {
+                    t.insert(key, value(f.as_str()));
+                }
+                Some(_) => {}
+                None => {
+                    t.remove(key);
+                }
+            }
+        }
+    }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -487,7 +521,7 @@ mod tests {
     fn empty_config_is_default() {
         let cfg = resolve(FileConfig::default());
         assert_eq!(cfg.theme.background, EditorTheme::dracula().background);
-        assert!(cfg.font_family.is_none());
+        assert!(cfg.prefs.font_family.is_none() && cfg.prefs.code_font_family.is_none());
         assert_eq!(cfg.font_size, FONT_SIZE);
     }
 
@@ -537,8 +571,23 @@ mod tests {
         let f: FileConfig =
             toml::from_str("[font]\nfamily = \"JetBrains Mono\"\nsize = 20.0").unwrap();
         let cfg = resolve(f);
-        assert_eq!(cfg.font_family.as_deref(), Some("JetBrains Mono"));
+        assert_eq!(cfg.prefs.font_family.as_deref(), Some("JetBrains Mono"));
+        // An old config (no `code_family`): `family` was the whole document's font.
+        assert_eq!(cfg.prefs.code_font_family.as_deref(), Some("JetBrains Mono"));
         assert_eq!(cfg.font_size, 20.0);
+    }
+
+    #[test]
+    fn separate_text_and_code_fonts() {
+        let f: FileConfig =
+            toml::from_str("[font]\nfamily = \"Noto Sans\"\ncode_family = \"Hack\"").unwrap();
+        let cfg = resolve(f);
+        assert_eq!(cfg.prefs.font_family.as_deref(), Some("Noto Sans"));
+        assert_eq!(cfg.prefs.code_font_family.as_deref(), Some("Hack"));
+        // An explicitly empty code family means the system default, not `family`.
+        let f: FileConfig =
+            toml::from_str("[font]\nfamily = \"Noto Sans\"\ncode_family = \"\"").unwrap();
+        assert_eq!(resolve(f).prefs.code_font_family, None);
     }
 
     #[test]
@@ -591,6 +640,8 @@ mod tests {
         .unwrap();
         let prefs = Preferences {
             font_size: 20.0,
+            font_family: Some("JetBrains Mono".into()),
+            code_font_family: Some("Hack".into()),
             full_width: true,
             max_width: 960.0,
             line_numbers: true,
@@ -603,13 +654,24 @@ mod tests {
         save_preferences(&path, &prefs).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# my comment"));
-        assert!(text.contains("# inline"));
+        assert!(text.contains("# inline"), "unchanged family keeps its comment: {text}");
+        assert!(text.contains("code_family = \"Hack\""), "{text}");
         assert!(text.contains("[themes.mine]"));
         assert!(text.contains("size = 20\n"), "{text}");
         let loaded = load(Some(&path));
         assert_eq!(loaded.prefs, prefs);
-        assert_eq!(loaded.font_family.as_deref(), Some("JetBrains Mono"));
         assert_eq!(loaded.theme.background.to_rgba8().r, 0x10);
+
+        // Back to the system default: the keys are removed, not written empty.
+        let defaults = Preferences {
+            font_family: None,
+            code_font_family: None,
+            ..prefs.clone()
+        };
+        save_preferences(&path, &defaults).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("family"), "{text}");
+        assert_eq!(load(Some(&path)).prefs, defaults);
 
         // A file that is not valid TOML is never overwritten.
         std::fs::write(&path, "[font\n").unwrap();

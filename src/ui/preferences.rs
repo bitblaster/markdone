@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use crate::config::{ExternalChange, FONT_SIZE_RANGE, MAX_WIDTH_RANGE, Preferences};
+use crate::text_engine::FontFamilyInfo;
 
 /// Font sizes offered by the slider (the config file accepts a wider range).
 const FONT_SLIDER: std::ops::RangeInclusive<f32> = 8.0..=40.0;
@@ -15,6 +16,7 @@ pub fn show(
     open: &mut bool,
     prefs: &mut Preferences,
     theme_names: &[String],
+    font_families: &[FontFamilyInfo],
     config_path: Option<&Path>,
 ) -> bool {
     let before = prefs.clone();
@@ -37,6 +39,20 @@ pub fn show(
                             ui.selectable_value(&mut prefs.theme, name.clone(), name.as_str());
                         }
                     });
+                ui.end_row();
+
+                ui.label("Text font");
+                font_picker(ui, "prefs-text-font", &mut prefs.font_family, font_families, false);
+                ui.end_row();
+
+                ui.label("Code font");
+                font_picker(
+                    ui,
+                    "prefs-code-font",
+                    &mut prefs.code_font_family,
+                    font_families,
+                    true,
+                );
                 ui.end_row();
 
                 ui.label("Font size");
@@ -139,6 +155,31 @@ pub fn show(
         .clamp(*MAX_WIDTH_RANGE.start(), *MAX_WIDTH_RANGE.end())
         .round();
     *prefs != before
+}
+
+/// The default entry of the font pickers (`None`).
+const SYSTEM_FONT: &str = "System monospace";
+
+/// A drop-down of installed font families (fixed-pitch ones only when `monospace_only`),
+/// headed by the system default. A configured family no longer installed still shows
+/// as the selection.
+fn font_picker(
+    ui: &mut egui::Ui,
+    id: &str,
+    value: &mut Option<String>,
+    families: &[FontFamilyInfo],
+    monospace_only: bool,
+) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(value.as_deref().unwrap_or(SYSTEM_FONT))
+        .width(220.0)
+        .height(360.0)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(value, None, SYSTEM_FONT);
+            for family in families.iter().filter(|f| !monospace_only || f.monospace) {
+                ui.selectable_value(value, Some(family.name.clone()), family.name.as_str());
+            }
+        });
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {

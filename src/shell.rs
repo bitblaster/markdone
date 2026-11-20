@@ -201,7 +201,7 @@ mod profile {
     }
 }
 use crate::commands::Command;
-use crate::text_engine::{TextEngine, peniko_color, peniko_color_alpha};
+use crate::text_engine::{FontFamilyInfo, TextEngine, peniko_color, peniko_color_alpha};
 use crate::text_input;
 use crate::links::{self, LinkTarget};
 use crate::session::Session;
@@ -902,6 +902,9 @@ struct App {
     config_path: Option<PathBuf>,
     /// The Preferences window is shown.
     prefs_open: bool,
+    /// Installed font families for the font pickers, scanned when the Preferences window
+    /// first opens.
+    font_families: Option<Vec<FontFamilyInfo>>,
     /// Preferences changed and not yet saved: saved at this time (debounced, so dragging
     /// a slider does not rewrite the file every frame).
     prefs_save_at: Option<Instant>,
@@ -1046,16 +1049,8 @@ impl App {
         }
         let next_tab_id = tabs.len() as u64;
         let title = window_title(&editor);
-        // Apply the configured font family, but only if it renders fixed-pitch — a
-        // proportional (or unloadable) family would break writ's deterministic wrapping.
         let mut text_engine = TextEngine::new();
-        if let Some(family) = config.font_family {
-            text_engine.set_font_family(Some(family.clone()));
-            if !text_engine.is_monospace() {
-                eprintln!("[markdone] config: font '{family}' is not monospace; using the default");
-                text_engine.set_font_family(None);
-            }
-        }
+        apply_fonts(&mut text_engine, &config.prefs);
         Self {
             context: RenderContext::new(),
             renderer: None,
@@ -1089,6 +1084,7 @@ impl App {
             theme_names: config.theme_names.clone(),
             config_path,
             prefs_open: false,
+            font_families: None,
             prefs_save_at: None,
             github,
             modal: missing_files_notice(&missing),
@@ -1570,6 +1566,14 @@ impl App {
         let mut relayout = false;
         if old.font_size != self.prefs.font_size {
             self.doc_engine.font_size = self.prefs.font_size;
+            relayout = true;
+        }
+        if old.font_family != self.prefs.font_family
+            || old.code_font_family != self.prefs.code_font_family
+        {
+            // The pickers only offer fixed-pitch code fonts, so a rejection here means the
+            // font failed to load; the layout falls back to the system monospace.
+            apply_fonts(&mut self.doc_engine.text_engine, &self.prefs);
             relayout = true;
         }
         if old.line_numbers != self.prefs.line_numbers {
@@ -2139,7 +2143,12 @@ impl App {
         };
         match cmd {
             Command::New => self.open_blank_tab(),
-            Command::Preferences => self.prefs_open = true,
+            Command::Preferences => {
+                if self.font_families.is_none() {
+                    self.font_families = Some(self.doc_engine.text_engine.font_families());
+                }
+                self.prefs_open = true;
+            }
             Command::GoToHeading(i) => {
                 self.go_to_heading(i);
                 return;
@@ -2386,6 +2395,23 @@ impl App {
 /// materialized band are always kept; older ones beyond this are evicted and reloaded on
 /// demand. ~10 downscaled 1024×728 screenshots.
 const IMAGE_MEMORY_BUDGET: usize = 32 * 1024 * 1024;
+
+/// Install the preferences' text and code fonts. The code font must render fixed-pitch
+/// (code relies on column alignment): a proportional or unloadable family falls back to
+/// the system monospace. Returns `false` when the code font was rejected.
+fn apply_fonts(engine: &mut TextEngine, prefs: &Preferences) -> bool {
+    engine.set_font_family(prefs.font_family.clone());
+    engine.set_code_font_family(prefs.code_font_family.clone());
+    if prefs.code_font_family.is_some() && !engine.code_font_is_monospace() {
+        eprintln!(
+            "[markdone] code font '{}' is not monospace; using the system monospace",
+            prefs.code_font_family.as_deref().unwrap_or_default()
+        );
+        engine.set_code_font_family(None);
+        return false;
+    }
+    true
+}
 
 /// Touchpad scroll distance (device px) that makes one Ctrl+wheel zoom step.
 const WHEEL_ZOOM_PX_PER_STEP: f32 = 50.0;
@@ -5258,6 +5284,7 @@ impl ApplicationHandler<WritEvent> for App {
                 let mut prefs_changed = false;
                 let mut prefs_open = self.prefs_open;
                 let theme_names = &self.theme_names;
+                let font_families = self.font_families.as_deref().unwrap_or_default();
                 let config_path = self.config_path.as_deref();
                 let ui_frame = self.ui.as_mut().map(|ui| {
                     ui.run(&state.window, modal_shown, |ui| {
@@ -5287,6 +5314,7 @@ impl ApplicationHandler<WritEvent> for App {
                                 &mut prefs_open,
                                 prefs,
                                 theme_names,
+                                font_families,
                                 config_path,
                             );
                         }

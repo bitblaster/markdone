@@ -48,10 +48,21 @@ impl StyleRun {
 pub struct TextEngine {
     fcx: FontContext,
     lcx: LayoutContext<Brush>,
-    /// User-chosen font family; `None` = system monospace. When set, layouts use the
-    /// stack `[family, monospace]` so a missing font (or one rejected by the startup
-    /// monospace guard) still falls back to system monospace.
+    /// User-chosen text font family (any font); `None` = system monospace. When set,
+    /// layouts use the stack `[family, monospace]` so a missing font still falls back.
     font_family: Option<String>,
+    /// User-chosen family for code (runs with `mono`: code blocks, inline code); `None`
+    /// = system monospace. Must be fixed-pitch: check with
+    /// [`code_font_is_monospace`](Self::code_font_is_monospace).
+    code_font_family: Option<String>,
+}
+
+/// An installed font family, for the font pickers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontFamilyInfo {
+    pub name: String,
+    /// Fixed-pitch (usable for code).
+    pub monospace: bool,
 }
 
 impl Default for TextEngine {
@@ -66,13 +77,20 @@ impl TextEngine {
             fcx: FontContext::new(),
             lcx: LayoutContext::new(),
             font_family: None,
+            code_font_family: None,
         }
     }
 
-    /// Set the document font family (`None` = system monospace). Callers should verify
-    /// fixed-pitch via [`is_monospace`](Self::is_monospace) before trusting a user value.
+    /// Set the text font family (`None` = system monospace). Any font works: layout
+    /// measures real advances, it doesn't assume a fixed pitch.
     pub fn set_font_family(&mut self, family: Option<String>) {
         self.font_family = family;
+    }
+
+    /// Set the code font family (`None` = system monospace). Callers should verify it is
+    /// fixed-pitch via [`code_font_is_monospace`](Self::code_font_is_monospace).
+    pub fn set_code_font_family(&mut self, family: Option<String>) {
+        self.code_font_family = family;
     }
 
     /// Register a font from raw bytes (TTF/OTF) into the layout collection and return the
@@ -137,10 +155,10 @@ impl TextEngine {
         fonts
     }
 
-    /// The default font for a line: the configured family with a monospace fallback, or
-    /// system monospace when unset. Owned (`'static`) so it borrows nothing from `self`.
-    fn body_family(&self) -> FontFamily<'static> {
-        match &self.font_family {
+    /// A configured family with a system-monospace fallback, or system monospace when
+    /// unset. Owned (`'static`) so it borrows nothing from `self`.
+    fn family_or_monospace(family: &Option<String>) -> FontFamily<'static> {
+        match family {
             Some(name) => FontFamily::List(Cow::Owned(vec![
                 FontFamilyName::Named(Cow::Owned(name.clone())),
                 FontFamilyName::Generic(GenericFamily::Monospace),
@@ -149,17 +167,46 @@ impl TextEngine {
         }
     }
 
-    /// Whether the current font is fixed-pitch: a run of `i` and a run of `M` share the
-    /// same advance. Guards writ's deterministic wrapping — a proportional family (or one
-    /// that fell back to a non-mono default because it failed to load) returns false.
-    pub fn is_monospace(&mut self) -> bool {
-        let wi = self
-            .build_line("iiiiiiiiii", 1.0, 16.0, 1.0, Color::WHITE, None, &[])
-            .width();
-        let wm = self
-            .build_line("MMMMMMMMMM", 1.0, 16.0, 1.0, Color::WHITE, None, &[])
-            .width();
+    /// Whether the code font is fixed-pitch: a run of `i` and a run of `M` share the same
+    /// advance. A proportional family (or one that fell back to a non-mono default because
+    /// it failed to load) returns false — code would lose its column alignment.
+    pub fn code_font_is_monospace(&mut self) -> bool {
+        let mut width = |text: &str| {
+            let mut mono = StyleRun::new(0..text.len(), Color::WHITE);
+            mono.mono = true;
+            self.build_line(text, 1.0, 16.0, 1.0, Color::WHITE, None, &[mono])
+                .width()
+        };
+        let (wi, wm) = (width("iiiiiiiiii"), width("MMMMMMMMMM"));
         (wi - wm).abs() <= 0.01 * wi.max(1.0)
+    }
+
+    /// The installed font families, sorted by name, each marked fixed-pitch or not (for
+    /// the font pickers). Reads only a few table pages of each family's default face —
+    /// fontique memory-maps font files — so it costs a short one-time scan, done when the
+    /// pickers are first shown, not at startup.
+    #[cfg(feature = "app")]
+    pub fn font_families(&mut self) -> Vec<FontFamilyInfo> {
+        let names: Vec<String> = self
+            .fcx
+            .collection
+            .family_names()
+            .filter(|n| !n.starts_with('.'))
+            .map(str::to_string)
+            .collect();
+        let mut out: Vec<FontFamilyInfo> = names
+            .into_iter()
+            .filter_map(|name| {
+                let family = self.fcx.collection.family_by_name(&name)?;
+                let font = family.default_font()?;
+                let blob = font.load(None)?;
+                let monospace = is_fixed_pitch(blob.data(), font.index());
+                Some(FontFamilyInfo { name, monospace })
+            })
+            .collect();
+        out.sort_by_key(|f| f.name.to_lowercase());
+        out.dedup_by(|a, b| a.name == b.name);
+        out
     }
 
     /// Build a laid-out line. `font_size` is in *logical* pixels; `scale` (the
@@ -215,7 +262,8 @@ impl TextEngine {
         content_start: usize,
         inline_boxes: &[(usize, f32, f32)],
     ) -> Layout<Brush> {
-        let family = self.body_family();
+        let family = Self::family_or_monospace(&self.font_family);
+        let code_family = Self::family_or_monospace(&self.code_font_family);
         let mut builder = self.lcx.ranged_builder(&mut self.fcx, text, scale, true);
         builder.push_default(StyleProperty::FontSize(font_size));
         builder.push_default(StyleProperty::LineHeight(LineHeight::FontSizeRelative(
@@ -246,7 +294,10 @@ impl TextEngine {
                 );
             }
             if run.mono {
-                builder.push(StyleProperty::FontFamily(family.clone()), run.range.clone());
+                builder.push(
+                    StyleProperty::FontFamily(code_family.clone()),
+                    run.range.clone(),
+                );
             }
             if run.underline {
                 builder.push(StyleProperty::Underline(true), run.range.clone());
@@ -397,6 +448,29 @@ pub(crate) fn display_range_selection(layout: &Layout<Brush>, range: Range<usize
     )
 }
 
+/// Whether the face `index` of font file `data` is fixed-pitch: it says so in its `post`
+/// table, or `i` and `M` have the same advance (some monospace fonts leave the flag
+/// unset). Unreadable fonts count as proportional.
+#[cfg(feature = "app")]
+fn is_fixed_pitch(data: &[u8], index: u32) -> bool {
+    use skrifa::MetadataProvider;
+    use skrifa::instance::{LocationRef, Size};
+    use skrifa::raw::TableProvider;
+    let Ok(font) = skrifa::FontRef::from_index(data, index) else {
+        return false;
+    };
+    if font.post().is_ok_and(|post| post.is_fixed_pitch() != 0) {
+        return true;
+    }
+    let charmap = font.charmap();
+    let metrics = font.glyph_metrics(Size::unscaled(), LocationRef::default());
+    let advance = |c: char| charmap.map(c).and_then(|g| metrics.advance_width(g));
+    match (advance('i'), advance('M')) {
+        (Some(i), Some(m)) => i > 0.0 && (i - m).abs() < 0.5,
+        _ => false,
+    }
+}
+
 /// A theme color at an explicit alpha (0..1) — for translucent diff backgrounds.
 pub fn peniko_color_alpha(c: Color, alpha: f32) -> Color {
     let [r, g, b, _] = c.components;
@@ -406,6 +480,33 @@ pub fn peniko_color_alpha(c: Color, alpha: f32) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Text and code fonts are independent: a proportional text font leaves code runs
+    /// fixed-pitch, and the code-font guard rejects a proportional family. Uses the
+    /// installed fonts; skipped on a system without a proportional one.
+    #[cfg(feature = "app")]
+    #[test]
+    fn text_and_code_fonts_are_independent() {
+        let mut engine = TextEngine::new();
+        let families = engine.font_families();
+        assert!(families.iter().any(|f| f.monospace), "no monospace font detected");
+        let Some(proportional) = families.iter().find(|f| !f.monospace) else {
+            return;
+        };
+        engine.set_font_family(Some(proportional.name.clone()));
+        assert!(engine.code_font_is_monospace(), "code stays on the system monospace");
+        let plain = |e: &mut TextEngine, t: &str| {
+            e.build_line(t, 1.0, 16.0, 1.0, Color::WHITE, None, &[]).width()
+        };
+        assert_ne!(
+            plain(&mut engine, "iiiiiiiiii"),
+            plain(&mut engine, "MMMMMMMMMM"),
+            "the text font {} should be proportional",
+            proportional.name
+        );
+        engine.set_code_font_family(Some(proportional.name.clone()));
+        assert!(!engine.code_font_is_monospace(), "a proportional code font is rejected");
+    }
 
     /// The visual byte-range covered by each laid-out line (union of its glyph runs).
     fn line_ranges(layout: &Layout<Brush>) -> Vec<Range<usize>> {
