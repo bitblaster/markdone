@@ -3504,6 +3504,14 @@ fn pointer_cursor(
     {
         return CursorIcon::Pointer;
     }
+    // A drawn task checkbox is a button: a click toggles it.
+    if doc_engine
+        .doc
+        .as_ref()
+        .is_some_and(|d| d.checkbox_line_at(mouse_pos.0, mouse_pos.1).is_some())
+    {
+        return CursorIcon::Pointer;
+    }
     if fold_chevrons
         .iter()
         .any(|(_, r)| rect_contains(r, mouse_pos))
@@ -4670,8 +4678,16 @@ impl ApplicationHandler<WritEvent> for App {
                         return;
                     }
                     // Clicking a checkbox toggles it (leaving the caret where it was)
-                    // rather than placing the caret in the box.
-                    if let Some(line) = self.doc_engine.editor.checkbox_at(off) {
+                    // rather than placing the caret in the box: the drawn box (off the
+                    // caret line), or the raw `[ ]` text (on it).
+                    let drawn_box = self
+                        .doc_engine
+                        .doc
+                        .as_ref()
+                        .and_then(|d| d.checkbox_line_at(self.mouse_pos.0, self.mouse_pos.1));
+                    if let Some(line) =
+                        drawn_box.or_else(|| self.doc_engine.editor.checkbox_at(off))
+                    {
                         self.doc_engine.editor.toggle_checkbox(line);
                         // A checkbox flip is a real buffer edit — run the full effect
                         // pipeline (find-rescan, ref/image sync) rather than a bare refresh

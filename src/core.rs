@@ -2805,10 +2805,10 @@ let code = target(); // fenced block line
         assert!(!anchors.iter().any(|a| a.byte_offset == 999));
         assert!(!editor.is_heading_folded(sibling));
 
-        // The parent checkbox still toggles while its children are folded (checking a task
-        // also strikes it through), and the fold offset survives the edit — kids stay hidden.
+        // The parent checkbox still toggles while its children are folded, and the fold
+        // offset survives the edit — kids stay hidden.
         editor.toggle_checkbox(0);
-        assert_eq!(editor.text().lines().next(), Some("- [x] ~~parent~~"));
+        assert_eq!(editor.text().lines().next(), Some("- [x] parent"));
         assert_eq!(
             editor.hidden_line_ranges(),
             vec![1..3],

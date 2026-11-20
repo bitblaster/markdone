@@ -1680,8 +1680,8 @@ impl EditorState {
     }
 
     pub fn toggle_checkbox(&mut self, line_number: usize) {
-        // Capture pre-toggle state so the whole cascade (child + parent + all
-        // strikethrough edits) collapses to a single undo entry at the end.
+        // Capture pre-toggle state so the whole cascade (the box, its children and the
+        // parents it checks or unchecks) collapses to a single undo entry at the end.
         let head_before = self.buffer.undo_head();
         let cursor_before = self.cursor().offset;
         let text_before = self.buffer.text();
@@ -1728,9 +1728,8 @@ impl EditorState {
         // Sort by offset descending so we can modify without invalidating earlier offsets
         checkboxes_to_toggle.sort_by_key(|c| std::cmp::Reverse(c.0));
 
-        // Toggle each checkbox + its line strikethrough. Descending offset order keeps a
-        // strikethrough's byte shift from invalidating the lower offsets processed next;
-        // the state replace is length-preserving.
+        // Toggle each checkbox (a length-preserving replace, so the order is free; kept
+        // descending all the same).
         for (offset, _currently_checked) in &checkboxes_to_toggle {
             self.set_checkbox(*offset, new_checked, &mut cursor_pos);
         }
@@ -1859,90 +1858,15 @@ impl EditorState {
         }
     }
 
-    /// Flip a single checkbox's state byte (`[ ]`↔`[x]`), toggle its line's
-    /// strikethrough to match, and advance `cursor_pos` by the strikethrough's byte
-    /// adjustment. The state replace is length-preserving; only strikethrough shifts bytes.
+    /// Flip a single checkbox's state byte (`[ ]`↔`[x]`). The replace is length-preserving,
+    /// so `cursor_pos` stays valid. The task's text is left alone: a completed task reads as
+    /// done by its dimmed rendering, not by `~~` written into the document.
     fn set_checkbox(&mut self, checkbox_offset: usize, checked: bool, cursor_pos: &mut usize) {
         let content_start = checkbox_offset + 1; // skip '['
         let content_end = content_start + 1;
         let new_content = if checked { "x" } else { " " };
         self.buffer
             .replace(content_start..content_end, new_content, *cursor_pos);
-        let line = self.buffer.byte_to_line(checkbox_offset);
-        let adjustment = self.toggle_line_strikethrough(line, checked, *cursor_pos);
-        *cursor_pos = (*cursor_pos as isize + adjustment) as usize;
-    }
-
-    /// Add or remove strikethrough (`~~`) from a line's content.
-    fn toggle_line_strikethrough(
-        &mut self,
-        line_idx: usize,
-        add_strikethrough: bool,
-        cursor_pos: usize,
-    ) -> isize {
-        // Clear tab cycle cache since content is changing
-        self.tab_cycle_cache = None;
-        if line_idx >= self.buffer.line_count() {
-            return 0;
-        }
-        let line = self.buffer.line_markers(line_idx);
-
-        let content_start = line.content_start();
-        let content_end = line.range.end;
-
-        if content_start >= content_end {
-            return 0;
-        }
-
-        let content = self.buffer.slice_cow(content_start..content_end);
-        let trimmed = content.trim();
-
-        if trimmed.is_empty() {
-            return 0;
-        }
-
-        // The content span excluding surrounding whitespace — the range the `~~` wraps.
-        let leading_ws = content.len() - content.trim_start().len();
-        let trailing_ws = content.len() - content.trim_end().len();
-        let text_start = content_start + leading_ws;
-        let text_end = content_end - trailing_ws;
-
-        if add_strikethrough {
-            if trimmed.starts_with("~~") && trimmed.ends_with("~~") {
-                return 0;
-            }
-            // Single replace wrapping the text in `~~` — one undo entry, byte-identical
-            // to inserting `~~` at both ends.
-            let wrapped = format!("~~{trimmed}~~");
-            self.buffer
-                .replace(text_start..text_end, &wrapped, cursor_pos);
-
-            let mut adjustment: isize = 0;
-            if cursor_pos > text_start {
-                adjustment += 2;
-            }
-            if cursor_pos > text_end {
-                adjustment += 2;
-            }
-            adjustment
-        } else if trimmed.starts_with("~~") && trimmed.ends_with("~~") && trimmed.len() >= 4 {
-            // Single replace stripping the wrapping `~~` — one undo entry, byte-identical
-            // to deleting the trailing and leading `~~` separately.
-            let inner = trimmed[2..trimmed.len() - 2].to_string();
-            self.buffer
-                .replace(text_start..text_end, &inner, cursor_pos);
-
-            let mut adjustment: isize = 0;
-            if cursor_pos > text_start + 2 {
-                adjustment -= 2;
-            }
-            if cursor_pos > text_end {
-                adjustment -= 2;
-            }
-            adjustment
-        } else {
-            0
-        }
     }
 }
 
@@ -2621,27 +2545,27 @@ mod tests {
         fn delete_checkbox_marker_rechecks_parent() {
             // Start with checked parent and one checked nested child
             // Cycle: "" -> "- [ ] " -> "  " -> "  - [ ] " -> ""
-            let mut state = editor_with_cursor("- [x] ~~parent~~\n  - [x] ~~nested~~\n|");
+            let mut state = editor_with_cursor("- [x] parent\n  - [x] nested\n|");
             // Tab three times to create a new nested unchecked checkbox (with para indent now in cycle)
             state.tab();
             state.tab();
             state.tab();
-            assert_editor_eq(&state, "- [x] ~~parent~~\n  - [x] ~~nested~~\n  - [ ] |");
+            assert_editor_eq(&state, "- [x] parent\n  - [x] nested\n  - [ ] |");
             // Type to make it parseable - this should uncheck the parent
             state.insert_text("new");
-            assert_editor_eq(&state, "- [ ] parent\n  - [x] ~~nested~~\n  - [ ] new|");
+            assert_editor_eq(&state, "- [ ] parent\n  - [x] nested\n  - [ ] new|");
             // Now delete backwards to remove the unchecked child entirely
             // First delete the content
             state.delete_backward();
             state.delete_backward();
             state.delete_backward();
-            assert_editor_eq(&state, "- [ ] parent\n  - [x] ~~nested~~\n  - [ ] |");
+            assert_editor_eq(&state, "- [ ] parent\n  - [x] nested\n  - [ ] |");
             // Delete the checkbox marker
             state.delete_backward();
-            assert_editor_eq(&state, "- [ ] parent\n  - [x] ~~nested~~\n  - |");
+            assert_editor_eq(&state, "- [ ] parent\n  - [x] nested\n  - |");
             // Delete the list marker
             state.delete_backward();
-            assert_editor_eq(&state, "- [x] ~~parent~~\n  - [x] ~~nested~~\n  |");
+            assert_editor_eq(&state, "- [x] parent\n  - [x] nested\n  |");
         }
 
         #[test]
@@ -3206,52 +3130,39 @@ mod tests {
             let mut state = editor_with_cursor("- [ ] |parent\n  - [ ] child1\n  - [ ] child2\n");
             state.toggle_checkbox(0);
             let text = state.text();
-            assert!(text.contains("[x] ~~parent~~"), "parent should be checked");
-            assert!(text.contains("[x] ~~child1~~"), "child1 should be checked");
-            assert!(text.contains("[x] ~~child2~~"), "child2 should be checked");
+            assert!(text.contains("[x] parent"), "parent should be checked");
+            assert!(text.contains("[x] child1"), "child1 should be checked");
+            assert!(text.contains("[x] child2"), "child2 should be checked");
         }
 
         #[test]
         fn uncheck_parent_unchecks_all_children() {
-            let mut state =
-                editor_with_cursor("- [x] ~~|parent~~\n  - [x] ~~child1~~\n  - [x] ~~child2~~\n");
+            let mut state = editor_with_cursor("- [x] |parent\n  - [x] child1\n  - [x] child2\n");
             state.toggle_checkbox(0);
             let text = state.text();
             assert!(text.contains("[ ] parent"), "parent should be unchecked");
             assert!(text.contains("[ ] child1"), "child1 should be unchecked");
             assert!(text.contains("[ ] child2"), "child2 should be unchecked");
-            assert!(!text.contains("~~"), "no strikethrough should remain");
         }
 
         #[test]
         fn check_all_siblings_checks_parent() {
-            let mut state =
-                editor_with_cursor("- [ ] parent\n  - [x] ~~child1~~\n  - [ ] |child2\n");
+            let mut state = editor_with_cursor("- [ ] parent\n  - [x] child1\n  - [ ] |child2\n");
             state.toggle_checkbox(2);
             let text = state.text();
-            assert!(
-                text.contains("[x] ~~parent~~"),
-                "parent should be auto-checked"
-            );
-            assert!(
-                text.contains("[x] ~~child1~~"),
-                "child1 should remain checked"
-            );
-            assert!(text.contains("[x] ~~child2~~"), "child2 should be checked");
+            assert!(text.contains("[x] parent"), "parent should be auto-checked");
+            assert!(text.contains("[x] child1"), "child1 should remain checked");
+            assert!(text.contains("[x] child2"), "child2 should be checked");
         }
 
         #[test]
         fn uncheck_child_unchecks_parent() {
-            let mut state =
-                editor_with_cursor("- [x] ~~parent~~\n  - [x] ~~|child1~~\n  - [x] ~~child2~~\n");
+            let mut state = editor_with_cursor("- [x] parent\n  - [x] |child1\n  - [x] child2\n");
             state.toggle_checkbox(1);
             let text = state.text();
             assert!(text.contains("[ ] parent"), "parent should be unchecked");
             assert!(text.contains("[ ] child1"), "child1 should be unchecked");
-            assert!(
-                text.contains("[x] ~~child2~~"),
-                "child2 should remain checked"
-            );
+            assert!(text.contains("[x] child2"), "child2 should remain checked");
         }
 
         #[test]
@@ -3289,9 +3200,9 @@ mod tests {
             let mut state = editor_with_cursor("- [ ] |level1\n  - [ ] level2\n    - [ ] level3\n");
             state.toggle_checkbox(0);
             let text = state.text();
-            assert!(text.contains("[x] ~~level1~~"), "level1 should be checked");
-            assert!(text.contains("[x] ~~level2~~"), "level2 should be checked");
-            assert!(text.contains("[x] ~~level3~~"), "level3 should be checked");
+            assert!(text.contains("[x] level1"), "level1 should be checked");
+            assert!(text.contains("[x] level2"), "level2 should be checked");
+            assert!(text.contains("[x] level3"), "level3 should be checked");
         }
 
         #[test]
@@ -3299,15 +3210,9 @@ mod tests {
             let mut state = editor_with_cursor("- [ ] level1\n  - [ ] level2\n    - [ ] |level3\n");
             state.toggle_checkbox(2);
             let text = state.text();
-            assert!(
-                text.contains("[x] ~~level1~~"),
-                "level1 should be auto-checked"
-            );
-            assert!(
-                text.contains("[x] ~~level2~~"),
-                "level2 should be auto-checked"
-            );
-            assert!(text.contains("[x] ~~level3~~"), "level3 should be checked");
+            assert!(text.contains("[x] level1"), "level1 should be auto-checked");
+            assert!(text.contains("[x] level2"), "level2 should be auto-checked");
+            assert!(text.contains("[x] level3"), "level3 should be checked");
         }
 
         #[test]
@@ -3316,7 +3221,7 @@ mod tests {
             state.toggle_checkbox(1);
             let text = state.text();
             assert!(text.contains("[ ] parent"), "parent should stay unchecked");
-            assert!(text.contains("[x] ~~child1~~"), "child1 should be checked");
+            assert!(text.contains("[x] child1"), "child1 should be checked");
             assert!(text.contains("[ ] child2"), "child2 should stay unchecked");
         }
     }
@@ -3328,15 +3233,11 @@ mod tests {
         fn single_undo_reverts_cascade_to_children_and_parent() {
             // Checking child2 checks child2 AND auto-checks the parent — a cascade
             // spanning multiple lines. One undo must revert the entire toggle.
-            let before = trim_raw("- [ ] parent\n  - [x] ~~child1~~\n  - [ ] child2\n");
-            let mut state =
-                editor_with_cursor("- [ ] parent\n  - [x] ~~child1~~\n  - [ ] |child2\n");
+            let before = trim_raw("- [ ] parent\n  - [x] child1\n  - [ ] child2\n");
+            let mut state = editor_with_cursor("- [ ] parent\n  - [x] child1\n  - [ ] |child2\n");
             state.toggle_checkbox(2);
-            assert!(
-                state.text().contains("[x] ~~parent~~"),
-                "parent auto-checked"
-            );
-            assert!(state.text().contains("[x] ~~child2~~"), "child2 checked");
+            assert!(state.text().contains("[x] parent"), "parent auto-checked");
+            assert!(state.text().contains("[x] child2"), "child2 checked");
 
             state.buffer.undo();
             assert_eq!(state.text(), before, "one undo reverts the whole cascade");
@@ -3344,9 +3245,20 @@ mod tests {
         }
 
         #[test]
+        fn toggle_leaves_the_task_text_alone() {
+            // Only the box changes: the text (here with the user's own strikethrough,
+            // and without one) is never rewritten.
+            let mut state = editor_with_cursor("- [ ] |~~old~~ task\n- [x] done\n");
+            state.toggle_checkbox(0);
+            assert_eq!(state.text(), "- [x] ~~old~~ task\n- [x] done\n");
+            state.toggle_checkbox(1);
+            state.toggle_checkbox(0);
+            assert_eq!(state.text(), "- [ ] ~~old~~ task\n- [ ] done\n");
+        }
+
+        #[test]
         fn redo_reapplies_full_cascade() {
-            let mut state =
-                editor_with_cursor("- [ ] parent\n  - [x] ~~child1~~\n  - [ ] |child2\n");
+            let mut state = editor_with_cursor("- [ ] parent\n  - [x] child1\n  - [ ] |child2\n");
             state.toggle_checkbox(2);
             let after = state.text();
 
@@ -3359,7 +3271,7 @@ mod tests {
         fn toggle_leaf_box_text_and_single_entry() {
             let mut state = editor_with_cursor("- [ ] |task\n");
             state.toggle_checkbox(0);
-            assert_eq!(state.text(), "- [x] ~~task~~\n");
+            assert_eq!(state.text(), "- [x] task\n");
             state.buffer.undo();
             assert_eq!(state.text(), "- [ ] task\n");
             assert!(!state.buffer.can_undo(), "leaf toggle is one undo entry");
@@ -3371,51 +3283,23 @@ mod tests {
             state.toggle_checkbox(0);
             assert_eq!(
                 state.text(),
-                "- [x] ~~parent~~\n  - [x] ~~child1~~\n  - [x] ~~child2~~\n"
+                "- [x] parent\n  - [x] child1\n  - [x] child2\n"
             );
         }
 
         #[test]
         fn uncheck_cascades_to_parent_text() {
-            let mut state =
-                editor_with_cursor("- [x] ~~parent~~\n  - [x] ~~|child1~~\n  - [x] ~~child2~~\n");
+            let mut state = editor_with_cursor("- [x] parent\n  - [x] |child1\n  - [x] child2\n");
             state.toggle_checkbox(1);
             assert_eq!(
                 state.text(),
-                "- [ ] parent\n  - [ ] child1\n  - [x] ~~child2~~\n"
+                "- [ ] parent\n  - [ ] child1\n  - [x] child2\n"
             );
         }
     }
 
-    mod strikethrough_tests {
+    mod undo_tests {
         use super::*;
-
-        #[test]
-        fn strikethrough_add_remove_round_trips() {
-            let mut state = EditorState::new("hello world\n");
-            state.toggle_line_strikethrough(0, true, 0);
-            assert_eq!(state.text(), "~~hello world~~\n");
-            state.toggle_line_strikethrough(0, false, 0);
-            assert_eq!(
-                state.text(),
-                "hello world\n",
-                "round-trip is byte-identical"
-            );
-        }
-
-        #[test]
-        fn strikethrough_add_is_single_undo() {
-            let mut state = EditorState::new("hello world\n");
-            state.toggle_line_strikethrough(0, true, 0);
-            assert_eq!(state.text(), "~~hello world~~\n");
-            state.buffer.undo();
-            assert_eq!(
-                state.text(),
-                "hello world\n",
-                "one undo reverts the whole strikethrough toggle"
-            );
-            assert!(!state.buffer.can_undo(), "no further undo entries remain");
-        }
 
         #[test]
         fn typing_coalesces_into_word_undo_steps() {
@@ -3461,26 +3345,6 @@ mod tests {
             assert_eq!(state.text(), "ab", "typing after a paste undoes separately");
             state.buffer.undo();
             assert_eq!(state.text(), "", "the paste is its own step");
-        }
-
-        #[test]
-        fn strikethrough_remove_is_single_undo() {
-            let mut state = EditorState::new("~~hello world~~\n");
-            state.toggle_line_strikethrough(0, false, 0);
-            assert_eq!(state.text(), "hello world\n");
-            state.buffer.undo();
-            assert_eq!(state.text(), "~~hello world~~\n", "one undo restores `~~`");
-            assert!(!state.buffer.can_undo(), "no further undo entries remain");
-        }
-
-        #[test]
-        fn strikethrough_preserves_surrounding_whitespace() {
-            // Leading/trailing whitespace must be outside the `~~` wrap.
-            let mut state = EditorState::new("  hello  \n");
-            state.toggle_line_strikethrough(0, true, 0);
-            assert_eq!(state.text(), "  ~~hello~~  \n");
-            state.toggle_line_strikethrough(0, false, 0);
-            assert_eq!(state.text(), "  hello  \n");
         }
     }
 }

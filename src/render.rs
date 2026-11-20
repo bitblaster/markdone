@@ -52,6 +52,15 @@ pub struct InlineImageRef {
     pub display_offset: usize,
 }
 
+/// A task item's `[ ]` / `[x]` collapsed to a zero-width display point on a line; the
+/// draw path paints a checkbox there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InlineCheckboxRef {
+    pub checked: bool,
+    /// Display byte offset of the collapsed checkbox's zero-width point.
+    pub display_offset: usize,
+}
+
 /// An inline `$…$` math span collapsed to a zero-width display point on a line. The draw
 /// path reserves an inline box there and paints the rendered math image on the baseline.
 #[derive(Clone)]
@@ -115,6 +124,10 @@ pub struct LineRender {
     /// draw path reserves an inline box for the rendered math. Empty for a span the cursor
     /// is inside (raw `$…$` revealed) and when the `math` feature is off.
     pub inline_math: Vec<InlineMathRef>,
+    /// A task item's checkbox, collapsed to a zero-width point where the draw path
+    /// reserves an inline box and paints the box (with its check mark). Empty while the
+    /// cursor is on the line: the raw `- [ ] ` / `- [x] ` is shown for editing.
+    pub inline_checkboxes: Vec<InlineCheckboxRef>,
     /// This line is a grid-rendered table row: its raw pipe text is hidden (`text`
     /// empty) and the draw path paints the cell grid instead. `None` when the line is
     /// not a table, or when the cursor is inside the table block (raw text revealed).
@@ -369,6 +382,8 @@ pub fn build_line_render(
     // Inline images collected during the specials pass: (buffer offset of the collapsed
     // `![alt](url)` span, url, alt). Resolved to display offsets once the map is built.
     let mut inline_image_specs: Vec<(usize, String, String)> = Vec::new();
+    // Task-item checkboxes collapsed to an inline box: (buffer offset of `[`, checked).
+    let mut inline_checkbox_specs: Vec<(usize, bool)> = Vec::new();
     if is_grid_table {
         // Grid mode: hide the whole line; the draw path paints the cell grid instead.
         if line_end > line_start {
@@ -392,14 +407,16 @@ pub fn build_line_render(
         if is_standalone_image && line_end > line_start {
             specials.push(Special::Hidden(line_start..line_end));
         }
-        // Prefix markers render as bullets / blockquote gutters (always on — they're
-        // structural), substituting `- `→`• `, `> `→`  ` (the blockquote bar is painted
-        // as a continuous rule in the draw path, not a per-line glyph). Indent whitespace and
-        // ordered-list numbers stay literal; checkbox stays as `[ ]`/`[x]`.
-        // On a task item the checkbox is the marker, so suppress the list bullet
-        // (`has_checkbox_style`, computed above, is the same scan).
+        // Prefix markers: blockquotes always render as gutters (`> `→`  `; the bar is
+        // painted as a continuous rule in the draw path, not a per-line glyph). List
+        // markers render only off the cursor line, like the rest of the syntax: `- `→`• `,
+        // and a task item's `- [ ] ` becomes a drawn checkbox (its `- ` hidden, its
+        // `[ ]`/`[x]` collapsed to an inline box below). On the cursor line the raw
+        // markers show, so they can be edited. Indent whitespace and ordered-list numbers
+        // stay literal. (`has_checkbox_style`, computed above, is the task-item scan.)
         for marker in &markers.markers {
             let sub = match &marker.kind {
+                MarkerKind::ListItem { ordered: false, .. } if cursor_on_line => None,
                 // Task item: hide the `- ` so the checkbox is the marker.
                 MarkerKind::ListItem { ordered: false, .. } if has_checkbox_style => Some(""),
                 MarkerKind::ListItem {
@@ -408,6 +425,16 @@ pub fn build_line_render(
                     ..
                 } => Some(unordered_marker.as_ref().map_or("• ", |m| m.bullet())),
                 MarkerKind::BlockQuote => Some("  "),
+                MarkerKind::Checkbox { checked } if !cursor_on_line => {
+                    // The marker is `[ ] ` (4 bytes): hide the `[ ]`, keep the space as
+                    // the gap after the drawn box.
+                    let start = marker.range.start;
+                    if start >= line_start && start + 3 <= line_end {
+                        specials.push(Special::Hidden(start..start + 3));
+                        inline_checkbox_specs.push((start, *checked));
+                    }
+                    None
+                }
                 _ => None,
             };
             if let Some(display) = sub
@@ -511,6 +538,13 @@ pub fn build_line_render(
         })
         .collect();
     inline_math.sort_by_key(|m| m.display_offset);
+    let inline_checkboxes: Vec<InlineCheckboxRef> = inline_checkbox_specs
+        .into_iter()
+        .map(|(buffer_start, checked)| InlineCheckboxRef {
+            checked,
+            display_offset: map.buffer_to_display(buffer_start),
+        })
+        .collect();
 
     // Display offsets of each blockquote marker (outermost first), for the drawn gutter
     // rules. Skipped inside code blocks, where `> ` isn't a quote marker.
@@ -660,6 +694,7 @@ pub fn build_line_render(
         code_ranges,
         inline_images,
         inline_math,
+        inline_checkboxes,
         table: table_ref,
     }
 }
@@ -791,8 +826,50 @@ mod tests {
         assert!(!lr.runs.iter().any(|r| r.underline));
     }
 
+    /// List markers render off the cursor line (a bullet; a task's checkbox drawn in an
+    /// inline box) and show their raw source on it, so they can be edited.
+    #[test]
+    fn list_markers_reveal_on_the_cursor_line() {
+        let theme = EditorTheme::dracula();
+        let mut buf: Buffer = "- item\n- [x] done\n".parse().unwrap();
+        let snap = buf.render_snapshot();
+        let line = |idx: usize, cursor: usize| {
+            build_line_render(
+                &snap,
+                idx,
+                &theme,
+                18.0,
+                cursor,
+                &[],
+                &[],
+                None,
+                &[],
+                &[],
+                None,
+            )
+        };
+        let away = usize::MAX;
+        let bullet = line(0, away);
+        assert!(bullet.text.starts_with('•') && bullet.text.ends_with("item"));
+        assert_eq!(line(0, 2).text, "- item", "raw marker on the cursor line");
+
+        let task = line(1, away);
+        assert_eq!(
+            task.text, " done",
+            "`- [x]` collapses to the drawn box + a space"
+        );
+        assert_eq!(task.inline_checkboxes.len(), 1);
+        let task_start = "- item\n".len();
+        let editing = line(1, task_start + 3);
+        assert_eq!(
+            editing.text, "- [x] done",
+            "raw task marker on the cursor line"
+        );
+        assert!(editing.inline_checkboxes.is_empty());
+    }
+
     /// A completed task dims its content (muted, spanning the line) while its checkbox
-    /// stays green; an active task's content is not dimmed.
+    /// is drawn; an active task's content is not dimmed.
     #[test]
     fn completed_task_dims_content() {
         let theme = EditorTheme::dracula();
@@ -819,11 +896,13 @@ mod tests {
                 .any(|r| r.color == comment && r.range.len() >= done.text.len()),
             "completed task content is dimmed across the line"
         );
-        assert!(
-            done.runs
-                .iter()
-                .any(|r| r.color == peniko_color(theme.green)),
-            "the checkbox itself stays green"
+        assert_eq!(
+            done.inline_checkboxes,
+            [InlineCheckboxRef {
+                checked: true,
+                display_offset: 0
+            }],
+            "the checkbox is drawn, at the start of the line"
         );
 
         let todo = build_line_render(

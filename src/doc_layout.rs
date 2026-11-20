@@ -35,8 +35,8 @@ use crate::mermaid;
 #[cfg(feature = "math")]
 use crate::render::InlineMathRef;
 use crate::render::{
-    CalloutHeader, ImageRef, InlineImageRef, LineRender, TableCtx, build_cell_render,
-    build_line_render,
+    CalloutHeader, ImageRef, InlineCheckboxRef, InlineImageRef, LineRender, TableCtx,
+    build_cell_render, build_line_render,
 };
 use crate::segment_map::SegmentMap;
 use crate::table::{Align, RowKind, TableInfo, TableRow};
@@ -626,6 +626,32 @@ fn wrapped_rows(text_w: f32, width: f32, k: f32) -> f32 {
 /// [`wrapped_rows`]).
 const WRAP_SLACK_CHARS: f32 = 1.5;
 
+/// Inline boxes (and their draws) for a line's task checkboxes: a square of about the
+/// text's cap height plus a bit, in device px. Parley sits an inline box on the baseline;
+/// the draw drops it slightly so it straddles the baseline the way a checkbox beside text
+/// does.
+fn resolve_inline_checkboxes(
+    checkboxes: &[InlineCheckboxRef],
+    font_size: f32,
+    scale: f32,
+) -> (Vec<(usize, f32, f32)>, Vec<InlineImageDraw>) {
+    let side = (font_size * scale * 0.85).round().max(8.0);
+    let drop = (side * 0.15).round();
+    checkboxes
+        .iter()
+        .map(|c| {
+            (
+                (c.display_offset, side, side),
+                InlineImageDraw {
+                    brush: None,
+                    baseline_offset: drop,
+                    checkbox: Some(c.checked),
+                },
+            )
+        })
+        .unzip()
+}
+
 /// Vertical padding (logical px) above and below an image block.
 const IMG_VPAD: f32 = 8.0;
 /// Block height (logical px) reserved for a loading/failed image placeholder.
@@ -679,6 +705,8 @@ struct InlineImageDraw {
     /// baseline (descenders), so its image is shifted down by its descent to sit the
     /// math baseline on the text baseline. `0.0` for ordinary images.
     baseline_offset: f32,
+    /// A task checkbox to paint in the box instead of an image: `Some(checked)`.
+    checkbox: Option<bool>,
 }
 
 /// Inline git-diff decorations for one real line (added-line bg + word ranges).
@@ -942,6 +970,7 @@ fn resolve_inline_images(
                         InlineImageDraw {
                             brush,
                             baseline_offset: 0.0,
+                            checkbox: None,
                         },
                     )
                 }
@@ -962,6 +991,7 @@ fn resolve_inline_images(
                         InlineImageDraw {
                             brush: None,
                             baseline_offset: 0.0,
+                            checkbox: None,
                         },
                     )
                 }
@@ -971,6 +1001,7 @@ fn resolve_inline_images(
                     InlineImageDraw {
                         brush: None,
                         baseline_offset: 0.0,
+                        checkbox: None,
                     },
                 ),
             };
@@ -1036,6 +1067,7 @@ fn resolve_inline_math(
                         InlineImageDraw {
                             brush,
                             baseline_offset: descent,
+                            checkbox: None,
                         },
                     )
                 }
@@ -1045,6 +1077,7 @@ fn resolve_inline_math(
                     InlineImageDraw {
                         brush: None,
                         baseline_offset: 0.0,
+                        checkbox: None,
                     },
                 ),
             };
@@ -1214,6 +1247,10 @@ pub struct DocLayout {
     /// (device px + theme colors).
     code_boxes: Vec<CodeBox>,
     code_box_bg: Color,
+    /// Task checkbox colors: the filled box, its check mark, an empty box's border.
+    checkbox_on: Color,
+    checkbox_mark: Color,
+    checkbox_border: Color,
     code_box_pad: f32,
     code_label_size: f32,
     code_label_color: Color,
@@ -1361,6 +1398,7 @@ impl DocLayout {
             code_ranges: Vec::new(),
             inline_images: Vec::new(),
             inline_math: Vec::new(),
+            inline_checkboxes: Vec::new(),
             table: None,
         });
         // The materialized band: [measure_from_line, measured_count). Lines before
@@ -1778,6 +1816,13 @@ impl DocLayout {
                 inline_boxes.extend(math_boxes);
                 line_inline_draws.extend(math_draws);
             }
+            // Task checkboxes share the same id space, appended last.
+            if !lr.inline_checkboxes.is_empty() {
+                let (boxes, draws) =
+                    resolve_inline_checkboxes(&lr.inline_checkboxes, lr.font_size, scale);
+                inline_boxes.extend(boxes);
+                line_inline_draws.extend(draws);
+            }
             let key = line_key(
                 &lr.text,
                 scale,
@@ -1996,6 +2041,9 @@ impl DocLayout {
             code_boxes,
             // The image-placeholder tint: a faint panel that reads as "not prose".
             code_box_bg: peniko_color_alpha(theme.comment, 0.08),
+            checkbox_on: peniko_color(theme.cyan),
+            checkbox_mark: peniko_color(theme.background),
+            checkbox_border: peniko_color(theme.comment),
             code_box_pad: 6.0 * scale,
             code_label_size: 12.0 * scale,
             code_label_color: peniko_color(theme.comment),
@@ -2361,6 +2409,10 @@ impl DocLayout {
                 };
                 let x = self.pad_x as f64 + pib.x as f64;
                 let y = gy as f64 + pib.y as f64 + draw.baseline_offset as f64;
+                if let Some(checked) = draw.checkbox {
+                    self.paint_checkbox(scene, x, y, pib.width as f64, checked);
+                    continue;
+                }
                 match &draw.brush {
                     Some((paint, nat_w, nat_h)) => {
                         draw_paint(
@@ -2385,6 +2437,80 @@ impl DocLayout {
                     }
                 }
             }
+        }
+    }
+
+    /// The line of the drawn task checkbox under the screen point `(x, y)` (device px), if
+    /// any — a click there toggles the task. (Off the cursor line the `[ ]` text is
+    /// hidden, so the click can't be told from its buffer offset.)
+    pub fn checkbox_line_at(&self, x: f32, y: f32) -> Option<usize> {
+        let n = self.layouts.len();
+        if n == 0 {
+            return None;
+        }
+        let cy = y + self.scroll_y;
+        let line = self.tops[..n]
+            .partition_point(|&t| t <= cy)
+            .saturating_sub(1)
+            .min(n - 1);
+        let draws = &self.inline_draws[line];
+        if draws.is_empty() {
+            return None;
+        }
+        let (lx, ly) = (x - self.pad_x, cy - self.real_top(line));
+        for row in self.layouts[line].lines() {
+            for item in row.items() {
+                let PositionedLayoutItem::InlineBox(pib) = item else {
+                    continue;
+                };
+                let Some(draw) = draws.get(pib.id as usize) else {
+                    continue;
+                };
+                let top = pib.y + draw.baseline_offset;
+                if draw.checkbox.is_some()
+                    && (pib.x..=pib.x + pib.width).contains(&lx)
+                    && (top..=top + pib.height).contains(&ly)
+                {
+                    return Some(line);
+                }
+            }
+        }
+        None
+    }
+
+    /// Paint a task checkbox of `side` device px at `(x, y)`: a filled rounded square with
+    /// a check mark when `checked`, an outlined one otherwise.
+    fn paint_checkbox(&self, scene: &mut Scene, x: f64, y: f64, side: f64, checked: bool) {
+        let radius = side * 0.22;
+        if checked {
+            let rect = Rect::new(x, y, x + side, y + side).to_rounded_rect(radius);
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                self.checkbox_on,
+                None,
+                &rect,
+            );
+            let mut mark = vello::kurbo::BezPath::new();
+            mark.move_to((x + side * 0.24, y + side * 0.52));
+            mark.line_to((x + side * 0.43, y + side * 0.71));
+            mark.line_to((x + side * 0.77, y + side * 0.31));
+            let stroke = Stroke::new(side * 0.14)
+                .with_caps(vello::kurbo::Cap::Round)
+                .with_join(vello::kurbo::Join::Round);
+            scene.stroke(&stroke, Affine::IDENTITY, self.checkbox_mark, None, &mark);
+        } else {
+            let width = (side * 0.09).max(1.0);
+            let inset = width / 2.0;
+            let rect = Rect::new(x + inset, y + inset, x + side - inset, y + side - inset)
+                .to_rounded_rect(radius - inset);
+            scene.stroke(
+                &Stroke::new(width),
+                Affine::IDENTITY,
+                self.checkbox_border,
+                None,
+                &rect,
+            );
         }
     }
 
@@ -2907,6 +3033,7 @@ mod tests {
                         code_ranges: Vec::new(),
                         inline_images: Vec::new(),
                         inline_math: Vec::new(),
+                        inline_checkboxes: Vec::new(),
                         table: None,
                     })
                 })
@@ -2932,6 +3059,9 @@ mod tests {
             code_bg: Color::TRANSPARENT,
             code_boxes: Vec::new(),
             code_box_bg: Color::TRANSPARENT,
+            checkbox_on: Color::TRANSPARENT,
+            checkbox_mark: Color::TRANSPARENT,
+            checkbox_border: Color::TRANSPARENT,
             code_box_pad: 0.0,
             code_label_size: 12.0,
             code_label_color: Color::TRANSPARENT,
@@ -3676,6 +3806,65 @@ mod tests {
             doc.scroll_y,
             doc.max_scroll(viewport_h)
         );
+    }
+
+    /// A drawn task checkbox (an inline box, its `[ ]` text hidden) is found by position,
+    /// so a click on it toggles the task.
+    #[test]
+    fn drawn_checkbox_is_clickable() {
+        use crate::buffer::Buffer;
+        let mut engine = TextEngine::new();
+        let theme = EditorTheme::dracula();
+        let text = "- [ ] task\n\nother\n";
+        let mut buffer: Buffer = text.parse().unwrap();
+        let snapshot = buffer.render_snapshot();
+        let params = test_params(&theme, 1000.0);
+        let caret = text.find("other").unwrap(); // off the task line: rendered
+        let doc = DocLayout::build(
+            &mut engine,
+            &mut LineCache::new(),
+            &mut RenderCache::new(),
+            &mut HeightCache::new(),
+            &mut TableCache::new(),
+            1,
+            &snapshot,
+            &theme,
+            None,
+            None,
+            &ImageCache::new(),
+            caret,
+            &params,
+            None,
+            0,
+            f32::INFINITY,
+            &[],
+            &(caret..caret),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(doc.inline_draws[0].len(), 1, "one drawn checkbox");
+        // The box as laid out, in screen coordinates.
+        let pib = doc.layouts[0]
+            .lines()
+            .flat_map(|row| row.items().collect::<Vec<_>>())
+            .find_map(|item| match item {
+                PositionedLayoutItem::InlineBox(pib) => Some(pib),
+                _ => None,
+            })
+            .expect("the checkbox's inline box");
+        let left = doc.body_left() + pib.x;
+        let top = doc.line_top_screen(0).unwrap() + pib.y + doc.inline_draws[0][0].baseline_offset;
+        let mid_y = top + pib.height / 2.0;
+        // Both halves of the box hit it; the task text after it and the next line don't.
+        for dx in [1.0, pib.width - 1.0] {
+            assert_eq!(
+                doc.checkbox_line_at(left + dx, mid_y),
+                Some(0),
+                "a click at +{dx} must hit the box"
+            );
+        }
+        assert_eq!(doc.checkbox_line_at(left + pib.width * 3.0, mid_y), None);
+        let other_y = doc.line_top_screen(2).unwrap() + 4.0;
+        assert_eq!(doc.checkbox_line_at(left + 1.0, other_y), None);
     }
 
     /// A code block the caret is outside of hides its fences and shows a labelled box;
