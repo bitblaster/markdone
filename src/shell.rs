@@ -4023,8 +4023,10 @@ impl ApplicationHandler<WritEvent> for App {
         // Native decorations (shadow, rounded corners, resize, snap — all free), but
         // request a dark title bar to match the editor instead of a bright one over
         // dark content. On Wayland CSD this also honors WINIT_WAYLAND_CSD_THEME.
+        // Hidden until the renderer is ready (see `set_visible` below).
         let mut attrs = Window::default_attributes()
             .with_title(self.title.clone())
+            .with_visible(false)
             .with_window_icon(app_icon())
             .with_theme(decoration_theme(&self.prefs, &self.doc_engine.theme));
         // MARKDONE_WINDOW_SIZE=<width>x<height> (logical px): the initial window size, for
@@ -4103,6 +4105,11 @@ impl ApplicationHandler<WritEvent> for App {
                 fallbacks,
             )
         });
+        // Show the window only now: creating the renderer compiles Vello's shaders, which
+        // takes about a second on Windows, and a window shown before that stays a blank,
+        // frozen rectangle meanwhile. (Wayland ignores this: a window appears there with
+        // its first frame anyway.)
+        window.set_visible(true);
         self.state = Some(ActiveSurface {
             surface,
             window,

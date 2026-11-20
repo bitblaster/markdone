@@ -315,6 +315,9 @@ SVG by merman and recorded once into a Vello scene fragment, drawn as vectors.
 
 ## Limitations
 
+- Markdone draws with the GPU, so it needs a graphics driver with DirectX 12 (Windows),
+  Metal (macOS) or Vulkan. Without one, as in a virtual machine without 3D acceleration,
+  it falls back to a software renderer and becomes very slow.
 - Only ATX headings (`# Heading`) are recognized; setext headings (a line underlined with
   `===` or `---`) render as plain text.
 - macOS: opening a document from Finder (double-click, *Open With*) does not pass it to
