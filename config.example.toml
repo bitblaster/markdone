@@ -28,6 +28,9 @@ on_external_change = "ask"
 # Also compare the files with the disk when the window gets the focus or a tab is
 # selected (catches changes the file watcher misses, e.g. on network shares).
 check_on_focus = true
+# Save modified documents by themselves, about a second after typing stops and when they
+# are closed (a new document is saved by hand the first time).
+autosave = false
 
 [network]
 # Look up GitHub issues / pull requests / users referenced in documents: reads the

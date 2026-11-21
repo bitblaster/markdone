@@ -18,6 +18,10 @@ use crate::editor::EditorTheme;
 /// Environment variable name for GitHub token (shared between clap and tests)
 pub const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
 
+/// Set (to anything) by the GhostText daemon on the Markdone it starts: every edit is
+/// written to disk at once, since the browser reads the file back.
+pub const AUTOSAVE_EVERY_EDIT_ENV: &str = "MARKDONE_AUTOSAVE_EVERY_EDIT";
+
 #[cfg(feature = "app")]
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
@@ -37,10 +41,6 @@ pub struct Config {
     /// Start a separate instance instead of opening the files in the running one.
     #[arg(long)]
     pub new_instance: bool,
-
-    /// Save file automatically on every edit (useful for GhostText integration)
-    #[arg(long)]
-    pub autosave: bool,
 
     /// GitHub personal access token for API access (issue/PR references)
     #[arg(long, env = GITHUB_TOKEN_ENV)]
@@ -142,6 +142,9 @@ pub struct Preferences {
     /// Compare the files with the disk when the window gets the focus or a tab is
     /// activated (catches changes the file watcher misses, e.g. on network shares).
     pub check_on_focus: bool,
+    /// Save modified documents by themselves, shortly after typing stops and when they
+    /// are closed (documents never saved excepted).
+    pub autosave: bool,
     /// Look up GitHub references (issues, PRs, users) found in documents: reads the
     /// repository from `.git/config` and calls api.github.com.
     pub github: bool,
@@ -167,6 +170,7 @@ impl Default for Preferences {
             follow_system_theme: false,
             external_change: ExternalChange::Ask,
             check_on_focus: true,
+            autosave: false,
             github: false,
             github_token: None,
         }
@@ -299,6 +303,7 @@ struct FilesSpec {
     /// "reload" or "ask".
     on_external_change: Option<String>,
     check_on_focus: Option<bool>,
+    autosave: Option<bool>,
 }
 
 #[cfg(feature = "app")]
@@ -540,6 +545,9 @@ fn resolve(file: FileConfig) -> ResolvedConfig {
         if let Some(check) = files.check_on_focus {
             cfg.prefs.check_on_focus = check;
         }
+        if let Some(autosave) = files.autosave {
+            cfg.prefs.autosave = autosave;
+        }
     }
     if let Some(network) = &file.network {
         if let Some(github) = network.github {
@@ -604,6 +612,7 @@ pub fn save_preferences(path: &Path, prefs: &Preferences) -> std::io::Result<()>
         value(prefs.external_change.key()),
     );
     set("files", "check_on_focus", value(prefs.check_on_focus));
+    set("files", "autosave", value(prefs.autosave));
     set("network", "github", value(prefs.github));
     // The pre-modes single theme name is superseded by `dark`/`light`/`mode` (left in place
     // it would be re-read as the chosen theme).
@@ -752,7 +761,7 @@ mod tests {
     fn preference_sections_parse() {
         let file: FileConfig = toml::from_str(
             "[editor]\nfull_width = true\nmax_width = 1000\n\
-             [files]\non_external_change = \"ask\"\ncheck_on_focus = false\n\
+             [files]\non_external_change = \"ask\"\ncheck_on_focus = false\nautosave = true\n\
              [network]\ngithub = true\n",
         )
         .unwrap();
@@ -761,6 +770,7 @@ mod tests {
         assert_eq!(p.max_width, 1000.0);
         assert_eq!(p.external_change, ExternalChange::Ask);
         assert!(!p.check_on_focus);
+        assert!(p.autosave);
         assert!(p.github);
         // Defaults: limited width, reload, check on focus, no network.
         let d = resolve(FileConfig::default()).prefs;
@@ -875,6 +885,7 @@ mod tests {
             follow_system_theme: true,
             external_change: ExternalChange::Ask,
             check_on_focus: false,
+            autosave: true,
             github: true,
             github_token: Some("ghp_example".into()),
         };

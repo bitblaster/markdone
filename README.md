@@ -81,7 +81,6 @@ separate one.
 | `--config <path>` | Use this configuration file instead of the default one |
 | `--github-token <token>` | GitHub API token for the GitHub references (or the `GITHUB_TOKEN` variable) |
 | `--github-repo <owner/repo>` | GitHub repository for the references (default: detected from the git remote) |
-| `--autosave` | Save the document on every edit |
 
 Shortcuts are written with Ctrl in this document; on macOS they use Cmd, and text
 navigation follows the Mac conventions (Option+arrows by word, Cmd+arrows to the line or
@@ -103,6 +102,10 @@ Every document opens in a tab; the open tabs are restored at the next start, and
 reload after asking (or automatically, see the preferences); a document with unsaved
 changes is never overwritten without asking. Files and images can be dropped on the
 window.
+
+With *Save documents automatically* (Preferences → Files) the modified documents are
+saved about a second after you stop typing, and when they are closed; a new document is
+saved by hand the first time, to give it a name.
 
 The status bar shows the document's words and characters (link targets aside), and the
 selection's next to them when text is selected, along with the cursor position.

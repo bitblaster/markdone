@@ -8,6 +8,7 @@ use std::process::Stdio;
 
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
+use markdone::config::AUTOSAVE_EVERY_EDIT_ENV;
 use notify::{EventKind, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -275,10 +276,11 @@ async fn handle_websocket(
     // Build writ command with optional GitHub context
     let mut cmd = Command::new("markdone");
     // Its own instance: the temp file must not land in an already open Markdone.
+    // Every edit must reach the temp file at once (the browser reads it back).
     cmd.arg("--new-instance")
         .arg("--file")
         .arg(&temp_file)
-        .arg("--autosave");
+        .env(AUTOSAVE_EVERY_EDIT_ENV, "1");
 
     // Pass GitHub repo context if URL is a GitHub page or title contains repo info
     let github_repo = client_msg
@@ -316,7 +318,7 @@ async fn handle_websocket(
 
     // Log the full command being executed
     println!(
-        "Starting writ: --file {:?} --autosave{}{}",
+        "Starting writ: --file {:?} (autosave){}{}",
         temp_file,
         if client_msg.url.is_some() {
             " --github-repo ..."

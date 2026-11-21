@@ -997,6 +997,10 @@ struct App {
     /// Preferences changed and not yet saved: saved at this time (debounced, so dragging
     /// a slider does not rewrite the file every frame).
     prefs_save_at: Option<Instant>,
+    /// Autosave (Preferences): the active tab and buffer revision last seen, and when to
+    /// save the modified documents (a pause after the last edit).
+    autosave_seen: Option<(u64, u64)>,
+    autosave_at: Option<Instant>,
     /// GitHub lookups for documents opened from now on.
     github: GithubSetup,
     modifiers: ModifiersState,
@@ -1212,6 +1216,8 @@ impl App {
             paste_after_save: None,
             font_families: None,
             prefs_save_at: None,
+            autosave_seen: None,
+            autosave_at: None,
             github,
             modal: missing_files_notice(&missing),
             file_dialog_open: false,
@@ -1356,6 +1362,14 @@ impl App {
     /// Close the tabs of `req` (and quit, if asked), first asking what to do with
     /// unsaved changes. Re-entrant: after a Save As the request is simply re-run.
     fn request_close(&mut self, req: CloseRequest, event_loop: &ActiveEventLoop) {
+        // With autosave the documents that have a file are saved, not asked about.
+        if self.prefs.autosave {
+            for i in 0..self.tabs.len() {
+                if req.ids.contains(&self.tabs[i].id) {
+                    self.autosave_tab(i);
+                }
+            }
+        }
         let dirty: Vec<u64> = self
             .tabs
             .iter()
@@ -1422,6 +1436,64 @@ impl App {
 
     /// Save tab `i` to its file. An untitled document asks for a path instead (the save
     /// then completes asynchronously). Returns `true` only if the document was saved.
+    /// Autosave tab `i` when it has unsaved changes and a file, and no disk conflict is
+    /// waiting on it (saving would silently overwrite the other program's version).
+    /// Returns whether it was saved.
+    fn autosave_tab(&mut self, i: usize) -> bool {
+        let editor = self.tab_editor(i);
+        if !editor.is_dirty() || editor.file_path().is_none() || self.tabs[i].conflict.is_some() {
+            return false;
+        }
+        match self.tab_editor_mut(i).save() {
+            Ok(()) => true,
+            Err(e) => {
+                let name = doc_name(self.tab_editor(i));
+                if self.modal.is_none() {
+                    self.show_message(
+                        "Could not save",
+                        format!("Saving “{name}” automatically failed: {e}"),
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    /// Autosave: schedule a save a moment after the active document's last edit, and run
+    /// it when due (on every modified document with a file).
+    fn autosave_tick(&mut self) {
+        if !self.prefs.autosave {
+            self.autosave_at = None;
+            return;
+        }
+        let now = Instant::now();
+        let seen = (
+            self.tabs[self.active_tab].id,
+            self.doc_engine.editor.state.buffer.version(),
+        );
+        if self.autosave_seen != Some(seen) {
+            self.autosave_seen = Some(seen);
+            if self.doc_engine.editor.is_dirty() {
+                self.autosave_at = Some(now + AUTOSAVE_DELAY);
+            }
+        }
+        if self.autosave_at.is_some_and(|t| t <= now) {
+            self.autosave_at = None;
+            self.autosave_all();
+        }
+    }
+
+    /// Save every modified document that has a file (see [`Self::autosave_tab`]).
+    fn autosave_all(&mut self) {
+        let mut saved = false;
+        for i in 0..self.tabs.len() {
+            saved |= self.autosave_tab(i);
+        }
+        if saved {
+            self.redraw();
+        }
+    }
+
     fn save_tab(&mut self, i: usize) -> bool {
         if self.tab_editor(i).file_path().is_none() {
             self.start_save_as(i, None);
@@ -1662,7 +1734,7 @@ impl App {
             }
             let id = self.next_tab_id;
             self.next_tab_id += 1;
-            let mut editor = open_document(&path, &self.github, false);
+            let mut editor = open_document(&path, &self.github);
             forward_file_watch(&mut editor, id, &self.proxy);
             self.tabs.push(Tab {
                 id,
@@ -2750,6 +2822,9 @@ impl App {
         sync_image_loads(&self.doc_engine, &self.runtime, &self.proxy);
     }
 }
+
+/// Autosave waits this long after the last edit.
+const AUTOSAVE_DELAY: Duration = Duration::from_secs(1);
 
 /// Decoded-pixel budget for file/remote images per document (bytes). Images in the
 /// materialized band are always kept; older ones beyond this are evicted and reloaded on
@@ -6097,10 +6172,14 @@ impl ApplicationHandler<WritEvent> for App {
         if self.prefs_save_at.take().is_some() {
             self.save_preferences();
         }
+        if self.prefs.autosave {
+            self.autosave_all();
+        }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.persist_session();
+        self.autosave_tick();
         if self.prefs_save_at.is_some_and(|t| t <= Instant::now()) {
             self.prefs_save_at = None;
             self.save_preferences();
@@ -6225,10 +6304,15 @@ impl ApplicationHandler<WritEvent> for App {
             None
         };
         let ui_deadline = self.ui.as_ref().and_then(UiLayer::repaint_deadline);
-        let other = [drag_deadline, ui_deadline, self.prefs_save_at]
-            .into_iter()
-            .flatten()
-            .min();
+        let other = [
+            drag_deadline,
+            ui_deadline,
+            self.prefs_save_at,
+            self.autosave_at,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         event_loop.set_control_flow(self.frame_retry.control_flow(other));
     }
 }
@@ -6346,10 +6430,7 @@ fn startup_from_cli() -> Option<Startup> {
     };
     if paths.is_empty() {
         let (restore, active) = session.restorable();
-        let mut editors: Vec<Editor> = restore
-            .iter()
-            .map(|p| open_document(p, &github, config.autosave))
-            .collect();
+        let mut editors: Vec<Editor> = restore.iter().map(|p| open_document(p, &github)).collect();
         if editors.is_empty() {
             editors.push(Editor::new(""));
         }
@@ -6369,10 +6450,7 @@ fn startup_from_cli() -> Option<Startup> {
     for path in paths.iter().filter(|p| p.exists()) {
         session.touch_recent(path);
     }
-    let editors = paths
-        .iter()
-        .map(|p| open_document(p, &github, config.autosave))
-        .collect();
+    let editors = paths.iter().map(|p| open_document(p, &github)).collect();
     Some(Startup {
         editors,
         active: 0,
@@ -6445,9 +6523,11 @@ struct GithubSetup {
 
 /// Open a document: load it, set up GitHub lookups if enabled, detect links and watch
 /// the file for external edits.
-fn open_document(path: &Path, github: &GithubSetup, autosave: bool) -> Editor {
+fn open_document(path: &Path, github: &GithubSetup) -> Editor {
     let mut editor = Editor::open(path);
-    editor.set_autosave(autosave);
+    // The GhostText daemon's instance writes every edit through (the Preferences'
+    // autosave, handled by the shell, waits for a pause instead).
+    editor.set_autosave(std::env::var_os(crate::config::AUTOSAVE_EVERY_EDIT_ENV).is_some());
     if github.enabled {
         // GitHub context for ref detection: explicit --github-repo, else auto-detect.
         let context = github

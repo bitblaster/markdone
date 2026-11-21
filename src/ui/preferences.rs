@@ -133,6 +133,12 @@ pub fn show(
             ui,
             "Catches changes the file watcher misses, e.g. on network shares.",
         );
+        ui.checkbox(&mut prefs.autosave, "Save documents automatically");
+        note(
+            ui,
+            "About a second after you stop typing, and when a document is closed. A new \
+             document is saved by hand the first time, to give it a name.",
+        );
 
         section(ui, "Privacy");
         ui.checkbox(
