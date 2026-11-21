@@ -204,6 +204,7 @@ use crate::links::{self, LinkTarget};
 use crate::paste_image::PastedImage;
 use crate::session::Session;
 use crate::single_instance::{self, Instance};
+use crate::status_bar::{TextCounts, count_text};
 use crate::text_engine::{FontFamilyInfo, TextEngine, peniko_color, peniko_color_alpha};
 use crate::text_input;
 use crate::ui::UiLayer;
@@ -389,6 +390,7 @@ fn build_status_info(editor: &Editor, doc: &DocLayout, editor_h: f32) -> StatusI
     // the user sees on screen.
     let col = buffer.slice_cow(line_start..cursor).graphemes(true).count() + 1;
     let (first, last) = doc.visible_range(editor_h);
+    let (counts, selection_counts) = text_counts(editor);
     StatusInfo {
         context: editor.state.build_nested_context(cursor),
         heading_level: heading_at(buffer, line),
@@ -397,7 +399,44 @@ fn build_status_info(editor: &Editor, doc: &DocLayout, editor_h: f32) -> StatusI
         total_lines: buffer.line_count(),
         first_visible: first,
         last_visible: last.saturating_sub(1),
+        counts,
+        selection_counts,
     }
+}
+
+/// The words and characters of the document and of its selection, for the status bar.
+/// Drawn on every frame, so both are cached: the document's by buffer revision, the
+/// selection's by revision and range.
+fn text_counts(editor: &Editor) -> (TextCounts, Option<TextCounts>) {
+    type Cache = (
+        Option<(u64, TextCounts)>,
+        Option<(u64, Range<usize>, TextCounts)>,
+    );
+    thread_local! {
+        static CACHE: std::cell::RefCell<Cache> = const { std::cell::RefCell::new((None, None)) };
+    }
+    let buffer = &editor.state.buffer;
+    let version = buffer.version();
+    let selection = editor.selection_range().filter(|r| !r.is_empty());
+    CACHE.with_borrow_mut(|(doc, sel)| {
+        let doc_counts = match doc {
+            Some((v, c)) if *v == version => *c,
+            _ => {
+                let c = count_text(&buffer.text());
+                *doc = Some((version, c));
+                c
+            }
+        };
+        let sel_counts = selection.map(|range| match sel {
+            Some((v, r, c)) if *v == version && *r == range => *c,
+            _ => {
+                let c = count_text(&buffer.slice_cow(range.clone()));
+                *sel = Some((version, range, c));
+                c
+            }
+        });
+        (doc_counts, sel_counts)
+    })
 }
 
 /// Sample document shown until the shell loads real files (Phase 4+ wires input).

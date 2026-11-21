@@ -104,6 +104,9 @@ reload after asking (or automatically, see the preferences); a document with uns
 changes is never overwritten without asking. Files and images can be dropped on the
 window.
 
+The status bar shows the document's words and characters (link targets aside), and the
+selection's next to them when text is selected, along with the cursor position.
+
 ### Table of contents
 
 *View → Table of Contents* (Ctrl+Shift+O) shows the headings in a side panel: click one

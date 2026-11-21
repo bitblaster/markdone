@@ -1,4 +1,43 @@
+use std::sync::LazyLock;
+
+use regex::Regex;
+use unicode_segmentation::UnicodeSegmentation;
+
 use crate::marker::MarkerKind;
+
+/// Words and characters of a text, as the status bar shows them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextCounts {
+    /// Words (Unicode word boundaries; punctuation and Markdown markers are not words).
+    pub words: usize,
+    /// Characters, spaces included, line breaks excluded.
+    pub chars: usize,
+}
+
+/// Count the words and characters of Markdown `text`. The targets of links and images
+/// (`](…)`) are left out: they are not text the reader sees.
+pub fn count_text(text: &str) -> TextCounts {
+    static LINK_TARGET: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\]\([^)\n]*\)").expect("valid regex"));
+    let visible = LINK_TARGET.replace_all(text, "]");
+    TextCounts {
+        words: visible.unicode_words().count(),
+        chars: visible.chars().filter(|&c| c != '\n' && c != '\r').count(),
+    }
+}
+
+/// `n` with thousands separators (`12,345`).
+pub fn group_thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
 
 /// Build the display string for context markers, handling nested checkbox compaction.
 /// Returns a vector of (display_string, depth) tuples.
@@ -274,5 +313,33 @@ mod tests {
         // Depths: 0, 1, 2, 3, 4, 5, 6
         assert_eq!(display[6].1, 6);
         // Color cycling happens in status_bar() with depth % 6
+    }
+}
+
+#[cfg(test)]
+mod count_tests {
+    use super::*;
+
+    #[test]
+    fn counts_words_and_characters() {
+        let c = count_text("# Title\n\nSome *bold* text, l'albero.\n");
+        assert_eq!(c.words, 5, "Title, Some, bold, text, l'albero");
+        assert_eq!(
+            c.chars,
+            "# Title".len() + "Some *bold* text, l'albero.".len()
+        );
+        // Link and image targets are not counted; their visible text is.
+        let c = count_text("See [the docs](https://example.com/a/b) ![shot](img/x.png)");
+        assert_eq!(c.words, 4, "See, the, docs, shot");
+        assert_eq!(count_text(""), TextCounts::default());
+        assert_eq!(count_text("città è\r\n").chars, 7);
+    }
+
+    #[test]
+    fn groups_thousands() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1000), "1,000");
+        assert_eq!(group_thousands(1234567), "1,234,567");
     }
 }

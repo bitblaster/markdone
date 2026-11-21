@@ -26,6 +26,10 @@ pub struct StatusInfo {
     pub total_lines: usize,
     pub first_visible: usize,
     pub last_visible: usize,
+    /// The document's words and characters.
+    pub counts: crate::status_bar::TextCounts,
+    /// The selection's, when there is one.
+    pub selection_counts: Option<crate::status_bar::TextCounts>,
 }
 
 /// A screen rect (device px) for a chrome strip.
@@ -527,7 +531,8 @@ fn draw_find_field(
 }
 
 /// Draw the bottom status bar: left = nesting context (depth-colored), right =
-/// heading level, cursor position, line count, scroll indicator.
+/// heading level, words and characters (of the selection too, when there is one),
+/// cursor position, line count, scroll indicator.
 pub fn draw_status_bar(
     engine: &mut TextEngine,
     scene: &mut Scene,
@@ -594,7 +599,7 @@ pub fn draw_status_bar(
         );
     }
 
-    // --- right: H-level · Ln,Col · lines · scroll ---
+    // --- right: H-level · words · chars · Ln,Col · lines · scroll ---
     let scroll = if info.total_lines <= 1
         || (info.first_visible == 0 && info.last_visible + 1 >= info.total_lines)
     {
@@ -612,6 +617,29 @@ pub fn draw_status_bar(
     let mut segments = Vec::new();
     if let Some(l) = info.heading_level {
         segments.push(format!("H{l}"));
+    }
+    let g = crate::status_bar::group_thousands;
+    let plural = |n: usize, one: &str, many: &str| if n == 1 { one } else { many }.to_string();
+    let (words, chars) = (info.counts.words, info.counts.chars);
+    match info.selection_counts {
+        Some(sel) => {
+            segments.push(format!(
+                "{} of {} {}",
+                g(sel.words),
+                g(words),
+                plural(words, "word", "words")
+            ));
+            segments.push(format!(
+                "{} of {} {}",
+                g(sel.chars),
+                g(chars),
+                plural(chars, "char", "chars")
+            ));
+        }
+        None => {
+            segments.push(format!("{} {}", g(words), plural(words, "word", "words")));
+            segments.push(format!("{} {}", g(chars), plural(chars, "char", "chars")));
+        }
     }
     segments.push(format!("Ln {}, Col {}", info.cursor_line, info.cursor_col));
     segments.push(format!("{} lines", info.total_lines));
