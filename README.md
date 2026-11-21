@@ -117,6 +117,12 @@ links, images and code blocks. Pasting rich text (from a web page or an office s
 converts it to Markdown; *Paste without Style* keeps the plain text, and *Copy as HTML*
 copies the rendered selection.
 
+Pasting an image (a screenshot, an image copied from another program) opens a dialog with
+its preview: it is saved as a PNG file, named with the date and time unless you rename
+it, in the folder the document's other images are in (or the document's own folder;
+*Browse* picks another), and linked at the cursor. A document that was never saved is
+saved first, so that the image has a place next to it.
+
 Selection works with click, drag (with edge auto-scroll), Shift+arrows, double-click
 (word) and triple-click (line). Undo and redo group typing into words, cursor movement
 and deletion operate on whole grapheme clusters, and vertical movement keeps its column

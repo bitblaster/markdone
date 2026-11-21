@@ -201,12 +201,13 @@ mod profile {
 }
 use crate::commands::Command;
 use crate::links::{self, LinkTarget};
+use crate::paste_image::PastedImage;
 use crate::session::Session;
 use crate::single_instance::{self, Instance};
 use crate::text_engine::{FontFamilyInfo, TextEngine, peniko_color, peniko_color_alpha};
 use crate::text_input;
 use crate::ui::UiLayer;
-use crate::ui::dialogs::{self, Answer, DialogView};
+use crate::ui::dialogs::{self, Answer, DialogView, PasteImageAction};
 use crate::ui::menu::{MenuState, menu_bar};
 use crate::ui::preferences;
 use crate::ui::tabs::{TabInfo, tab_strip};
@@ -555,6 +556,8 @@ pub(crate) enum WritEvent {
     /// Files dropped on the window (Wayland; winit reports them itself elsewhere).
     #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
     FilesDropped(Vec<PathBuf>),
+    /// The folder picker of the paste-image dialog closed (`None`: cancelled).
+    PasteFolderPicked(Option<PathBuf>),
     /// The Insert → Image dialog for tab `id` closed (`None`: cancelled).
     ImagePicked {
         id: u64,
@@ -595,6 +598,15 @@ enum PendingModal {
     ConfirmReload {
         id: u64,
     },
+    /// An image is being pasted into a document never saved (`paste_after_save`).
+    SaveBeforePaste,
+}
+
+/// The paste-image dialog: the image from the clipboard, for tab `tab`.
+struct PasteImageDialog {
+    tab: u64,
+    image: PastedImage,
+    form: dialogs::PasteImageForm,
 }
 
 /// A tab's file changed on disk and the user must choose between the disk version
@@ -928,6 +940,11 @@ struct App {
     config_path: Option<PathBuf>,
     /// The Preferences window is shown.
     prefs_open: bool,
+    /// The paste-image dialog is shown.
+    paste_image: Option<PasteImageDialog>,
+    /// An image pasted into tab `.0`, never saved: the dialog opens once Save As has
+    /// given the document a location.
+    paste_after_save: Option<(u64, PastedImage)>,
     /// Resolves theme names (built-ins, the config's `[themes.*]`, `[theme.overrides]`).
     themes: ThemeSet,
     /// The desktop's light/dark preference, when it reports one (Linux: XDG portal;
@@ -1152,6 +1169,8 @@ impl App {
             applied_theme,
             config_path,
             prefs_open: false,
+            paste_image: None,
+            paste_after_save: None,
             font_families: None,
             prefs_save_at: None,
             github,
@@ -1934,7 +1953,18 @@ impl App {
             (Some(md), Some(plain)) if md.replace('\\', "").trim() == plain.trim() => plain,
             (Some(md), _) => md,
             (None, Some(plain)) => plain,
-            (None, None) => return,
+            // No text: maybe an image (a screenshot).
+            (None, None) => {
+                if let Ok(image) = cb.get_image() {
+                    let image = PastedImage {
+                        width: image.width as u32,
+                        height: image.height as u32,
+                        rgba: image.bytes.into_owned(),
+                    };
+                    self.start_paste_image(image);
+                }
+                return;
+            }
         };
         let Some(state) = self.state.as_ref() else {
             return;
@@ -1953,6 +1983,135 @@ impl App {
             scale,
             vh,
         );
+    }
+
+    /// An image was pasted into the active document: open the dialog that saves it, or,
+    /// for a document never saved, ask to save it first.
+    fn start_paste_image(&mut self, image: PastedImage) {
+        let id = self.tabs[self.active_tab].id;
+        if self.active_doc_dir().is_none() {
+            self.paste_after_save = Some((id, image));
+            self.modal = Some(PendingModal::SaveBeforePaste);
+        } else {
+            self.open_paste_dialog(id, image);
+        }
+        self.redraw();
+    }
+
+    /// Show the paste-image dialog for `image`, pasted into the active tab `id`.
+    fn open_paste_dialog(&mut self, id: u64, image: PastedImage) {
+        let Some(doc_dir) = self.active_doc_dir() else {
+            return;
+        };
+        let dir = crate::paste_image::proposed_dir(&self.doc_engine.editor.text(), &doc_dir);
+        let name = crate::paste_image::proposed_name(&jiff::Zoned::now(), &dir);
+        // A small copy for the preview texture (a 4K screenshot would be a huge one).
+        let (preview, preview_size) =
+            image::RgbaImage::from_raw(image.width, image.height, image.rgba.clone()).map_or_else(
+                || (Vec::new(), [0, 0]),
+                |full| {
+                    let side = dialogs::PREVIEW_SIDE;
+                    let small = if full.width() > side || full.height() > side {
+                        image::imageops::thumbnail(
+                            &full,
+                            (full.width() * side / full.width().max(full.height())).max(1),
+                            (full.height() * side / full.width().max(full.height())).max(1),
+                        )
+                    } else {
+                        full
+                    };
+                    let size = [small.width() as usize, small.height() as usize];
+                    (small.into_raw(), size)
+                },
+            );
+        if preview.is_empty() {
+            self.show_message(
+                "Cannot paste the image",
+                "The image in the clipboard is not valid.".to_string(),
+            );
+            return;
+        }
+        let form = dialogs::PasteImageForm::new(
+            name,
+            dir.display().to_string(),
+            preview,
+            preview_size,
+            [image.width, image.height],
+        );
+        self.paste_image = Some(PasteImageDialog {
+            tab: id,
+            image,
+            form,
+        });
+        self.redraw();
+    }
+
+    /// Act on a button of the paste-image dialog.
+    fn paste_image_action(&mut self, action: PasteImageAction) {
+        match action {
+            PasteImageAction::Cancel => self.paste_image = None,
+            PasteImageAction::Browse => {
+                if self.file_dialog_open {
+                    return;
+                }
+                let (Some(state), Some(dialog)) = (self.state.as_ref(), self.paste_image.as_mut())
+                else {
+                    return;
+                };
+                let mut picker = rfd::FileDialog::new()
+                    .set_title("Folder for the Image")
+                    .set_parent(&*state.window);
+                let dir = PathBuf::from(dialog.form.dir.trim());
+                if dir.is_dir() {
+                    picker = picker.set_directory(dir);
+                }
+                dialog.form.browsing = true;
+                self.file_dialog_open = true;
+                let proxy = self.proxy.clone();
+                std::thread::spawn(move || {
+                    let dir = picker.pick_folder();
+                    let _ = proxy.send_event(WritEvent::PasteFolderPicked(dir));
+                });
+            }
+            PasteImageAction::Insert => self.insert_pasted_image(),
+        }
+        self.redraw();
+    }
+
+    /// Save the pasted image as the dialog says and link it at the caret; on an error the
+    /// dialog stays open and shows it.
+    fn insert_pasted_image(&mut self) {
+        let doc_dir = self.active_doc_dir();
+        let Some(dialog) = self.paste_image.as_mut() else {
+            return;
+        };
+        let name = match crate::paste_image::checked_name(&dialog.form.name) {
+            Ok(name) => name,
+            Err(e) => {
+                dialog.form.error = Some(e.to_string());
+                return;
+            }
+        };
+        let typed = PathBuf::from(dialog.form.dir.trim());
+        let dir = match (&doc_dir, typed.is_absolute()) {
+            (_, true) => typed,
+            (Some(doc), false) => doc.join(typed),
+            (None, false) => {
+                dialog.form.error = Some("Choose a folder.".to_string());
+                return;
+            }
+        };
+        let path = dir.join(&name);
+        if let Err(e) = crate::paste_image::save_png(&dialog.image, &path) {
+            dialog.form.error = Some(e);
+            return;
+        }
+        let tab = dialog.tab;
+        self.paste_image = None;
+        if self.tabs[self.active_tab].id == tab {
+            let (_, sel) = self.text_and_selection();
+            self.apply_format(crate::format::insert_image(sel, &path, doc_dir.as_deref()));
+        }
     }
 
     /// Copy the selection rendered as HTML, with its Markdown as the plain-text
@@ -2145,6 +2304,7 @@ impl App {
             PendingModal::ConfirmReload { id } => DialogView::ConfirmReload {
                 name: name(*id).unwrap_or_default(),
             },
+            PendingModal::SaveBeforePaste => DialogView::SaveBeforePaste,
             PendingModal::Exported { path } => DialogView::Exported {
                 name: path.file_name().map_or_else(
                     || path.display().to_string(),
@@ -2187,6 +2347,13 @@ impl App {
             PendingModal::ConfirmReload { id } => {
                 if answer == Answer::Reload {
                     self.reload_tab(id);
+                }
+            }
+            PendingModal::SaveBeforePaste => {
+                if answer == Answer::Save {
+                    self.start_save_as(self.active_tab, None);
+                } else {
+                    self.paste_after_save = None;
                 }
             }
             PendingModal::Exported { path } => match answer {
@@ -3984,9 +4151,31 @@ impl ApplicationHandler<WritEvent> for App {
         if let WritEvent::SaveAsPicked { id, path, then } = event {
             self.file_dialog_open = false;
             // Cancelled: a close that was waiting for this save is abandoned too.
+            let saved = path.is_some();
             if let Some(path) = path {
                 self.finish_save_as(id, path, then, event_loop);
             }
+            // An image pasted before the document had a location: now it has one.
+            if let Some((tab, image)) = self.paste_after_save.take()
+                && saved
+                && tab == id
+                && self.tabs[self.active_tab].id == id
+                && self.active_doc_dir().is_some()
+            {
+                self.open_paste_dialog(id, image);
+            }
+            return;
+        }
+        if let WritEvent::PasteFolderPicked(dir) = event {
+            self.file_dialog_open = false;
+            if let Some(dialog) = self.paste_image.as_mut() {
+                dialog.form.browsing = false;
+                if let Some(dir) = dir {
+                    dialog.form.dir = dir.display().to_string();
+                    dialog.form.error = None;
+                }
+            }
+            self.redraw();
             return;
         }
         if let WritEvent::OpenPicked(paths) = event {
@@ -4283,7 +4472,7 @@ impl ApplicationHandler<WritEvent> for App {
             }
             // A dialog or the Preferences own all input until closed; a disk conflict owns
             // the document (keys included) until it is answered.
-            if (self.modal.is_some() || self.prefs_open)
+            if (self.modal.is_some() || self.prefs_open || self.paste_image.is_some())
                 && matches!(
                     event,
                     WindowEvent::KeyboardInput { .. }
@@ -5629,7 +5818,10 @@ impl ApplicationHandler<WritEvent> for App {
                     let editor = &self.doc_engine.editor;
                     (doc_name(editor), editor.is_dirty())
                 });
-                let modal_shown = dialog_view.is_some() || self.prefs_open || conflict.is_some();
+                let modal_shown = dialog_view.is_some()
+                    || self.prefs_open
+                    || conflict.is_some()
+                    || self.paste_image.is_some();
                 let top_points = UiLayer::top_inset(state.scale) / state.scale;
                 // Table of contents (egui side panel over the strip the layout reserves).
                 let toc_w_dev = outline_width(&self.doc_engine.editor, state.scale);
@@ -5675,6 +5867,8 @@ impl ApplicationHandler<WritEvent> for App {
                 let theme_names = &self.theme_names;
                 let font_families = self.font_families.as_deref().unwrap_or_default();
                 let config_path = self.config_path.as_deref();
+                let mut paste_form = self.paste_image.as_mut().map(|d| &mut d.form);
+                let mut paste_action = None;
                 let ui_frame = self.ui.as_mut().map(|ui| {
                     ui.run(&state.window, modal_shown, |ui| {
                         let menu = menu_bar(ui, &menu_state);
@@ -5712,6 +5906,9 @@ impl ApplicationHandler<WritEvent> for App {
                             rect.min.y += top_points;
                             conflict_answer =
                                 dialogs::disk_conflict(ui.ctx(), rect, name, *unsaved);
+                        }
+                        if let Some(form) = paste_form.as_deref_mut() {
+                            paste_action = dialogs::paste_image(ui.ctx(), form);
                         }
                         if let Some(view) = &dialog_view {
                             answer = dialogs::show(ui.ctx(), view);
@@ -5813,6 +6010,9 @@ impl ApplicationHandler<WritEvent> for App {
                 }
                 if let Some(answer) = conflict_answer {
                     self.answer_conflict(answer);
+                }
+                if let Some(action) = paste_action {
+                    self.paste_image_action(action);
                 }
                 if let Some(answer) = answer {
                     self.answer_dialog(answer, event_loop);

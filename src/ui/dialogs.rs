@@ -1,5 +1,5 @@
 //! Modal dialogs: unsaved changes on close, a file changed on disk under unsaved edits,
-//! and plain messages (errors, notices).
+//! pasting an image, and plain messages (errors, notices).
 //!
 //! These functions only draw and report the user's choice. The shell owns the state
 //! behind a dialog (which tabs are closing, the disk content waiting to be applied) and
@@ -24,6 +24,8 @@ pub enum DialogView {
     ConfirmReload {
         name: String,
     },
+    /// An image is being pasted into a document that was never saved.
+    SaveBeforePaste,
 }
 
 /// The user's choice.
@@ -106,6 +108,18 @@ pub fn show(ctx: &egui::Context, view: &DialogView) -> Option<Answer> {
                     ],
                 );
             }
+            DialogView::SaveBeforePaste => {
+                heading(ui, "Save the document first");
+                ui.label(
+                    "A pasted image is saved as a file next to the document and linked \
+                     from it, so the document needs a location first.",
+                );
+                answer = buttons(
+                    ui,
+                    &[],
+                    &[("Cancel", Answer::Cancel), ("Save As…", Answer::Save)],
+                );
+            }
             DialogView::Exported { name } => {
                 heading(ui, "PDF exported");
                 ui.label(format!("“{name}” is ready."));
@@ -124,7 +138,9 @@ pub fn show(ctx: &egui::Context, view: &DialogView) -> Option<Answer> {
         && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
     {
         answer = Some(match view {
-            DialogView::Unsaved { .. } | DialogView::ConfirmReload { .. } => Answer::Cancel,
+            DialogView::Unsaved { .. }
+            | DialogView::ConfirmReload { .. }
+            | DialogView::SaveBeforePaste => Answer::Cancel,
             DialogView::Message { .. } | DialogView::Exported { .. } => Answer::Ok,
         });
     }
@@ -191,6 +207,140 @@ pub fn disk_conflict(
             });
         });
     answer
+}
+
+/// The editable state of the paste-image dialog (kept by the shell between frames).
+pub struct PasteImageForm {
+    /// The file name, as typed.
+    pub name: String,
+    /// The folder, as typed or picked with Browse.
+    pub dir: String,
+    /// Why the last Insert failed, shown under the fields.
+    pub error: Option<String>,
+    /// A folder picker opened by Browse is showing: the dialog waits for it.
+    pub browsing: bool,
+    /// The preview: RGBA pixels (at most [`PREVIEW_SIDE`] px a side) and their size.
+    pub preview: Vec<u8>,
+    pub preview_size: [usize; 2],
+    /// The image's real size, shown under the preview.
+    pub image_size: [u32; 2],
+    texture: Option<egui::TextureHandle>,
+}
+
+/// The largest side of the preview texture, in pixels.
+pub const PREVIEW_SIDE: u32 = 800;
+
+impl PasteImageForm {
+    pub fn new(
+        name: String,
+        dir: String,
+        preview: Vec<u8>,
+        preview_size: [usize; 2],
+        image_size: [u32; 2],
+    ) -> Self {
+        Self {
+            name,
+            dir,
+            error: None,
+            browsing: false,
+            preview,
+            preview_size,
+            image_size,
+            texture: None,
+        }
+    }
+}
+
+/// What the user did in the paste-image dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasteImageAction {
+    Cancel,
+    Insert,
+    /// Pick the folder with the system's folder picker.
+    Browse,
+}
+
+/// The dialog shown when an image is pasted: its preview, the file name and the folder
+/// to save it in.
+pub fn paste_image(ctx: &egui::Context, form: &mut PasteImageForm) -> Option<PasteImageAction> {
+    let mut action = None;
+    let texture = form
+        .texture
+        .get_or_insert_with(|| {
+            let image = egui::ColorImage::from_rgba_unmultiplied(form.preview_size, &form.preview);
+            ctx.load_texture("paste-image-preview", image, egui::TextureOptions::LINEAR)
+        })
+        .clone();
+    let response = egui::Modal::new(egui::Id::new("paste-image-dialog")).show(ctx, |ui| {
+        ui.set_width(WIDTH + 60.0);
+        ui.spacing_mut().item_spacing.y = 10.0;
+        heading(ui, "Paste Image");
+        // The preview, scaled down to fit (never up).
+        let [w, h] = form.preview_size.map(|v| v as f32);
+        let scale = ((WIDTH + 60.0) / w).min(260.0 / h).min(1.0);
+        ui.vertical_centered(|ui| {
+            ui.add(egui::Image::new((
+                texture.id(),
+                egui::vec2(w * scale, h * scale),
+            )));
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} × {} px",
+                    form.image_size[0], form.image_size[1]
+                ))
+                .small()
+                .weak(),
+            );
+        });
+        egui::Grid::new("paste-image-fields")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("File name");
+                ui.add(egui::TextEdit::singleline(&mut form.name).desired_width(f32::INFINITY));
+                ui.end_row();
+                ui.label("Folder");
+                ui.horizontal(|ui| {
+                    let browse_w = 80.0;
+                    ui.add(
+                        egui::TextEdit::singleline(&mut form.dir)
+                            .desired_width(ui.available_width() - browse_w - 8.0),
+                    );
+                    if ui
+                        .add_enabled(!form.browsing, egui::Button::new("Browse…"))
+                        .clicked()
+                    {
+                        action = Some(PasteImageAction::Browse);
+                    }
+                });
+                ui.end_row();
+            });
+        if let Some(error) = &form.error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        ui.add_enabled_ui(!form.browsing, |ui| {
+            let picked = buttons(
+                ui,
+                &[],
+                &[("Cancel", Answer::Cancel), ("Insert", Answer::Ok)],
+            );
+            match picked {
+                Some(Answer::Ok) => action = Some(PasteImageAction::Insert),
+                Some(_) => action = Some(PasteImageAction::Cancel),
+                None => {}
+            }
+        });
+    });
+    if action.is_none() && !form.browsing && response.is_top_modal {
+        ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                action = Some(PasteImageAction::Cancel);
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                action = Some(PasteImageAction::Insert);
+            }
+        });
+    }
+    action
 }
 
 fn heading(ui: &mut egui::Ui, text: &str) {
