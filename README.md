@@ -204,6 +204,22 @@ switches live. *View → Git Differences* turns it off.
 
 ![Inline git diff: deleted lines as red rows, added lines and words in green](assets/diff.png)
 
+### Spell checking
+
+With *Check spelling* on (Preferences → Spelling, off by default), misspelled words are
+underlined with a wavy line, in any combination of languages (English, Italian, French,
+German, Spanish, Portuguese, Dutch): a word is right if one of the checked languages
+accepts it, so mixed-language documents work. Code, links' targets, URLs, math and
+footnote markers are not checked, nor is the word being typed. Right-click an underlined
+word for suggestions, or to add it to your personal dictionary (`dictionary.txt` next to
+the configuration file).
+
+On Linux the dictionaries installed with the system (`hunspell-*` packages) are used.
+A language the system does not have, and every language on Windows and macOS, is
+downloaded from [LibreOffice's dictionaries](https://github.com/LibreOffice/dictionaries)
+the first time it is checked, and kept in the user data folder. Checking is done by
+[spellbook](https://github.com/helix-editor/spellbook), which reads Hunspell dictionaries.
+
 ### Find and replace
 
 Ctrl+F opens the find bar, Ctrl+H adds the replace field. Matches highlight live with a
@@ -360,3 +376,10 @@ The Mermaid renderer included in the builds brings third-party code under other 
   [merman repository](https://github.com/Latias94/merman); see merman's
   [THIRD_PARTY_NOTICES.md](https://github.com/Latias94/merman/blob/main/THIRD_PARTY_NOTICES.md)
   for the obligations that apply when distributing binaries.
+
+The spell checker, [spellbook](https://github.com/helix-editor/spellbook), is under the
+**Mozilla Public License 2.0** ([text](https://www.mozilla.org/MPL/2.0/)), also a
+file-level copyleft that covers only that crate's own files, whose source is published on
+[crates.io](https://crates.io/crates/spellbook). The dictionaries are not part of
+Markdone: they come from the system, or are downloaded from LibreOffice's repository
+under their own licenses (see the README of each language there).

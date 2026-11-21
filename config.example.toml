@@ -32,6 +32,14 @@ check_on_focus = true
 # are closed (a new document is saved by hand the first time).
 autosave = false
 
+[spelling]
+# Underline misspelled words (off by default), in any of these languages (Hunspell codes:
+# en_US, en_GB, it_IT, fr_FR, de_DE, es_ES, pt_PT, pt_BR, nl_NL). On Linux the system's
+# dictionaries are used when installed; otherwise a language's dictionary is downloaded
+# from LibreOffice's repository on GitHub when it is enabled.
+enabled = false
+languages = ["en_US"]
+
 [network]
 # Look up GitHub issues / pull requests / users referenced in documents: reads the
 # repository from .git/config and calls api.github.com. Off by default.

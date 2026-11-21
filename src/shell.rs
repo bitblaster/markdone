@@ -8,7 +8,7 @@
 //! lines/words, red ghost deleted lines above), and a status bar.
 //!
 //! Set `MARKDONE_SHELL_SNAPSHOT=out.png` (+ optional
-//! `MARKDONE_SHELL_{FILE,W,H,SCROLL,CURSOR,SEL_A,SEL_B,DIFF}`) to render one frame
+//! `MARKDONE_SHELL_{FILE,W,H,SCROLL,CURSOR,SEL_A,SEL_B,DIFF,HOVER,SPELL}`) to render one frame
 //! headlessly instead of opening a window.
 
 use std::ops::Range;
@@ -597,6 +597,13 @@ pub(crate) enum WritEvent {
     FilesDropped(Vec<PathBuf>),
     /// The folder picker of the paste-image dialog closed (`None`: cancelled).
     PasteFolderPicked(Option<PathBuf>),
+    /// New dictionaries are in use: the lines must be checked again.
+    SpellingReady,
+    /// A language's dictionary download finished.
+    DictionaryDownloaded {
+        code: String,
+        result: Result<(), String>,
+    },
     /// The Insert → Image dialog for tab `id` closed (`None`: cancelled).
     ImagePicked {
         id: u64,
@@ -639,6 +646,13 @@ enum PendingModal {
     },
     /// An image is being pasted into a document never saved (`paste_after_save`).
     SaveBeforePaste,
+}
+
+/// A misspelled word right-clicked: its buffer range, and the suggestions offered.
+struct SpellMenu {
+    range: Range<usize>,
+    word: String,
+    suggestions: Vec<String>,
 }
 
 /// The paste-image dialog: the image from the clipboard, for tab `tab`.
@@ -1059,6 +1073,12 @@ struct App {
     /// open on the next frame.
     context_menu: Option<egui::Pos2>,
     context_menu_open: bool,
+    /// The context menu was opened on a misspelled word: it, and what to offer.
+    spell_menu: Option<SpellMenu>,
+    /// Dictionary downloads in progress or failed, by language code.
+    dict_status: std::collections::HashMap<String, crate::spelling::DownloadState>,
+    /// Bumped by each speller load: only the latest one installs its result.
+    speller_seq: Arc<AtomicU64>,
     /// A right button press on the document waits for its release to open the menu.
     context_menu_pending: bool,
     /// Wayland file drag-and-drop listener (stopped in `exiting`).
@@ -1251,6 +1271,9 @@ impl App {
             visual_goal: None,
             context_menu: None,
             context_menu_open: false,
+            spell_menu: None,
+            dict_status: std::collections::HashMap::new(),
+            speller_seq: Arc::new(AtomicU64::new(0)),
             context_menu_pending: false,
             toc_width: toc_width(),
             toc_current: None,
@@ -1792,6 +1815,11 @@ impl App {
             relayout = true;
         }
         self.prefs_save_at = Some(Instant::now() + Duration::from_millis(500));
+        if old.spell_check != self.prefs.spell_check
+            || old.spell_languages != self.prefs.spell_languages
+        {
+            self.reload_speller();
+        }
         if old.follow_system_theme != self.prefs.follow_system_theme {
             // Windows/macOS: (un)set the explicit window theme, which decides whether winit
             // reports the desktop's preference, then read it (Linux: the portal watcher
@@ -2131,6 +2159,69 @@ impl App {
             scale,
             vh,
         );
+    }
+
+    /// Load the dictionaries of the preferences' languages (off the UI thread) and put
+    /// them in use; with spell checking off, stop using any. A language whose dictionary
+    /// is not here is downloaded first (then loaded by the next call).
+    fn reload_speller(&mut self) {
+        if !self.prefs.spell_check || self.prefs.spell_languages.is_empty() {
+            self.speller_seq.fetch_add(1, Ordering::Relaxed);
+            if crate::spelling::is_active() {
+                crate::spelling::install(None);
+                self.refresh_spelling();
+            }
+            return;
+        }
+        // A failed download is retried once its language is unchecked and checked again.
+        let languages = &self.prefs.spell_languages;
+        self.dict_status.retain(|code, state| {
+            *state == crate::spelling::DownloadState::Downloading || languages.contains(code)
+        });
+        for code in self.prefs.spell_languages.clone() {
+            if crate::spelling::dictionary_paths(&code).is_none()
+                && !self.dict_status.contains_key(&code)
+            {
+                self.start_dictionary_download(&code);
+            }
+        }
+        let codes = self.prefs.spell_languages.clone();
+        let seq = self.speller_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let latest = self.speller_seq.clone();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let (speller, _missing) = crate::spelling::load(&codes);
+            if latest.load(Ordering::Relaxed) == seq {
+                crate::spelling::install(Some(speller));
+                let _ = proxy.send_event(WritEvent::SpellingReady);
+            }
+        });
+    }
+
+    /// Download language `code`'s dictionary in the background.
+    fn start_dictionary_download(&mut self, code: &str) {
+        let Some(lang) = crate::spelling::language(code) else {
+            return;
+        };
+        self.dict_status.insert(
+            code.to_string(),
+            crate::spelling::DownloadState::Downloading,
+        );
+        let proxy = self.proxy.clone();
+        let code = code.to_string();
+        self.runtime.spawn(async move {
+            let result = crate::spelling::download(lang).await;
+            let _ = proxy.send_event(WritEvent::DictionaryDownloaded { code, result });
+        });
+    }
+
+    /// The marked words changed (dictionaries, personal words): lay the document out again.
+    fn refresh_spelling(&mut self) {
+        if let Some(state) = self.state.as_ref() {
+            let (w, vh, scale) = state.viewport();
+            self.doc_engine.rebuild_preserving_scroll(w, scale, vh);
+        }
+        self.redraw();
     }
 
     /// An image was pasted into the active document: open the dialog that saves it, or,
@@ -2715,6 +2806,38 @@ impl App {
             }
             Command::InsertImage => {
                 self.start_insert_image();
+                return;
+            }
+            Command::SpellReplace(i) => {
+                if let Some(menu) = self.spell_menu.take()
+                    && let Some(word) = menu.suggestions.get(i)
+                    && self
+                        .doc_engine
+                        .editor
+                        .state
+                        .buffer
+                        .slice_cow(menu.range.clone())
+                        == menu.word.as_str()
+                {
+                    let end = menu.range.start + word.len();
+                    self.apply_format(crate::format::TextEdit {
+                        range: menu.range,
+                        text: word.clone(),
+                        selection: end..end,
+                    });
+                }
+                return;
+            }
+            Command::SpellAddWord => {
+                if let Some(menu) = self.spell_menu.take() {
+                    match crate::spelling::add_to_personal(&menu.word) {
+                        Ok(()) => self.refresh_spelling(),
+                        Err(e) => self.show_message(
+                            "Could not add the word",
+                            format!("Saving the personal dictionary failed: {e}"),
+                        ),
+                    }
+                }
                 return;
             }
             Command::InsertFootnote => {
@@ -4337,6 +4460,25 @@ impl ApplicationHandler<WritEvent> for App {
             }
             return;
         }
+        if let WritEvent::SpellingReady = event {
+            self.refresh_spelling();
+            return;
+        }
+        if let WritEvent::DictionaryDownloaded { code, result } = event {
+            match result {
+                Ok(()) => {
+                    self.dict_status.remove(&code);
+                    self.reload_speller();
+                }
+                Err(e) => {
+                    eprintln!("[markdone] dictionary {code}: download failed: {e}");
+                    self.dict_status
+                        .insert(code, crate::spelling::DownloadState::Failed(e));
+                }
+            }
+            self.redraw();
+            return;
+        }
         if let WritEvent::PasteFolderPicked(dir) = event {
             self.file_dialog_open = false;
             if let Some(dialog) = self.paste_image.as_mut() {
@@ -4604,6 +4746,7 @@ impl ApplicationHandler<WritEvent> for App {
         // Validate refs already present in the loaded file, and start loading images
         // (spawn_validations already calls sync_images).
         self.spawn_validations();
+        self.reload_speller();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -4966,6 +5109,30 @@ impl ApplicationHandler<WritEvent> for App {
                 if self.ui.is_none() || self.mouse_pos.1 < 0.0 || self.mouse_pos.1 >= vh {
                     return;
                 }
+                // A misspelled word under the pointer: the menu offers its corrections.
+                self.spell_menu = self
+                    .doc_engine
+                    .doc
+                    .as_ref()
+                    .and_then(|d| {
+                        let off = d.hit_test(self.mouse_pos.0, self.mouse_pos.1)?;
+                        d.misspelled_at(off)
+                    })
+                    .map(|range| {
+                        let word = self
+                            .doc_engine
+                            .editor
+                            .state
+                            .buffer
+                            .slice_cow(range.clone())
+                            .into_owned();
+                        let suggestions = crate::spelling::suggest(&word);
+                        SpellMenu {
+                            range,
+                            word,
+                            suggestions,
+                        }
+                    });
                 // Outside the selection, the right click first moves the caret there.
                 if let Some(off) = self
                     .doc_engine
@@ -6036,6 +6203,8 @@ impl ApplicationHandler<WritEvent> for App {
                 }
                 let context_menu = self.context_menu;
                 let context_menu_open = std::mem::take(&mut self.context_menu_open);
+                let spell_suggestions = self.spell_menu.as_ref().map(|m| m.suggestions.clone());
+                let dict_status = &self.dict_status;
                 let has_selection = menu_state.has_selection;
                 let exporting = self.export_running.clone();
                 let status_points = STATUS_BAR_H;
@@ -6061,6 +6230,7 @@ impl ApplicationHandler<WritEvent> for App {
                                 pos,
                                 context_menu_open,
                                 has_selection,
+                                spell_suggestions.as_deref(),
                             )
                         {
                             picked = Some(cmd);
@@ -6077,6 +6247,7 @@ impl ApplicationHandler<WritEvent> for App {
                                 theme_names,
                                 font_families,
                                 config_path,
+                                dict_status,
                             );
                         }
                         if let Some((name, unsaved)) = &conflict {
@@ -6654,6 +6825,11 @@ fn fetch_autocomplete_blocking(editor: &mut Editor) {
 /// `path` as a PNG. Independent of any surface/window, so it runs headlessly and
 /// doubles as a golden-image harness for later phases.
 pub fn snapshot(path: &str, width: u32, height: u32, scroll_y: f32) -> Result<()> {
+    // MARKDONE_SHELL_SPELL=it_IT,en_US: check the spelling in these languages.
+    if let Ok(codes) = std::env::var("MARKDONE_SHELL_SPELL") {
+        let codes: Vec<String> = codes.split(',').map(|c| c.trim().to_string()).collect();
+        crate::spelling::install(Some(crate::spelling::load(&codes).0));
+    }
     // MARKDONE_SHELL_FILE opens a real file (with live HEAD diff); else the demo doc.
     let mut editor = match std::env::var("MARKDONE_SHELL_FILE") {
         Ok(p) => Editor::open(std::path::Path::new(&p)),

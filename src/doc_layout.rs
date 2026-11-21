@@ -186,6 +186,9 @@ fn ranges_overlap(a: &Range<usize>, b: &Range<usize>) -> bool {
 fn render_key(version: u64, line_idx: usize, cursor_key: usize) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     version.hash(&mut h);
+    // A dictionary or a personal word changes which words are marked.
+    #[cfg(feature = "app")]
+    crate::spelling::generation().hash(&mut h);
     line_idx.hash(&mut h);
     cursor_key.hash(&mut h);
     h.finish()
@@ -1251,6 +1254,9 @@ pub struct DocLayout {
     checkbox_on: Color,
     checkbox_mark: Color,
     checkbox_border: Color,
+    /// The wavy underline of misspelled words: its color and stroke width (device px).
+    misspelled_color: Color,
+    misspelled_width: f32,
     code_box_pad: f32,
     code_label_size: f32,
     code_label_color: Color,
@@ -1399,6 +1405,7 @@ impl DocLayout {
             inline_images: Vec::new(),
             inline_math: Vec::new(),
             inline_checkboxes: Vec::new(),
+            misspelled: Vec::new(),
             table: None,
         });
         // The materialized band: [measure_from_line, measured_count). Lines before
@@ -2044,6 +2051,8 @@ impl DocLayout {
             checkbox_on: peniko_color(theme.cyan),
             checkbox_mark: peniko_color(theme.background),
             checkbox_border: peniko_color(theme.comment),
+            misspelled_color: peniko_color(theme.red),
+            misspelled_width: scale.max(1.0),
             code_box_pad: 6.0 * scale,
             code_label_size: 12.0 * scale,
             code_label_color: peniko_color(theme.comment),
@@ -2077,6 +2086,17 @@ impl DocLayout {
     }
 
     /// Buffer line index containing `buffer_off` (clamped to the last line).
+    /// The buffer range of the misspelled (underlined) word at buffer offset `off`.
+    pub fn misspelled_at(&self, off: usize) -> Option<Range<usize>> {
+        let i = self.line_of(off);
+        let render = self.renders.get(i)?;
+        render
+            .misspelled
+            .iter()
+            .map(|r| render.map.display_to_buffer(r.start)..render.map.display_to_buffer(r.end))
+            .find(|r| r.start <= off && off <= r.end)
+    }
+
     pub fn line_of(&self, buffer_off: usize) -> usize {
         let n = self.line_ranges.len();
         if n == 0 {
@@ -2390,6 +2410,52 @@ impl DocLayout {
         self.fill_display_ranges(scene, layout, ranges, self.pad_x as f64, top_y, color);
     }
 
+    /// Underline the display `ranges` of `layout` (drawn at `top_y`) with a wavy line,
+    /// just under the text's baseline: the misspelled words.
+    fn draw_misspelled(
+        &self,
+        scene: &mut Scene,
+        layout: &parley::Layout<Brush>,
+        ranges: &[Range<usize>],
+        top_y: f32,
+    ) {
+        let w = self.misspelled_width as f64;
+        let amplitude = 1.25 * w;
+        let step = 3.0 * w;
+        let stroke = Stroke::new(w);
+        let lines: Vec<_> = layout.lines().collect();
+        for r in ranges {
+            let sel = display_range_selection(layout, r.clone());
+            for (bb, line) in sel.geometry(layout) {
+                let Some(metrics) = lines.get(line).map(|l| l.metrics()) else {
+                    continue;
+                };
+                let y = top_y as f64 + (metrics.baseline + metrics.descent * 0.6) as f64;
+                let (x0, x1) = (self.pad_x as f64 + bb.x0, self.pad_x as f64 + bb.x1);
+                if x1 - x0 < step {
+                    continue;
+                }
+                let mut path = vello::kurbo::BezPath::new();
+                path.move_to((x0, y));
+                let mut x = x0;
+                let mut up = true;
+                while x + step <= x1 {
+                    let dy = if up { -amplitude } else { amplitude };
+                    path.quad_to((x + step / 2.0, y + dy * 2.0), (x + step, y));
+                    x += step;
+                    up = !up;
+                }
+                scene.stroke(
+                    &stroke,
+                    Affine::IDENTITY,
+                    self.misspelled_color,
+                    None,
+                    &path,
+                );
+            }
+        }
+    }
+
     /// Paint line `i`'s inline images at their laid-out inline-box positions. `gy` is
     /// the real line's top (device px, scroll-applied). A box's `id` indexes
     /// `inline_draws[i]`: a loaded image is drawn scaled to the box; otherwise a faint
@@ -2537,6 +2603,10 @@ impl DocLayout {
             self.draw_inline_images(scene, i, real_top);
             // The real line, below its ghost block.
             engine.draw_line(scene, &self.layouts[i], (self.pad_x, real_top));
+            let misspelled = &self.renders[i].misspelled;
+            if !misspelled.is_empty() {
+                self.draw_misspelled(scene, &self.layouts[i], misspelled, real_top);
+            }
         }
         // Trailing deletions below the last real line (a hunk anchored past the end).
         let mut gy = self.tops[self.layouts.len()] - self.scroll_y;
@@ -3034,6 +3104,7 @@ mod tests {
                         inline_images: Vec::new(),
                         inline_math: Vec::new(),
                         inline_checkboxes: Vec::new(),
+                        misspelled: Vec::new(),
                         table: None,
                     })
                 })
@@ -3062,6 +3133,8 @@ mod tests {
             checkbox_on: Color::TRANSPARENT,
             checkbox_mark: Color::TRANSPARENT,
             checkbox_border: Color::TRANSPARENT,
+            misspelled_color: Color::TRANSPARENT,
+            misspelled_width: 1.0,
             code_box_pad: 0.0,
             code_label_size: 12.0,
             code_label_color: Color::TRANSPARENT,

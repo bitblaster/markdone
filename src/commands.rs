@@ -38,6 +38,10 @@ pub enum Command {
     InsertCodeBlock,
     /// A footnote: its reference at the caret, its definition at the document's end.
     InsertFootnote,
+    /// Replace the misspelled word of the context menu with its suggestion `i`.
+    SpellReplace(usize),
+    /// Add the misspelled word of the context menu to the personal dictionary.
+    SpellAddWord,
     Preferences,
     Find,
     Replace,

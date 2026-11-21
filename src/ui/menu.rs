@@ -215,6 +215,8 @@ pub fn context_menu(
     pos: egui::Pos2,
     open: bool,
     has_selection: bool,
+    // Right-clicked on a misspelled word: the suggestions to offer (maybe none).
+    spelling: Option<&[String]>,
 ) -> Option<Command> {
     let mut picked = None;
     egui::Popup::new(
@@ -230,6 +232,26 @@ pub fn context_menu(
     .open_memory(open.then_some(egui::SetOpenCommand::Bool(true)))
     .show(|ui| {
         ui.set_min_width(240.0);
+        if let Some(suggestions) = spelling {
+            if suggestions.is_empty() {
+                ui.add_enabled(false, egui::Button::new("No Suggestions"));
+            }
+            for (i, word) in suggestions.iter().enumerate() {
+                let label = egui::RichText::new(word).strong();
+                if ui.button(label).clicked() {
+                    picked = Some(Command::SpellReplace(i));
+                    ui.close();
+                }
+            }
+            item(
+                ui,
+                "Add to Dictionary",
+                Command::SpellAddWord,
+                true,
+                &mut picked,
+            );
+            ui.separator();
+        }
         item(ui, "Cut", Command::Cut, has_selection, &mut picked);
         item(ui, "Copy", Command::Copy, has_selection, &mut picked);
         item(

@@ -1,9 +1,11 @@
 //! The Preferences window (Edit → Preferences…). It edits a copy of the preferences;
 //! the shell applies every change immediately and saves it to `config.toml`.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::config::{ExternalChange, FONT_SIZE_RANGE, MAX_WIDTH_RANGE, Preferences, ThemeMode};
+use crate::spelling::{self, Availability, DownloadState};
 use crate::text_engine::FontFamilyInfo;
 
 /// Font sizes offered by the slider (the config file accepts a wider range).
@@ -18,6 +20,7 @@ pub fn show(
     theme_names: &[String],
     font_families: &[FontFamilyInfo],
     config_path: Option<&Path>,
+    dict_status: &HashMap<String, DownloadState>,
 ) -> bool {
     let before = prefs.clone();
     let response = egui::Modal::new(egui::Id::new("writ-preferences")).show(ctx, |ui| {
@@ -140,6 +143,50 @@ pub fn show(
              document is saved by hand the first time, to give it a name.",
         );
 
+        section(ui, "Spelling");
+        ui.checkbox(&mut prefs.spell_check, "Check spelling");
+        ui.add_enabled_ui(prefs.spell_check, |ui| {
+            egui::Grid::new("prefs-spelling")
+                .num_columns(2)
+                .spacing([16.0, 4.0])
+                .show(ui, |ui| {
+                    for lang in spelling::LANGUAGES {
+                        let mut on = prefs.spell_languages.iter().any(|c| c == lang.code);
+                        if ui.checkbox(&mut on, lang.name).changed() {
+                            if on {
+                                prefs.spell_languages.push(lang.code.to_string());
+                            } else {
+                                prefs.spell_languages.retain(|c| c != lang.code);
+                            }
+                        }
+                        let status = match dict_status.get(lang.code) {
+                            Some(DownloadState::Downloading) => {
+                                egui::RichText::new("downloading…").small().weak()
+                            }
+                            Some(DownloadState::Failed(_)) => {
+                                egui::RichText::new("download failed (uncheck and check to retry)")
+                                    .small()
+                                    .color(ui.visuals().error_fg_color)
+                            }
+                            None => egui::RichText::new(match spelling::availability(lang.code) {
+                                Availability::System => "system dictionary",
+                                Availability::Downloaded => "downloaded",
+                                Availability::Missing => "downloaded when checked",
+                            })
+                            .small()
+                            .weak(),
+                        };
+                        ui.label(status);
+                        ui.end_row();
+                    }
+                });
+        });
+        note(
+            ui,
+            "A word is correct if any checked language accepts it. Right-click an \
+             underlined word for suggestions, or to add it to your dictionary.",
+        );
+
         section(ui, "Privacy");
         ui.checkbox(
             &mut prefs.github,
@@ -149,6 +196,12 @@ pub fn show(
             ui,
             "Reads the repository from .git/config and contacts api.github.com. \
                  Applies to documents opened after the change.",
+        );
+        note(
+            ui,
+            "Spelling dictionaries the system does not have are downloaded from \
+             LibreOffice's repository on GitHub (raw.githubusercontent.com) when their \
+             language is checked.",
         );
         // Always shown; editable only while the lookups are on.
         ui.add_enabled_ui(prefs.github, |ui| {

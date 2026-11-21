@@ -128,6 +128,9 @@ pub struct LineRender {
     /// reserves an inline box and paints the box (with its check mark). Empty while the
     /// cursor is on the line: the raw `- [ ] ` / `- [x] ` is shown for editing.
     pub inline_checkboxes: Vec<InlineCheckboxRef>,
+    /// Display byte ranges of the words spell checking marks (underlined with a wavy
+    /// line). Empty when spell checking is off.
+    pub misspelled: Vec<Range<usize>>,
     /// This line is a grid-rendered table row: its raw pipe text is hidden (`text`
     /// empty) and the draw path paints the cell grid instead. `None` when the line is
     /// not a table, or when the cursor is inside the table block (raw text revealed).
@@ -683,6 +686,20 @@ pub fn build_line_render(
     // so wrapped rows align under it. Hidden markers (e.g. heading `# `) collapse to 0.
     let content_start = map.buffer_to_display(markers.content_start());
 
+    let misspelled = if in_code_block || is_grid_table {
+        Vec::new()
+    } else {
+        spelling_marks(
+            &line_text,
+            line_start,
+            &inline,
+            math_spans,
+            latex_ranges,
+            cursor_on_line.then(|| cursor_offset.saturating_sub(line_start)),
+            &map,
+        )
+    };
+
     LineRender {
         text,
         font_size,
@@ -696,8 +713,66 @@ pub fn build_line_render(
         inline_images,
         inline_math,
         inline_checkboxes,
+        misspelled,
         table: table_ref,
     }
+}
+
+/// The display ranges of the line's misspelled words (see [`crate::spelling`]). Code,
+/// images, footnote markers, shortened URLs, links' targets and math are not prose and
+/// are left out; so is the word at `caret` (being typed).
+#[cfg(feature = "app")]
+fn spelling_marks(
+    line_text: &str,
+    line_start: usize,
+    regions: &[StyledRegion],
+    math_spans: &[MathSpan],
+    latex_ranges: &[Range<usize>],
+    caret: Option<usize>,
+    map: &SegmentMap,
+) -> Vec<Range<usize>> {
+    if !crate::spelling::is_active() {
+        return Vec::new();
+    }
+    let rel =
+        |r: &Range<usize>| r.start.saturating_sub(line_start)..r.end.saturating_sub(line_start);
+    let mut skip: Vec<Range<usize>> = Vec::new();
+    for region in regions {
+        if region.style.code
+            || region.is_image
+            || region.footnote
+            || region.checkbox.is_some()
+            || region.display_text.is_some()
+        {
+            skip.push(rel(&region.full_range));
+        } else if region.link_url.is_some() {
+            skip.push(rel(&(region.full_range.start..region.content_range.start)));
+            skip.push(rel(&(region.content_range.end..region.full_range.end)));
+        }
+    }
+    skip.extend(math_spans.iter().map(|m| rel(&m.full_range)));
+    skip.extend(latex_ranges.iter().map(rel));
+    crate::spelling::misspelled(line_text, &skip, caret)
+        .into_iter()
+        .filter_map(|r| {
+            let start = map.buffer_to_display(line_start + r.start);
+            let end = map.buffer_to_display(line_start + r.end);
+            (end > start).then_some(start..end)
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "app"))]
+fn spelling_marks(
+    _line_text: &str,
+    _line_start: usize,
+    _regions: &[StyledRegion],
+    _math_spans: &[MathSpan],
+    _latex_ranges: &[Range<usize>],
+    _caret: Option<usize>,
+    _map: &SegmentMap,
+) -> Vec<Range<usize>> {
+    Vec::new()
 }
 
 /// Build the display text, style runs, and segment map for a single table cell's

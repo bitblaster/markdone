@@ -128,6 +128,8 @@ pub mod session;
 pub mod shell;
 #[cfg(feature = "app")]
 pub mod single_instance;
+#[cfg(feature = "app")]
+pub mod spelling;
 pub mod status_bar;
 #[cfg(all(feature = "app", unix, not(target_os = "macos")))]
 pub mod system_theme;

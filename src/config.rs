@@ -145,6 +145,10 @@ pub struct Preferences {
     /// Save modified documents by themselves, shortly after typing stops and when they
     /// are closed (documents never saved excepted).
     pub autosave: bool,
+    /// Underline misspelled words.
+    pub spell_check: bool,
+    /// The languages checked (Hunspell codes, e.g. `it_IT`): a word is right in any.
+    pub spell_languages: Vec<String>,
     /// Look up GitHub references (issues, PRs, users) found in documents: reads the
     /// repository from `.git/config` and calls api.github.com.
     pub github: bool,
@@ -171,6 +175,8 @@ impl Default for Preferences {
             external_change: ExternalChange::Ask,
             check_on_focus: true,
             autosave: false,
+            spell_check: false,
+            spell_languages: Vec::new(),
             github: false,
             github_token: None,
         }
@@ -269,6 +275,7 @@ struct FileConfig {
     theme: Option<ThemeSpec>,
     editor: Option<EditorSpec>,
     files: Option<FilesSpec>,
+    spelling: Option<SpellingSpec>,
     network: Option<NetworkSpec>,
     /// User-defined named palettes, selectable via `theme.name`.
     #[serde(default)]
@@ -304,6 +311,14 @@ struct FilesSpec {
     on_external_change: Option<String>,
     check_on_focus: Option<bool>,
     autosave: Option<bool>,
+}
+
+#[cfg(feature = "app")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpellingSpec {
+    enabled: Option<bool>,
+    languages: Option<Vec<String>>,
 }
 
 #[cfg(feature = "app")]
@@ -549,6 +564,14 @@ fn resolve(file: FileConfig) -> ResolvedConfig {
             cfg.prefs.autosave = autosave;
         }
     }
+    if let Some(spelling) = &file.spelling {
+        if let Some(enabled) = spelling.enabled {
+            cfg.prefs.spell_check = enabled;
+        }
+        if let Some(languages) = &spelling.languages {
+            cfg.prefs.spell_languages = languages.clone();
+        }
+    }
     if let Some(network) = &file.network {
         if let Some(github) = network.github {
             cfg.prefs.github = github;
@@ -613,6 +636,14 @@ pub fn save_preferences(path: &Path, prefs: &Preferences) -> std::io::Result<()>
     );
     set("files", "check_on_focus", value(prefs.check_on_focus));
     set("files", "autosave", value(prefs.autosave));
+    set("spelling", "enabled", value(prefs.spell_check));
+    set(
+        "spelling",
+        "languages",
+        value(toml_edit::Array::from_iter(
+            prefs.spell_languages.iter().map(String::as_str),
+        )),
+    );
     set("network", "github", value(prefs.github));
     // The pre-modes single theme name is superseded by `dark`/`light`/`mode` (left in place
     // it would be re-read as the chosen theme).
@@ -762,6 +793,7 @@ mod tests {
         let file: FileConfig = toml::from_str(
             "[editor]\nfull_width = true\nmax_width = 1000\n\
              [files]\non_external_change = \"ask\"\ncheck_on_focus = false\nautosave = true\n\
+             [spelling]\nenabled = true\nlanguages = [\"it_IT\", \"en_US\"]\n\
              [network]\ngithub = true\n",
         )
         .unwrap();
@@ -771,6 +803,8 @@ mod tests {
         assert_eq!(p.external_change, ExternalChange::Ask);
         assert!(!p.check_on_focus);
         assert!(p.autosave);
+        assert!(p.spell_check);
+        assert_eq!(p.spell_languages, ["it_IT", "en_US"]);
         assert!(p.github);
         // Defaults: limited width, reload, check on focus, no network.
         let d = resolve(FileConfig::default()).prefs;
@@ -886,6 +920,8 @@ mod tests {
             external_change: ExternalChange::Ask,
             check_on_focus: false,
             autosave: true,
+            spell_check: true,
+            spell_languages: vec!["it_IT".into(), "en_US".into()],
             github: true,
             github_token: Some("ghp_example".into()),
         };
