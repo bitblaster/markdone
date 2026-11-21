@@ -1923,10 +1923,6 @@ impl App {
     /// Jump to heading `i` of the active document (table of contents click): caret on
     /// the heading, unfolded if needed, pinned to the top of the view.
     fn go_to_heading(&mut self, i: usize) {
-        let Some(state) = self.state.as_ref() else {
-            return;
-        };
-        let (w, vh, scale) = state.viewport();
         let Some(off) = self
             .doc_engine
             .editor
@@ -1938,8 +1934,49 @@ impl App {
         else {
             return;
         };
+        self.go_to_offset(off);
+    }
+
+    /// The footnote marker (reference or definition) at buffer offset `off`.
+    fn footnote_marker_at(editor: &Editor, off: usize) -> Option<crate::footnote::Marker> {
+        let buffer = &editor.state.buffer;
+        let line = buffer.byte_to_line(off);
+        let start = buffer.line_to_byte(line);
+        let end = if line + 1 < buffer.line_count() {
+            buffer.line_to_byte(line + 1)
+        } else {
+            buffer.len_bytes()
+        };
+        let text = buffer.slice_cow(start..end);
+        crate::footnote::marker_at(text.trim_end_matches(['\n', '\r']), start, off)
+    }
+
+    /// Ctrl+click on a footnote marker: from a reference to its note, from a note back to
+    /// the first reference.
+    fn follow_footnote(&mut self, off: usize) {
+        let Some(marker) = Self::footnote_marker_at(&self.doc_engine.editor, off) else {
+            return;
+        };
+        let text = self.doc_engine.editor.text();
+        let target = if marker.definition {
+            crate::footnote::first_reference(&text, &marker.label).map(|r| r.end)
+        } else {
+            crate::footnote::definition(&text, &marker.label).map(|d| d.content_start)
+        };
+        if let Some(target) = target {
+            self.go_to_offset(target);
+        }
+    }
+
+    /// Put the caret at buffer offset `off` and scroll its line to the top of the view
+    /// (unfolding what hides it).
+    fn go_to_offset(&mut self, off: usize) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let (w, vh, scale) = state.viewport();
         self.doc_engine.editor.set_cursor(off);
-        // The heading may sit inside a folded ancestor; reveal it and relayout so its
+        // The target may sit inside a folded ancestor; reveal it and relayout so its
         // geometry exists before pinning it.
         if self.doc_engine.editor.reveal_cursor() {
             self.doc_engine.rebuild_preserving_scroll(w, scale, vh);
@@ -2268,10 +2305,18 @@ impl App {
 
     /// Apply a formatting edit to the active document and refresh like after typing.
     fn apply_format(&mut self, edit: crate::format::TextEdit) {
+        if self.state.is_none() {
+            return;
+        }
+        self.doc_engine.editor.apply_text_edit(&edit);
+        self.after_format_edit();
+    }
+
+    /// Refresh after an edit made by a command (like after typing).
+    fn after_format_edit(&mut self) {
         let Some(state) = self.state.as_ref() else {
             return;
         };
-        self.doc_engine.editor.apply_text_edit(&edit);
         let (w, vh, scale) = state.viewport();
         let window = state.window.clone();
         apply_edit_effects(
@@ -2670,6 +2715,15 @@ impl App {
             }
             Command::InsertImage => {
                 self.start_insert_image();
+                return;
+            }
+            Command::InsertFootnote => {
+                let (text, sel) = self.text_and_selection();
+                let (edits, caret) = crate::footnote::insert(&text, sel);
+                self.doc_engine
+                    .editor
+                    .apply_text_edits(&edits, caret..caret);
+                self.after_format_edit();
                 return;
             }
             Command::SelectAll => self.doc_engine.editor.select_all(),
@@ -3902,7 +3956,10 @@ fn pointer_cursor(
             .doc
             .as_ref()
             .and_then(|d| d.hit_test(mouse_pos.0, mouse_pos.1))
-            .is_some_and(|off| doc_engine.editor.link_at(off).is_some())
+            .is_some_and(|off| {
+                doc_engine.editor.link_at(off).is_some()
+                    || App::footnote_marker_at(&doc_engine.editor, off).is_some()
+            })
     {
         return CursorIcon::Pointer;
     }
@@ -4879,8 +4936,8 @@ impl ApplicationHandler<WritEvent> for App {
                             self.mouse_pos.1,
                         )
                     });
-                    let changed = self.hovered.as_ref().map(|h| &h.reference)
-                        != new.as_ref().map(|h| &h.reference);
+                    let changed =
+                        self.hovered.as_ref().map(|h| &h.kind) != new.as_ref().map(|h| &h.kind);
                     self.hovered = new;
                     if changed {
                         state.window.request_redraw();
@@ -5102,6 +5159,13 @@ impl ApplicationHandler<WritEvent> for App {
                     .as_ref()
                     .and_then(|d| d.hit_test(self.mouse_pos.0, self.mouse_pos.1))
                 {
+                    // Ctrl/Cmd-click on a footnote jumps between reference and note.
+                    if (self.modifiers.control_key() || self.modifiers.super_key())
+                        && Self::footnote_marker_at(&self.doc_engine.editor, off).is_some()
+                    {
+                        self.follow_footnote(off);
+                        return;
+                    }
                     // Ctrl/Cmd-click on a link (markdown link, naked URL, or GitHub ref)
                     // opens it in the browser instead of placing the caret.
                     if (self.modifiers.control_key() || self.modifiers.super_key())

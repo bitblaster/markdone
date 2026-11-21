@@ -204,6 +204,7 @@ pub fn format_items(ui: &mut egui::Ui, picked: &mut Option<Command>) {
         item(ui, "Link", Command::InsertLink, true, picked);
         item(ui, "Image…", Command::InsertImage, true, picked);
         item(ui, "Code Block", Command::InsertCodeBlock, true, picked);
+        item(ui, "Footnote", Command::InsertFootnote, true, picked);
     });
 }
 

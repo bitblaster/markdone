@@ -88,6 +88,7 @@ pub mod editor;
 #[cfg(feature = "app")]
 pub mod export;
 pub mod fold;
+pub mod footnote;
 pub mod format;
 #[cfg(feature = "git")]
 pub mod git;

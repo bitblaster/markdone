@@ -386,6 +386,36 @@ impl Editor {
         });
     }
 
+    /// Apply several non-overlapping `edits` (in the current text's coordinates; edits at
+    /// the same offset land in the order given) as one undo step, then select
+    /// `selection` (in the resulting text).
+    pub fn apply_text_edits(
+        &mut self,
+        edits: &[crate::format::TextEdit],
+        selection: std::ops::Range<usize>,
+    ) {
+        self.edit(|s| {
+            let head = s.buffer.undo_head();
+            let before = s.buffer.text();
+            let cursor_before = s.cursor().offset;
+            let mut order: Vec<usize> = (0..edits.len()).collect();
+            order.sort_by_key(|&i| {
+                (
+                    std::cmp::Reverse(edits[i].range.start),
+                    std::cmp::Reverse(i),
+                )
+            });
+            for i in order {
+                s.buffer
+                    .replace(edits[i].range.clone(), &edits[i].text, cursor_before);
+            }
+            let after = s.buffer.text();
+            s.buffer
+                .coalesce_since(head, &before, &after, cursor_before, selection.end);
+            s.selection = Selection::new(selection.start, selection.end);
+        });
+    }
+
     /// Mark the document as unsaved without editing it (see `Buffer::mark_dirty`).
     pub fn mark_dirty(&mut self) {
         self.state.buffer.mark_dirty();
@@ -3445,6 +3475,26 @@ let code = target(); // fenced block line
             e.find_state().unwrap().matches.len(),
             3,
             "rescan after undo restores the full match set"
+        );
+    }
+}
+
+#[cfg(test)]
+mod footnote_edit_tests {
+    use super::*;
+
+    #[test]
+    fn footnote_insert_is_one_undo_step() {
+        let mut e = Editor::new("Some text.\n");
+        let (edits, caret) = crate::footnote::insert(&e.text(), 4..4);
+        e.apply_text_edits(&edits, caret..caret);
+        assert_eq!(e.text(), "Some[^1] text.\n\n[^1]: ");
+        assert_eq!(e.cursor_position(), caret);
+        e.undo();
+        assert_eq!(
+            e.text(),
+            "Some text.\n",
+            "one undo removes reference and note"
         );
     }
 }

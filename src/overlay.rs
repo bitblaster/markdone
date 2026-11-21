@@ -1,6 +1,6 @@
-//! Overlay rendering: the GitHub-ref hover popover and the autocomplete dropdown,
-//! plus the styled-segment machinery (issue/user/title markdown) they share and the
-//! hover hit-testing that finds the ref under the pointer.
+//! Overlay rendering: the hover popover (GitHub refs, footnotes) and the autocomplete
+//! dropdown, plus the styled-segment machinery (issue/user/title markdown) they share
+//! and the hover hit-testing that finds what is under the pointer.
 
 use std::ops::Range;
 
@@ -20,11 +20,27 @@ use crate::text_engine::{
 };
 use crate::validation::{IssueStatus, ValidatedRefData, ValidationState};
 
-/// A GitHub ref currently under the pointer, plus its on-screen caret rect (used to
-/// anchor the hover popover above/below it).
+/// What is under the pointer, plus its on-screen caret rect (used to anchor the hover
+/// popover above/below it).
 pub(crate) struct HoverTarget {
-    pub(crate) reference: GitHubRef,
+    pub(crate) kind: HoverKind,
     pub(crate) anchor: ScreenRect,
+}
+
+/// The things that show a hover popover.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum HoverKind {
+    /// A GitHub issue, pull request or user reference.
+    GitHub(GitHubRef),
+    /// A footnote reference (`[^1]`) or a definition's marker (`[^1]:`).
+    Footnote {
+        label: String,
+        definition: bool,
+        /// For a reference: the note's text, if the document defines it.
+        note: Option<String>,
+        /// For a definition: whether the document refers to it.
+        referenced: bool,
+    },
 }
 
 pub(crate) fn find_hover_target(
@@ -43,13 +59,42 @@ pub(crate) fn hover_target_at_offset(
     doc: &DocLayout,
     off: usize,
 ) -> Option<HoverTarget> {
-    let line = editor.state.buffer.byte_to_line(off);
+    let buffer = &editor.state.buffer;
+    let line = buffer.byte_to_line(off);
+    let line_start = buffer.line_to_byte(line);
+    let line_end = if line + 1 < buffer.line_count() {
+        buffer.line_to_byte(line + 1)
+    } else {
+        buffer.len_bytes()
+    };
+    let line_text = buffer.slice_cow(line_start..line_end);
+    let line_text = line_text.trim_end_matches(['\n', '\r']);
+    if let Some(marker) = crate::footnote::marker_at(line_text, line_start, off) {
+        let anchor = doc.caret_rect(marker.range.start, 2.0)?;
+        let text = buffer.text();
+        let (note, referenced) = if marker.definition {
+            let referenced = crate::footnote::first_reference(&text, &marker.label).is_some();
+            (None, referenced)
+        } else {
+            let note = crate::footnote::definition(&text, &marker.label).map(|d| d.content);
+            (note, false)
+        };
+        return Some(HoverTarget {
+            kind: HoverKind::Footnote {
+                label: marker.label,
+                definition: marker.definition,
+                note,
+                referenced,
+            },
+            anchor,
+        });
+    }
     if let Some(refs) = editor.github_refs_by_line().get(&line) {
         for m in refs {
             if m.byte_range.contains(&off) {
                 let anchor = doc.caret_rect(m.byte_range.start, 2.0)?;
                 return Some(HoverTarget {
-                    reference: m.reference.clone(),
+                    kind: HoverKind::GitHub(m.reference.clone()),
                     anchor,
                 });
             }
@@ -62,7 +107,7 @@ pub(crate) fn hover_target_at_offset(
             {
                 let anchor = doc.caret_rect(u.byte_range.start, 2.0)?;
                 return Some(HoverTarget {
-                    reference: r.clone(),
+                    kind: HoverKind::GitHub(r.clone()),
                     anchor,
                 });
             }
@@ -377,16 +422,34 @@ pub(crate) fn draw_hover_popover(
     viewport_h: f32,
     scale: f32,
 ) {
-    let state = editor.github_validation_cache().get(&target.reference);
-    let segs = hover_segments(&target.reference, &state, editor.github_context(), theme);
-
     let font_size = 14.0;
-    // Cap the panel width (long issue titles) so it doesn't run off-screen.
+    // Cap the panel width (long issue titles, notes) so it doesn't run off-screen.
     let max_text = (viewport_w - 2.0 * PADDING * scale).min(480.0 * scale);
+    let (segs, hint) = match &target.kind {
+        HoverKind::GitHub(reference) => {
+            let state = editor.github_validation_cache().get(reference);
+            let segs = hover_segments(reference, &state, editor.github_context(), theme);
+            (segs, None)
+        }
+        HoverKind::Footnote {
+            label,
+            definition,
+            note,
+            referenced,
+        } => footnote_segments(label, *definition, note.as_deref(), *referenced, theme),
+    };
     let (layout, code_ranges) = segments_to_line(engine, &segs, scale, font_size, max_text, theme);
+    // The hint under the text: smaller and muted.
+    let hint_layout = hint.map(|hint| {
+        let seg = [PanelSeg::plain(hint, theme.comment)];
+        segments_to_line(engine, &seg, scale, 12.0, max_text, theme).0
+    });
+    let hint_gap = 4.0 * scale;
     let pad = 8.0 * scale;
-    let panel_w = layout.width() + pad * 2.0;
-    let panel_h = layout.height() + pad * 2.0;
+    let hint_w = hint_layout.as_ref().map_or(0.0, Layout::width);
+    let hint_h = hint_layout.as_ref().map_or(0.0, |l| l.height() + hint_gap);
+    let panel_w = layout.width().max(hint_w) + pad * 2.0;
+    let panel_h = layout.height() + hint_h + pad * 2.0;
 
     let gap = 4.0 * scale as f64;
     let (x, y) = place_panel(
@@ -409,6 +472,56 @@ pub(crate) fn draw_hover_popover(
     let origin = (x as f32 + pad, y as f32 + pad);
     fill_code_chips(scene, &layout, &code_ranges, origin, code_chip_color(theme));
     engine.draw_line(scene, &layout, origin);
+    if let Some(hint) = &hint_layout {
+        engine.draw_line(
+            scene,
+            hint,
+            (origin.0, origin.1 + layout.height() + hint_gap),
+        );
+    }
+}
+
+/// The popover of a footnote marker: the note (for a reference) and how to navigate.
+fn footnote_segments(
+    label: &str,
+    definition: bool,
+    note: Option<&str>,
+    referenced: bool,
+    theme: &EditorTheme,
+) -> (Vec<PanelSeg>, Option<String>) {
+    let click = if cfg!(target_os = "macos") {
+        "Cmd+click"
+    } else {
+        "Ctrl+click"
+    };
+    match (definition, note) {
+        (false, Some(note)) if !note.is_empty() => (
+            parse_title_markdown(note, theme.foreground),
+            Some(format!("{click} to go to the note")),
+        ),
+        (false, Some(_)) => (
+            vec![PanelSeg::italic("(empty note)".into(), theme.comment)],
+            Some(format!("{click} to go to the note")),
+        ),
+        (false, None) => (
+            vec![PanelSeg::plain(
+                format!("No note [^{label}] in this document."),
+                theme.comment,
+            )],
+            None,
+        ),
+        (true, _) if referenced => (
+            vec![PanelSeg::plain(format!("Note [^{label}]"), theme.cyan)],
+            Some(format!("{click} to go back to the reference")),
+        ),
+        (true, _) => (
+            vec![PanelSeg::plain(
+                format!("Nothing in this document refers to note [^{label}]."),
+                theme.comment,
+            )],
+            None,
+        ),
+    }
 }
 
 /// The colored text segments for one autocomplete row.

@@ -213,6 +213,7 @@ impl RenderSnapshot {
                     is_image: false,
                     checkbox: Some(checked),
                     display_text: None,
+                    footnote: false,
                 });
             }
         }

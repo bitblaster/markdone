@@ -191,7 +191,7 @@ fn styled_run_for(
         // A checked box reads as "done" (green); an empty box is muted.
         Some(true) => peniko_color(theme.green),
         Some(false) => peniko_color(theme.comment),
-        None if region.link_url.is_some() => peniko_color(theme.cyan),
+        None if region.link_url.is_some() || region.footnote => peniko_color(theme.cyan),
         None if style.code => peniko_color(theme.green),
         None => fallback,
     };
@@ -326,6 +326,7 @@ pub fn build_line_render(
                     is_image: false,
                     checkbox: Some(checked),
                     display_text: None,
+                    footnote: false,
                 });
             }
         }
@@ -766,6 +767,7 @@ mod tests {
             is_image: false,
             checkbox: None,
             display_text: None,
+            footnote: false,
         }
     }
 

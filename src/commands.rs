@@ -36,6 +36,8 @@ pub enum Command {
     InsertLink,
     InsertImage,
     InsertCodeBlock,
+    /// A footnote: its reference at the caret, its definition at the document's end.
+    InsertFootnote,
     Preferences,
     Find,
     Replace,

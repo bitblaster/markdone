@@ -716,6 +716,8 @@ pub struct StyledRegion {
     /// Used for GitHub URL shortening (e.g., show "owner/repo#123" instead of full URL).
     /// When set, the region is "atomic" - cursor/selection treat it as a single unit.
     pub display_text: Option<String>,
+    /// A footnote marker (`[^1]` or a definition's `[^1]:`), shown as its label.
+    pub footnote: bool,
 }
 
 /// Extract all inline styles from a markdown tree.
@@ -921,6 +923,37 @@ fn extract_link_region(node: &Node, rope: &Rope) -> Option<StyledRegion> {
                 url = Some(rope.slice(start..end).to_string());
             }
             _ => {}
+        }
+    }
+
+    // A footnote, `[^label]` (tree-sitter sees a shortcut link): shown as its label,
+    // superscript when it is a number. A definition's marker (`[^1]:` at the line
+    // start) takes its colon along.
+    if url.is_none() && node.kind() == "shortcut_link" {
+        let start = rope.byte_to_char(full_start);
+        let end = rope.byte_to_char(full_end);
+        let text = rope.slice(start..end).to_string();
+        if let Some(label) = text
+            .strip_prefix("[^")
+            .and_then(|t| t.strip_suffix(']'))
+            .filter(|l| !l.is_empty() && !l.contains(char::is_whitespace))
+        {
+            let line = rope.byte_to_line(full_start);
+            let line_start = rope.line_to_byte(line);
+            let before = rope.slice(rope.byte_to_char(line_start)..start).to_string();
+            let definition = before.trim_start_matches(' ').is_empty()
+                && before.len() <= 3
+                && end < rope.len_chars()
+                && rope.char(end) == ':';
+            let full_end = if definition { full_end + 1 } else { full_end };
+            let shown = crate::footnote::superscript(label).unwrap_or_else(|| format!("[{label}]"));
+            return Some(StyledRegion {
+                full_range: full_start..full_end,
+                content_range: full_start..full_end,
+                display_text: Some(shown),
+                footnote: true,
+                ..Default::default()
+            });
         }
     }
 

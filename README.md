@@ -153,6 +153,14 @@ the type, and `+`/`-` after it (`> [!tip]-`) makes the callout foldable.
 
 ![Callouts: note, a collapsed foldable tip, warning with a custom title, and danger](assets/callouts.png)
 
+### Footnotes
+
+Footnote references (`text[^1]`) show as superscript numbers (other labels in brackets),
+and the definitions (`[^1]: the note`) as the number and the note. Hovering a reference
+shows its note; Ctrl+click jumps from a reference to its note and from a note back to
+where it is referenced. *Format → Insert → Footnote* adds the next number at the cursor
+and its definition at the end of the document, with the cursor there to write it.
+
 ### Code blocks
 
 Fenced code blocks are shown as panels with their language in the corner; the fences come
