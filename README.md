@@ -250,8 +250,8 @@ must be present.
   automatically following the system setting (on Linux through the XDG desktop portal,
   supported by KDE, GNOME and others). Built-in themes: dark `dracula`, `nord`,
   `solarized-dark`, `gruvbox-dark`, `tokyo-night`, `catppuccin-mocha`; light
-  `solarized-light`, `catppuccin-latte`; custom themes can be defined in the
-  configuration file.
+  `solarized-light`, `catppuccin-latte`, `gruvbox-light`, `tokyo-night-day`,
+  `github-light`, `one-light`; custom themes can be defined in the configuration file.
 - **Fonts**: any installed font for the text, a monospace font for the code.
 - **Zoom**: Ctrl+plus, Ctrl+minus, Ctrl+0 or Ctrl+wheel.
 - Text width (limited or the whole window), line numbers.

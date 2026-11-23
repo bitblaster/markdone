@@ -224,14 +224,14 @@ fn draw_find_search_row(
         find.active.map(|i| i + 1).unwrap_or(0),
         find.matches.len()
     );
-    let mut run = StyleRun::new(0..count_str.len(), peniko_color(theme.comment));
+    let mut run = StyleRun::new(0..count_str.len(), peniko_color(theme.muted_text()));
     run.mono = true;
     let count = engine.build_line(
         &count_str,
         scale,
         FIND_LABEL_FONT,
         UI_LINE_HEIGHT,
-        peniko_color(theme.comment),
+        peniko_color(theme.muted_text()),
         None,
         &[run],
     );
@@ -433,7 +433,7 @@ fn draw_find_label(
         scale,
         FIND_LABEL_FONT,
         UI_LINE_HEIGHT,
-        peniko_color(theme.comment),
+        peniko_color(theme.muted_text()),
         None,
         &[],
     );
@@ -458,7 +458,11 @@ fn draw_find_chip(
     active: bool,
     scale: f32,
 ) -> f32 {
-    let color = if active { theme.purple } else { theme.comment };
+    let color = if active {
+        theme.purple
+    } else {
+        theme.muted_text()
+    };
     let layout = engine.build_line(
         label,
         scale,
@@ -588,7 +592,7 @@ pub fn draw_status_bar(
             scale,
             font_size,
             UI_LINE_HEIGHT,
-            peniko_color(theme.comment),
+            peniko_color(theme.muted_text()),
             None,
             &runs,
         );
@@ -650,7 +654,7 @@ pub fn draw_status_bar(
         scale,
         font_size,
         UI_LINE_HEIGHT,
-        peniko_color(theme.comment),
+        peniko_color(theme.muted_text()),
         None,
         &[],
     );

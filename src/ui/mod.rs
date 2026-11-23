@@ -421,7 +421,10 @@ fn style_from_theme(theme: &EditorTheme) -> egui::Style {
     let surface = color32(theme.surface);
     let background = color32(theme.background);
     let fg = color32(theme.foreground);
-    let dim = color32(theme.comment);
+    // Secondary text, legible on the theme (inactive tabs, the outline's lower levels):
+    // egui's weak text. Plain labels sit halfway between it and the foreground.
+    let weak = color32(theme.muted_text());
+    let dim = color32(theme.label_text());
     let hover = color32(theme.selection);
     let accent = color32(theme.purple);
 
@@ -447,6 +450,7 @@ fn style_from_theme(theme: &EditorTheme) -> egui::Style {
     v.extreme_bg_color = background;
     v.faint_bg_color = background;
     v.override_text_color = None;
+    v.weak_text_color = Some(weak);
     v.hyperlink_color = color32(theme.cyan);
     v.selection.bg_fill = hover;
     v.selection.stroke = Stroke::new(1.0, fg);

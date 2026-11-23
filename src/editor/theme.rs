@@ -2,6 +2,35 @@ use vello::peniko::Color;
 
 use crate::highlight::Highlighter;
 
+/// `a` blended toward `b` by `t` (0 = `a`, 1 = `b`), per sRGB channel.
+fn mix(a: Color, b: Color, t: f32) -> Color {
+    let (a, b) = (a.to_rgba8(), b.to_rgba8());
+    let ch = |x: u8, y: u8| {
+        (f32::from(x) + (f32::from(y) - f32::from(x)) * t.clamp(0.0, 1.0)).round() as u8
+    };
+    Color::from_rgba8(ch(a.r, b.r), ch(a.g, b.g), ch(a.b, b.b), 0xFF)
+}
+
+/// WCAG relative luminance of an sRGB color.
+fn luminance(c: Color) -> f32 {
+    let c = c.to_rgba8();
+    let lin = |v: u8| {
+        let v = f32::from(v) / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+}
+
+/// WCAG contrast ratio between two colors (1 to 21).
+fn contrast(a: Color, b: Color) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
 /// Color theme for the editor.
 ///
 /// Provides colors for the background, foreground, selection, and syntax
@@ -169,6 +198,78 @@ impl EditorTheme {
         }
     }
 
+    /// The Gruvbox Light color theme (companion to [`gruvbox_dark`](Self::gruvbox_dark)).
+    pub fn gruvbox_light() -> Self {
+        Self {
+            background: Color::from_rgba8(0xFB, 0xF1, 0xC7, 0xFF),
+            surface: Color::from_rgba8(0xF2, 0xE5, 0xBC, 0xFF),
+            foreground: Color::from_rgba8(0x3C, 0x38, 0x36, 0xFF),
+            selection: Color::from_rgba8(0xD5, 0xC4, 0xA1, 0xFF),
+            comment: Color::from_rgba8(0x92, 0x83, 0x74, 0xFF),
+            red: Color::from_rgba8(0x9D, 0x00, 0x06, 0xFF),
+            orange: Color::from_rgba8(0xAF, 0x3A, 0x03, 0xFF),
+            yellow: Color::from_rgba8(0xB5, 0x76, 0x14, 0xFF),
+            green: Color::from_rgba8(0x79, 0x74, 0x0E, 0xFF),
+            cyan: Color::from_rgba8(0x42, 0x7B, 0x58, 0xFF),
+            purple: Color::from_rgba8(0x8F, 0x3F, 0x71, 0xFF),
+            pink: Color::from_rgba8(0x9D, 0x00, 0x06, 0xFF),
+        }
+    }
+
+    /// The Tokyo Night Day color theme (companion to [`tokyo_night`](Self::tokyo_night)).
+    pub fn tokyo_night_day() -> Self {
+        Self {
+            background: Color::from_rgba8(0xE1, 0xE2, 0xE7, 0xFF),
+            surface: Color::from_rgba8(0xD0, 0xD5, 0xE3, 0xFF),
+            foreground: Color::from_rgba8(0x37, 0x60, 0xBF, 0xFF),
+            selection: Color::from_rgba8(0xB7, 0xC1, 0xE3, 0xFF),
+            comment: Color::from_rgba8(0x84, 0x8C, 0xB5, 0xFF),
+            red: Color::from_rgba8(0xF5, 0x2A, 0x65, 0xFF),
+            orange: Color::from_rgba8(0xB1, 0x5C, 0x00, 0xFF),
+            yellow: Color::from_rgba8(0x8C, 0x6C, 0x3E, 0xFF),
+            green: Color::from_rgba8(0x58, 0x75, 0x39, 0xFF),
+            cyan: Color::from_rgba8(0x00, 0x71, 0x97, 0xFF),
+            purple: Color::from_rgba8(0x98, 0x54, 0xF1, 0xFF),
+            pink: Color::from_rgba8(0x98, 0x54, 0xF1, 0xFF),
+        }
+    }
+
+    /// The GitHub Light color theme (Primer colors): white page, gray chrome.
+    pub fn github_light() -> Self {
+        Self {
+            background: Color::from_rgba8(0xFF, 0xFF, 0xFF, 0xFF),
+            surface: Color::from_rgba8(0xF6, 0xF8, 0xFA, 0xFF),
+            foreground: Color::from_rgba8(0x1F, 0x23, 0x28, 0xFF),
+            selection: Color::from_rgba8(0xAD, 0xD6, 0xFF, 0xFF),
+            comment: Color::from_rgba8(0x6E, 0x77, 0x81, 0xFF),
+            red: Color::from_rgba8(0xCF, 0x22, 0x2E, 0xFF),
+            orange: Color::from_rgba8(0xBC, 0x4C, 0x00, 0xFF),
+            yellow: Color::from_rgba8(0x9A, 0x67, 0x00, 0xFF),
+            green: Color::from_rgba8(0x11, 0x63, 0x29, 0xFF),
+            cyan: Color::from_rgba8(0x05, 0x50, 0xAE, 0xFF),
+            purple: Color::from_rgba8(0x82, 0x50, 0xDF, 0xFF),
+            pink: Color::from_rgba8(0xBF, 0x39, 0x89, 0xFF),
+        }
+    }
+
+    /// The One Light color theme (Atom): keywords purple, functions blue.
+    pub fn one_light() -> Self {
+        Self {
+            background: Color::from_rgba8(0xFA, 0xFA, 0xFA, 0xFF),
+            surface: Color::from_rgba8(0xF0, 0xF0, 0xF0, 0xFF),
+            foreground: Color::from_rgba8(0x38, 0x3A, 0x42, 0xFF),
+            selection: Color::from_rgba8(0xD4, 0xD5, 0xDA, 0xFF),
+            comment: Color::from_rgba8(0xA0, 0xA1, 0xA7, 0xFF),
+            red: Color::from_rgba8(0xE4, 0x56, 0x49, 0xFF),
+            orange: Color::from_rgba8(0x98, 0x68, 0x01, 0xFF),
+            yellow: Color::from_rgba8(0xC1, 0x84, 0x01, 0xFF),
+            green: Color::from_rgba8(0x50, 0xA1, 0x4F, 0xFF),
+            cyan: Color::from_rgba8(0x01, 0x84, 0xBC, 0xFF),
+            purple: Color::from_rgba8(0xA6, 0x26, 0xA4, 0xFF),
+            pink: Color::from_rgba8(0x40, 0x78, 0xF2, 0xFF),
+        }
+    }
+
     /// Config names of the built-in themes.
     pub const BUILTIN_NAMES: &'static [&'static str] = &[
         "dracula",
@@ -179,7 +280,32 @@ impl EditorTheme {
         "catppuccin-mocha",
         "solarized-light",
         "catppuccin-latte",
+        "gruvbox-light",
+        "tokyo-night-day",
+        "github-light",
+        "one-light",
     ];
+
+    /// `comment` moved toward the foreground until it reads at WCAG AA contrast (4.5:1)
+    /// on both `background` and `surface`: the color of secondary interface text (status
+    /// bar, inactive tabs, the outline's lower levels), which must stay legible. Themes
+    /// whose `comment` already has the contrast keep it unchanged.
+    pub fn muted_text(&self) -> Color {
+        let mut t = 0.0f32;
+        loop {
+            let c = mix(self.comment, self.foreground, t);
+            if t >= 1.0 || (contrast(c, self.background) >= 4.5 && contrast(c, self.surface) >= 4.5)
+            {
+                return c;
+            }
+            t += 0.05;
+        }
+    }
+
+    /// Interface labels: halfway between [`Self::muted_text`] and the foreground.
+    pub fn label_text(&self) -> Color {
+        mix(self.muted_text(), self.foreground, 0.5)
+    }
 
     /// Whether this is a light theme (light background).
     pub fn is_light(&self) -> bool {
@@ -199,6 +325,10 @@ impl EditorTheme {
             "tokyo-night" => Some(Self::tokyo_night()),
             "catppuccin-mocha" => Some(Self::catppuccin_mocha()),
             "catppuccin-latte" => Some(Self::catppuccin_latte()),
+            "gruvbox-light" => Some(Self::gruvbox_light()),
+            "tokyo-night-day" => Some(Self::tokyo_night_day()),
+            "github-light" => Some(Self::github_light()),
+            "one-light" => Some(Self::one_light()),
             _ => None,
         }
     }
@@ -247,12 +377,35 @@ impl Default for EditorTheme {
 mod tests {
     use super::*;
 
+    /// Secondary interface text is legible (WCAG AA, or as legible as the foreground) on
+    /// every built-in theme, and a
+    /// `comment` that already is stays as it is.
+    #[test]
+    fn muted_text_is_legible() {
+        for name in EditorTheme::BUILTIN_NAMES {
+            let t = EditorTheme::by_name(name).unwrap();
+            let m = t.muted_text();
+            // Where even the foreground falls short (Solarized's surface), it is the best.
+            let legible = contrast(m, t.background) >= 4.5 && contrast(m, t.surface) >= 4.5;
+            assert!(legible || m.to_rgba8() == t.foreground.to_rgba8(), "{name}");
+        }
+        let latte = EditorTheme::catppuccin_latte();
+        assert!(
+            contrast(latte.comment, latte.background) < 4.5,
+            "Latte's comment is faint"
+        );
+        let mut t = EditorTheme::catppuccin_latte();
+        t.comment = t.foreground;
+        assert_eq!(t.muted_text().to_rgba8(), t.foreground.to_rgba8());
+    }
+
     /// The built-in list resolves by name, and light/dark detection matches the presets.
     #[test]
     fn builtin_names_resolve_and_light_themes_are_detected() {
         for name in EditorTheme::BUILTIN_NAMES {
             let theme = EditorTheme::by_name(name).expect(name);
-            let light = name.ends_with("-light") || *name == "catppuccin-latte";
+            let light =
+                name.ends_with("-light") || matches!(*name, "catppuccin-latte" | "tokyo-night-day");
             assert_eq!(theme.is_light(), light, "{name}");
         }
     }
@@ -270,7 +423,17 @@ mod tests {
             "tokyo-night",
             "catppuccin-mocha",
             "catppuccin-latte",
+            "gruvbox-light",
+            "tokyo-night-day",
+            "github-light",
+            "one-light",
         ];
+        assert_eq!(names.len(), EditorTheme::BUILTIN_NAMES.len());
+        let light = names
+            .iter()
+            .filter(|n| EditorTheme::by_name(n).unwrap().is_light())
+            .count();
+        assert_eq!(light, 6, "as many light presets as dark ones");
         let mut backgrounds = Vec::new();
         for name in names {
             let theme = EditorTheme::by_name(name)

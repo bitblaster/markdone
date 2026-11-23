@@ -52,7 +52,8 @@ github = false
 # One theme for dark mode and one for light mode: a built-in preset, or the name of a
 # custom [themes.*] you define below. Built-ins:
 #   dark:  dracula (default), nord, solarized-dark, gruvbox-dark, tokyo-night, catppuccin-mocha
-#   light: solarized-light, catppuccin-latte (default)
+#   light: solarized-light, catppuccin-latte (default), gruvbox-light, tokyo-night-day,
+#          github-light, one-light
 dark = "dracula"
 light = "catppuccin-latte"
 # The mode shown: "dark" (default) or "light" (View → Dark Mode switches it).
