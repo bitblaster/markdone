@@ -171,10 +171,14 @@ sources. In a code block Tab indents.
 ### Tables
 
 Pipe tables render as a grid with a bold header, column alignment (`:--`, `:-:`, `--:`)
-and inline styles in the cells; the raw source comes back when the cursor enters the
-table. Type a header row such as `| Name | Age |` and press Shift+Enter to add the
-delimiter and a body row; Tab moves between cells and adds a row from the last one;
-adding a column to the header extends every row.
+and inline styles in the cells, and stay a grid while you edit them, as in a word
+processor: the cell with the cursor shows its Markdown source, the arrows move within and
+between cells, Tab goes to the next cell (adding a row after the last one) and Enter to the
+cell below. A `|` typed in a cell is escaped, so it can't split the table. Columns keep
+their header on one line whenever the table fits. The context menu's *Table* submenu
+clears or deletes the table, inserts and deletes rows and columns, and aligns a column;
+it rewrites the table with its columns lined up in the source. Type a header row such as
+`| Name | Age |` and press Shift+Enter to add the delimiter and a body row.
 
 ### Mermaid diagrams
 

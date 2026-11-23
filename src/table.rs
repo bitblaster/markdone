@@ -84,6 +84,143 @@ pub fn row_kind_at_line(
         .map(RowKind::Body)
 }
 
+/// Grid-render (and grid-edit) only tables under these limits; larger tables stay raw pipe
+/// text, where shaping every cell on each edit would cost more than it helps.
+pub const MAX_GRID_BODY_ROWS: usize = 200;
+pub const MAX_GRID_CELLS: usize = 1000;
+
+/// Whether a table is small enough to render (and edit) as a grid of cells.
+pub fn grid_ok(t: &TableInfo) -> bool {
+    t.body.len() <= MAX_GRID_BODY_ROWS
+        && (t.body.len() + 1).saturating_mul(t.ncols.max(1)) <= MAX_GRID_CELLS
+}
+
+/// A cell's position: `row` 0 is the header, `row` 1 + i the i-th body row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CellPos {
+    pub row: usize,
+    pub col: usize,
+}
+
+impl RowKind {
+    /// The row's position in header-then-body order (`None` for the delimiter row).
+    pub fn pos(self) -> Option<usize> {
+        match self {
+            RowKind::Header => Some(0),
+            RowKind::Body(i) => Some(i + 1),
+            RowKind::Delimiter => None,
+        }
+    }
+}
+
+impl TableInfo {
+    /// Header plus body rows (the delimiter row is not counted).
+    pub fn nrows(&self) -> usize {
+        1 + self.body.len()
+    }
+
+    /// The row at position `pos` (0 = header).
+    pub fn row(&self, pos: usize) -> Option<&TableRow> {
+        match pos {
+            0 => Some(&self.header),
+            p => self.body.get(p - 1),
+        }
+    }
+
+    /// The cell at `pos`, if that row has it (rows can be ragged).
+    pub fn cell(&self, pos: CellPos) -> Option<&TableCell> {
+        self.row(pos.row)?.cells.get(pos.col)
+    }
+
+    /// Line index of the table's last row (the delimiter for a header-only table).
+    pub fn last_line(&self, byte_to_line: impl Fn(usize) -> usize) -> usize {
+        let header = byte_to_line(self.header.line.start);
+        let delim = byte_to_line(self.delimiter_line.start);
+        let body = self.body.last().map_or(0, |r| byte_to_line(r.line.start));
+        header.max(delim).max(body)
+    }
+}
+
+/// Byte range of the line holding `byte`, without its line break.
+fn line_bounds(rope: &Rope, byte: usize) -> Range<usize> {
+    let line = rope.byte_to_line(byte.min(rope.len_bytes()));
+    let start = rope.line_to_byte(line);
+    let mut end = if line + 1 < rope.len_lines() {
+        rope.line_to_byte(line + 1)
+    } else {
+        rope.len_bytes()
+    };
+    while end > start && matches!(rope.get_byte(end - 1), Some(b'\n' | b'\r')) {
+        end -= 1;
+    }
+    start..end
+}
+
+/// `cell`'s whole span between its pipes: its content plus the padding around it.
+pub fn cell_span(rope: &Rope, cell: &TableCell) -> Range<usize> {
+    let line = line_bounds(rope, cell.content.start);
+    let mut start = cell.content.start;
+    while start > line.start && matches!(rope.get_byte(start - 1), Some(b' ' | b'\t')) {
+        start -= 1;
+    }
+    let mut end = cell.content.end;
+    while end < line.end && matches!(rope.get_byte(end), Some(b' ' | b'\t')) {
+        end += 1;
+    }
+    start..end
+}
+
+/// Column of the cell of `row` holding `offset`: the first whose span ends at or after it
+/// (so a pipe belongs to the cell on its left), else the last one.
+pub fn col_at(rope: &Rope, row: &TableRow, offset: usize) -> Option<usize> {
+    if row.cells.is_empty() {
+        return None;
+    }
+    Some(
+        row.cells
+            .iter()
+            .position(|c| offset <= cell_span(rope, c).end)
+            .unwrap_or(row.cells.len() - 1),
+    )
+}
+
+/// The cell holding `offset` in `table` (`None` on the delimiter row).
+pub fn cell_pos_at(table: &TableInfo, rope: &Rope, offset: usize) -> Option<CellPos> {
+    let line = rope.byte_to_line(offset.min(rope.len_bytes()));
+    let row = row_kind_at_line(table, line, |b| rope.byte_to_line(b))?.pos()?;
+    let col = col_at(rope, table.row(row)?, offset)?;
+    Some(CellPos { row, col })
+}
+
+/// Where the caret lands on entering `cell`: its content start, or for an empty cell one
+/// space in past the opening `|` (a trimmed-empty cell's content range collapses onto the
+/// closing pipe, so `content.start` would sit the caret on that pipe).
+pub fn cell_landing(rope: &Rope, cell: &TableCell) -> usize {
+    let content = &cell.content;
+    if content.start < content.end {
+        return content.start;
+    }
+    let closing = content.start;
+    let mut open = closing;
+    while open > 0 && rope.get_byte(open - 1) != Some(b'|') {
+        open -= 1;
+    }
+    // `open` is now just past the opening `|` (or 0 if none found); keep the caret inside
+    // the cell (below the closing pipe, at or past the opening one).
+    (open + 1).min(closing.saturating_sub(1)).max(open)
+}
+
+/// The editable extent of `cell` for the caret: its content, or the landing spot of an
+/// empty cell.
+pub fn cell_caret_range(rope: &Rope, cell: &TableCell) -> Range<usize> {
+    if cell.content.start < cell.content.end {
+        cell.content.clone()
+    } else {
+        let l = cell_landing(rope, cell);
+        l..l
+    }
+}
+
 /// Trim leading/trailing ASCII whitespace off a cell node's byte range using the
 /// rope, so the stored content range covers just the cell text.
 fn trim_cell_range(rope: &Rope, mut start: usize, mut end: usize) -> Range<usize> {
@@ -294,6 +431,24 @@ mod tests {
         let tables = &buf.parsed().tables;
         assert_eq!(tables.len(), 1, "expected exactly one table");
         tables[0].clone()
+    }
+
+    #[test]
+    fn empty_row_mid_table_stays_one_table() {
+        // A wide all-empty row in the middle (as Table → Row → Insert Below writes it)
+        // makes tree-sitter end the table and parse the rows from the one above it as a
+        // second `pipe_table`; that ghost must be dropped, the healed table keeps them all.
+        let src: String = [
+            "|", " ", "§", "   ", "|", &" ".repeat(31), "|", &" ".repeat(166), "|", "\n",
+            "|", " ", "---", " ", "|", " ", "----------------------------------", " ", "|", " ", "-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------", " ", "|", "\n",
+            "|", &" ".repeat(4), "|", &" ".repeat(24), "|", "   ", ",", "   ", ",", " ", ",", "  ", ",", " ", "-", &" ".repeat(99), "|", "\n",
+            "|", &" ".repeat(5), "|", &" ".repeat(36), "|", &" ".repeat(175), "|", "\n",
+            "| 3 | 4 | 5 |\n",
+        ]
+        .concat();
+        let buf: Buffer = src.parse().unwrap();
+        let t = only_table(&buf);
+        assert_eq!(t.body.len(), 3);
     }
 
     #[test]

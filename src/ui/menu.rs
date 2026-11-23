@@ -2,6 +2,8 @@
 
 use crate::commands::Command;
 use crate::format::{Block, Inline};
+use crate::table::Align;
+use crate::table_edit::TableOp;
 
 use super::MENU_BAR_H;
 
@@ -217,6 +219,8 @@ pub fn context_menu(
     has_selection: bool,
     // Right-clicked on a misspelled word: the suggestions to offer (maybe none).
     spelling: Option<&[String]>,
+    // Right-clicked in a table: offer the Table submenu.
+    in_table: bool,
 ) -> Option<Command> {
     let mut picked = None;
     egui::Popup::new(
@@ -271,8 +275,60 @@ pub fn context_menu(
         );
         ui.separator();
         format_items(ui, &mut picked);
+        if in_table {
+            ui.separator();
+            table_items(ui, &mut picked);
+        }
     });
     picked
+}
+
+/// The context menu's Table submenu: edits of the table at the caret.
+fn table_items(ui: &mut egui::Ui, picked: &mut Option<Command>) {
+    ui.menu_button("Table", |ui| {
+        item(ui, "Clear", Command::Table(TableOp::Clear), true, picked);
+        item(ui, "Delete", Command::Table(TableOp::Delete), true, picked);
+        ui.separator();
+        ui.menu_button("Row", |ui| {
+            for (label, op) in [
+                ("Insert Above", TableOp::InsertRowAbove),
+                ("Insert Below", TableOp::InsertRowBelow),
+                ("Delete", TableOp::DeleteRow),
+            ] {
+                item(ui, label, Command::Table(op), true, picked);
+            }
+        });
+        ui.menu_button("Column", |ui| {
+            for (label, op) in [
+                ("Insert Left", TableOp::InsertColLeft),
+                ("Insert Right", TableOp::InsertColRight),
+            ] {
+                item(ui, label, Command::Table(op), true, picked);
+            }
+            ui.separator();
+            for (label, align) in [
+                ("Align Left", Align::Left),
+                ("Align Center", Align::Center),
+                ("Align Right", Align::Right),
+            ] {
+                item(
+                    ui,
+                    label,
+                    Command::Table(TableOp::Align(align)),
+                    true,
+                    picked,
+                );
+            }
+            ui.separator();
+            item(
+                ui,
+                "Delete",
+                Command::Table(TableOp::DeleteCol),
+                true,
+                picked,
+            );
+        });
+    });
 }
 
 #[cfg(test)]

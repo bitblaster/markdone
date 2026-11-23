@@ -3099,6 +3099,7 @@ dependencies = [
  "tree-sitter-typescript",
  "undo",
  "unicode-segmentation",
+ "unicode-width",
  "vello",
  "vello_encoding",
  "vello_svg",

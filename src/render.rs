@@ -71,17 +71,15 @@ pub struct InlineMathRef {
 
 /// Context for a buffer line that belongs to a GFM table, passed into
 /// [`build_line_render`]. Present only when the table is small enough to grid-render
-/// (the caller applies the size cap); the block range drives the caret-reveal test.
+/// (the caller applies the size cap).
 #[derive(Clone)]
 pub struct TableCtx {
-    /// Byte range of the whole table block. Grid mode is active only while the cursor
-    /// is *not* inside this range.
+    /// Byte range of the whole table block.
     pub block: Range<usize>,
     pub kind: RowKind,
 }
 
-/// Marks a [`LineRender`] as a grid-rendered table row. Set only in grid mode (cursor
-/// off the block); the draw path uses `table_start` to fetch the shared `TableLayout`
+/// Marks a [`LineRender`] as a grid-rendered table row; the draw path uses `table_start` to fetch the shared `TableLayout`
 /// and `kind` to pick the row.
 #[derive(Clone, Copy)]
 pub struct TableLineRef {
@@ -133,7 +131,7 @@ pub struct LineRender {
     pub misspelled: Vec<Range<usize>>,
     /// This line is a grid-rendered table row: its raw pipe text is hidden (`text`
     /// empty) and the draw path paints the cell grid instead. `None` when the line is
-    /// not a table, or when the cursor is inside the table block (raw text revealed).
+    /// not a table row (or its table is too big to grid-render).
     pub table: Option<TableLineRef>,
 }
 
@@ -240,9 +238,8 @@ pub fn build_line_render(
     cursor_offset: usize,
     line_styles: &[StyledRegion],
     extra_regions: &[StyledRegion],
-    // Table membership for this line, when it belongs to a small-enough table. Grid
-    // mode (hidden text + `table` ref) engages only while the cursor is off the block;
-    // otherwise the line renders as ordinary raw pipe text via the normal path.
+    // Table membership for this line, when it belongs to a small-enough table: the line
+    // then renders as a grid row (hidden text + `table` ref).
     table_ctx: Option<TableCtx>,
     // Inline `$…$` math spans on this line (empty when the `math` feature is off). Each is
     // collapsed to an inline box unless the caret is inside it (then the raw `$…$` shows).
@@ -285,23 +282,12 @@ pub fn build_line_render(
     let cursor_on_line = cursor_in(&range, cursor_offset);
     let is_callout_header = callout.is_some();
 
-    // Grid table row: the cursor is off the whole table block, so this line hides its
-    // raw pipe text and the draw path paints the cell grid. While the cursor is inside
-    // the block, `table_ref` stays `None` and the line renders as ordinary text (reveal).
-    // Membership is line-based (the cursor's line start), matching the editor's
-    // `table_context_at_line`, so a caret at a row's left edge or at the last row's end —
-    // where `offset == block.end` for a table ending at EOF with no trailing newline —
-    // still counts as inside the block and reveals.
-    let table_ref = table_ctx.as_ref().and_then(|tc| {
-        // Only table lines need the cursor's line start (a rope line lookup), so compute it
-        // here rather than for every laid-out line.
-        let cursor_line_start = snapshot
-            .line_byte_range(rope.byte_to_line(cursor_offset.min(rope.len_bytes())))
-            .start;
-        (!tc.block.contains(&cursor_line_start)).then_some(TableLineRef {
-            table_start: tc.block.start,
-            kind: tc.kind,
-        })
+    // Grid table row: this line hides its raw pipe text and the draw path paints the cell
+    // grid, with the caret's cell shown as raw source there (see `TableLayout`). The grid
+    // stays up while the caret is in the table, so the row's render doesn't depend on it.
+    let table_ref = table_ctx.as_ref().map(|tc| TableLineRef {
+        table_start: tc.block.start,
+        kind: tc.kind,
     });
     let is_grid_table = table_ref.is_some();
 
@@ -786,6 +772,8 @@ pub fn build_cell_render(
     theme: &EditorTheme,
     cell_range: Range<usize>,
     line_styles: &[StyledRegion],
+    // The caret's cell: show its raw source (markers visible, dimmed) for editing.
+    reveal: bool,
 ) -> (String, Vec<StyleRun>, SegmentMap, Vec<Range<usize>>) {
     let rope = &snapshot.rope;
     let start = cell_range.start;
@@ -804,13 +792,29 @@ pub fn build_cell_render(
     // Hide each region's delimiters (or collapse to its display text), so the shown cell
     // text is just the styled content — mirroring the off-cursor path in build_line_render.
     let mut specials: Vec<Special> = Vec::new();
-    for r in &regions {
-        push_region_specials(&mut specials, r);
+    if !reveal {
+        for r in &regions {
+            push_region_specials(&mut specials, r);
+        }
     }
     let (text, map) = SegmentMap::build(&cell_text, start, &specials);
 
     let fg = peniko_color(theme.foreground);
     let mut runs = Vec::new();
+    if reveal {
+        let dim = peniko_color(theme.comment);
+        for r in &regions {
+            for m in [
+                r.full_range.start..r.content_range.start,
+                r.content_range.end..r.full_range.end,
+            ] {
+                let dr = map.buffer_range_to_display(m);
+                if !dr.is_empty() {
+                    runs.push(StyleRun::new(dr, dim));
+                }
+            }
+        }
+    }
     let mut code_ranges = Vec::new();
     for r in &regions {
         let dr = map.buffer_range_to_display(r.content_range.clone());
@@ -1274,12 +1278,12 @@ mod tests {
         );
     }
 
-    /// A grid-table row (cursor off the block) hides its raw pipe text and flags a
-    /// `table` ref; with the cursor inside the block it renders as ordinary raw text.
+    /// A grid-table row hides its raw pipe text and flags a `table` ref, whether the
+    /// cursor is off the table or inside it (the grid stays up while editing a cell).
     #[test]
-    fn table_row_hides_off_cursor_reveals_on_cursor() {
+    fn table_row_stays_a_grid_row_with_the_cursor_inside() {
         let theme = EditorTheme::dracula();
-        let mut buf: Buffer = "| a | b |\n|---|---|\n| 1 | 2 |\n".parse().unwrap();
+        let mut buf: Buffer = "| a | b |\n|---|---|\n| 1 | 2 |".parse().unwrap();
         let snap = buf.render_snapshot();
         let styles = snap.inline_styles_by_line();
         let (table, _) = snap.table_row_at_line(0).unwrap();
@@ -1287,77 +1291,24 @@ mod tests {
             block: table.block.clone(),
             kind: RowKind::Header,
         };
-
-        // Cursor off the block: grid mode — text hidden, table ref set.
-        let off = build_line_render(
-            &snap,
-            0,
-            &theme,
-            18.0,
-            usize::MAX,
-            &styles[0],
-            &[],
-            Some(ctx.clone()),
-            &[],
-            &[],
-            None,
-        );
-        assert!(off.table.is_some(), "off-cursor header is a grid row");
-        assert!(off.text.is_empty(), "grid row text hidden");
-
-        // Cursor inside the block: reveal — raw pipe text, no table ref.
-        let on = build_line_render(
-            &snap,
-            0,
-            &theme,
-            18.0,
-            2,
-            &styles[0],
-            &[],
-            Some(ctx),
-            &[],
-            &[],
-            None,
-        );
-        assert!(on.table.is_none(), "cursor in block reveals raw text");
-        assert_eq!(on.text, "| a | b |");
-    }
-
-    /// A caret at the end of the last row of a table that ends at EOF with no trailing
-    /// newline (`offset == block.end`) still counts as inside the block, so the last row
-    /// reveals its raw text rather than staying a hidden grid row. Line-based membership.
-    #[test]
-    fn table_reveals_at_last_row_end_without_trailing_newline() {
-        let theme = EditorTheme::dracula();
-        let mut buf: Buffer = "| a | b |\n|---|---|\n| 1 | 2 |".parse().unwrap();
-        let snap = buf.render_snapshot();
-        let styles = snap.inline_styles_by_line();
-        let last = snap.line_count() - 1;
-        let (table, kind) = snap.table_row_at_line(last).unwrap();
-        let eof = snap.rope.len_bytes();
-        assert_eq!(eof, table.block.end, "table block ends at EOF");
-        let ctx = TableCtx {
-            block: table.block.clone(),
-            kind,
-        };
-        let lr = build_line_render(
-            &snap,
-            last,
-            &theme,
-            18.0,
-            eof,
-            &styles[last],
-            &[],
-            Some(ctx),
-            &[],
-            &[],
-            None,
-        );
-        assert!(
-            lr.table.is_none(),
-            "caret at block.end reveals the last row"
-        );
-        assert_eq!(lr.text, "| 1 | 2 |");
+        // Off the table, in a cell, and at the very end of the table (EOF).
+        for cursor in [usize::MAX, 2, snap.rope.len_bytes()] {
+            let lr = build_line_render(
+                &snap,
+                0,
+                &theme,
+                18.0,
+                cursor,
+                &styles[0],
+                &[],
+                Some(ctx.clone()),
+                &[],
+                &[],
+                None,
+            );
+            assert!(lr.table.is_some(), "header is a grid row (cursor {cursor})");
+            assert!(lr.text.is_empty(), "grid row text hidden (cursor {cursor})");
+        }
     }
 
     /// `build_cell_render` styles a cell's inline content off-cursor: `**bold**` hides
@@ -1373,12 +1324,23 @@ mod tests {
         let (table, _) = snap.table_row_at_line(0).unwrap();
 
         let bold_cell = table.header.cells[0].content.clone();
-        let (text, runs, _map, _code) = build_cell_render(&snap, &theme, bold_cell, &styles[0]);
+        let (text, runs, _map, _code) =
+            build_cell_render(&snap, &theme, bold_cell.clone(), &styles[0], false);
         assert_eq!(text, "hi", "markers hidden, content shown");
         assert!(runs.iter().any(|r| r.bold), "cell content is bold");
+        // The caret's cell shows its source, markers included, content still bold.
+        let (text, runs, map, _code) =
+            build_cell_render(&snap, &theme, bold_cell.clone(), &styles[0], true);
+        assert_eq!(text, "**hi**", "markers shown in the caret's cell");
+        assert!(runs.iter().any(|r| r.bold));
+        assert_eq!(
+            map.buffer_to_display(bold_cell.start + 3),
+            3,
+            "identity map"
+        );
 
         let plain_cell = table.header.cells[1].content.clone();
-        let (ptext, pruns, _, _) = build_cell_render(&snap, &theme, plain_cell, &styles[0]);
+        let (ptext, pruns, _, _) = build_cell_render(&snap, &theme, plain_cell, &styles[0], false);
         assert_eq!(ptext, "plain");
         assert!(pruns.is_empty(), "a plain cell needs no style runs");
     }

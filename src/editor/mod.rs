@@ -4,10 +4,15 @@ mod theme;
 pub use action::Direction;
 pub use theme::EditorTheme;
 
+use std::ops::Range;
+
 use crate::buffer::Buffer;
 use crate::cursor::{Cursor, Selection, grapheme_column, offset_at_column, prev_grapheme_boundary};
 use crate::marker::{LineMarkers, MarkerKind, OrderedMarker, UnorderedMarker};
-use crate::table::{RowKind, TableCell, TableInfo, row_kind_at_line};
+use crate::table::{
+    CellPos, RowKind, TableCell, TableInfo, cell_caret_range, cell_pos_at, grid_ok,
+    row_kind_at_line,
+};
 
 /// Context about the line at the cursor, used by smart editing actions.
 struct LineContext {
@@ -142,6 +147,12 @@ impl EditorState {
     /// sticky goal column (`&mut self` to read/update it); other moves leave it stale,
     /// and it self-invalidates because the cursor no longer sits at its landing offset.
     pub fn cursor_in_direction(&mut self, direction: Direction) -> Cursor {
+        if let Some(offset) = self.grid_move(direction) {
+            self.goal_column = None;
+            return Cursor {
+                offset: self.snap_to_grid_cell(offset),
+            };
+        }
         let c = self.cursor();
         if matches!(direction, Direction::Up | Direction::Down) {
             let line = self.buffer.byte_to_line(c.offset);
@@ -160,10 +171,12 @@ impl EditorState {
             } else {
                 offset_at_column(&self.buffer, line + 1, column)
             };
+            // Entering a grid table lands in a cell, not on its pipes.
+            let offset = self.snap_to_grid_cell(offset);
             self.goal_column = Some((column, offset));
             return Cursor { offset };
         }
-        match direction {
+        let c = match direction {
             Direction::Left => c.move_left(&self.buffer),
             Direction::Right => c.move_right(&self.buffer),
             Direction::LineStart => c.move_to_line_start(&self.buffer),
@@ -171,6 +184,9 @@ impl EditorState {
             Direction::DocStart => Cursor::start(),
             Direction::DocEnd => Cursor::end(&self.buffer),
             Direction::Up | Direction::Down => unreachable!("handled above"),
+        };
+        Cursor {
+            offset: self.snap_to_grid_cell(c.offset),
         }
     }
 
@@ -364,7 +380,8 @@ impl EditorState {
             return false;
         }
 
-        self.insert_text(" ");
+        // `insert_typed`: a selection across a grid table's cells is emptied cell by cell.
+        self.insert_typed(" ");
         true
     }
 
@@ -1028,6 +1045,240 @@ impl EditorState {
             .map(|(t, k)| (t.clone(), k))
     }
 
+    /// The table holding `offset`'s line when it is edited as a grid of cells (small
+    /// enough to grid-render, see [`grid_ok`]), plus that line's role in it.
+    fn grid_at(&self, offset: usize) -> Option<(&TableInfo, RowKind)> {
+        let line = self
+            .buffer
+            .byte_to_line(offset.min(self.buffer.len_bytes()));
+        self.table_context_at_line(line).filter(|(t, _)| grid_ok(t))
+    }
+
+    /// The cell holding `offset` in a grid-edited table (`None` on the delimiter row).
+    fn grid_cell_at(&self, offset: usize) -> Option<(&TableInfo, CellPos)> {
+        let (t, _) = self.grid_at(offset)?;
+        Some((t, cell_pos_at(t, self.buffer.rope(), offset)?))
+    }
+
+    /// The table and cell holding `offset`, in any table (grid-edited or not); on the
+    /// delimiter row, the header's first cell. For the context menu's Table commands.
+    pub fn table_cell_at(&self, offset: usize) -> Option<(TableInfo, CellPos)> {
+        let line = self
+            .buffer
+            .byte_to_line(offset.min(self.buffer.len_bytes()));
+        let (t, kind) = self.table_context_at_line(line)?;
+        let pos = match kind {
+            RowKind::Delimiter => CellPos { row: 0, col: 0 },
+            _ => cell_pos_at(t, self.buffer.rope(), offset)?,
+        };
+        Some((t.clone(), pos))
+    }
+
+    /// The caret's extent in cell `pos` of `t` (see [`cell_caret_range`]).
+    fn grid_caret_range(&self, t: &TableInfo, pos: CellPos) -> Option<Range<usize>> {
+        Some(cell_caret_range(self.buffer.rope(), t.cell(pos)?))
+    }
+
+    /// `offset` moved into the nearest cell's text when it sits on a grid table's
+    /// structure (pipes, padding, the hidden delimiter row); unchanged anywhere else.
+    pub fn snap_to_grid_cell(&self, offset: usize) -> usize {
+        let Some((t, kind)) = self.grid_at(offset) else {
+            return offset;
+        };
+        let pos = match kind {
+            RowKind::Delimiter => CellPos {
+                row: usize::from(!t.body.is_empty()),
+                col: 0,
+            },
+            _ => match cell_pos_at(t, self.buffer.rope(), offset) {
+                Some(p) => p,
+                None => return offset,
+            },
+        };
+        match self.grid_caret_range(t, pos) {
+            Some(r) => offset.clamp(r.start, r.end),
+            None => offset,
+        }
+    }
+
+    /// A caret move inside a grid table, cell by cell: Left/Right walk the cell's text and
+    /// step into the neighbouring cell at its edges (out of the table past the first or
+    /// last cell), Home/End go to the cell's start/end, Up/Down to the same column of the
+    /// row above/below (out of the table past the first or last row). `None` outside grid
+    /// tables.
+    fn grid_move(&self, direction: Direction) -> Option<usize> {
+        let off = self.cursor().offset;
+        let (t, pos) = self.grid_cell_at(off)?;
+        let here = self.grid_caret_range(t, pos)?;
+        let ncells = |row: usize| t.row(row).map_or(0, |r| r.cells.len());
+        let range_of = |row: usize, col: usize| self.grid_caret_range(t, CellPos { row, col });
+        let header_line = self.buffer.byte_to_line(t.header.line.start);
+        let last_line = t.last_line(|b| self.buffer.byte_to_line(b));
+        // Just outside the table: the end of the line above, the start of the line below.
+        let above = || {
+            let start = self.buffer.line_to_byte(header_line);
+            if start > 0 { start - 1 } else { off }
+        };
+        let below = || {
+            if last_line + 1 < self.buffer.line_count() {
+                self.buffer.line_to_byte(last_line + 1)
+            } else {
+                Cursor::end(&self.buffer).offset
+            }
+        };
+        match direction {
+            Direction::Left => {
+                if off > here.start {
+                    let left = self.cursor().move_left(&self.buffer).offset;
+                    return Some(left.max(here.start));
+                }
+                if pos.col > 0 {
+                    return range_of(pos.row, pos.col - 1).map(|r| r.end);
+                }
+                if pos.row > 0 && ncells(pos.row - 1) > 0 {
+                    return range_of(pos.row - 1, ncells(pos.row - 1) - 1).map(|r| r.end);
+                }
+                Some(above())
+            }
+            Direction::Right => {
+                if off < here.end {
+                    let right = self.cursor().move_right(&self.buffer).offset;
+                    return Some(right.min(here.end));
+                }
+                if pos.col + 1 < ncells(pos.row) {
+                    return range_of(pos.row, pos.col + 1).map(|r| r.start);
+                }
+                if pos.row + 1 < t.nrows() && ncells(pos.row + 1) > 0 {
+                    return range_of(pos.row + 1, 0).map(|r| r.start);
+                }
+                Some(below())
+            }
+            Direction::LineStart => Some(here.start),
+            Direction::LineEnd => Some(here.end),
+            Direction::Up | Direction::Down => {
+                let row = if direction == Direction::Up {
+                    match pos.row.checked_sub(1) {
+                        Some(r) => r,
+                        None if header_line > 0 => {
+                            return Some(self.buffer.line_to_byte(header_line - 1));
+                        }
+                        None => return Some(off),
+                    }
+                } else {
+                    pos.row + 1
+                };
+                if row >= t.nrows() {
+                    return Some(below());
+                }
+                match ncells(row) {
+                    0 => None,
+                    n => range_of(row, pos.col.min(n - 1)).map(|r| r.start),
+                }
+            }
+            Direction::DocStart | Direction::DocEnd => None,
+        }
+    }
+
+    /// Delete a selection spanning several cells of one grid table by emptying the
+    /// selected part of each cell, so the table keeps its shape. False (nothing done) when
+    /// the selection is inside one cell or reaches outside the table: the ordinary delete
+    /// handles those.
+    fn grid_clear_selection(&mut self) -> bool {
+        let sel = self.selection.range();
+        let (cuts, landing) = {
+            let (Some((t, a)), Some((t2, b))) =
+                (self.grid_cell_at(sel.start), self.grid_cell_at(sel.end))
+            else {
+                return false;
+            };
+            if t.block.start != t2.block.start || a == b {
+                return false;
+            }
+            let cuts: Vec<Range<usize>> = (0..t.nrows())
+                .filter_map(|r| t.row(r))
+                .flat_map(|row| row.cells.iter())
+                .filter_map(|cell| {
+                    let s = sel.start.max(cell.content.start);
+                    let e = sel.end.min(cell.content.end);
+                    (s < e).then_some(s..e)
+                })
+                .collect();
+            // The cuts all start at or after this spot, so it stays put.
+            (cuts, self.snap_to_grid_cell(sel.start))
+        };
+        if let (Some(first), Some(last)) = (cuts.first(), cuts.last()) {
+            let (lo, hi) = (first.start, last.end);
+            let mut kept = String::new();
+            let mut at = lo;
+            for c in &cuts {
+                kept.push_str(&self.buffer.slice_cow(at..c.start));
+                at = c.end;
+            }
+            let cursor = self.cursor().offset;
+            self.buffer.replace(lo..hi, &kept, cursor);
+        }
+        self.selection = Selection::new(landing, landing);
+        true
+    }
+
+    /// Insert typed or pasted text. Inside a grid table's cell the text is kept on one
+    /// line and its `|` are escaped, so it can't break the table apart; a selection across
+    /// cells is emptied cell by cell first.
+    pub fn insert_typed(&mut self, text: &str) {
+        if self.grid_cell_at(self.selection.head).is_none() {
+            self.insert_text(text);
+            return;
+        }
+        if !self.selection.is_collapsed() {
+            self.grid_clear_selection();
+        }
+        let at = self.selection.range().start;
+        let mut escaped = at > 0 && self.buffer.byte_at(at - 1) == Some(b'\\');
+        let mut out = String::with_capacity(text.len() + 1);
+        for ch in text.chars() {
+            match ch {
+                '\r' => continue,
+                '\n' | '\t' => out.push(' '),
+                '|' if !escaped => out.push_str("\\|"),
+                c => out.push(c),
+            }
+            escaped = ch == '\\' && !escaped;
+        }
+        self.insert_text(&out);
+    }
+
+    /// Enter in a grid table's cell: go to the same column of the next row, adding a row
+    /// after the last one. Returns true if it fired.
+    fn grid_enter(&mut self) -> bool {
+        let Some((t, pos)) = self.grid_cell_at(self.selection.head) else {
+            return false;
+        };
+        if pos.row + 1 < t.nrows() {
+            let n = t.row(pos.row + 1).map_or(0, |r| r.cells.len());
+            let target = (n > 0)
+                .then(|| {
+                    self.grid_caret_range(
+                        t,
+                        CellPos {
+                            row: pos.row + 1,
+                            col: pos.col.min(n - 1),
+                        },
+                    )
+                })
+                .flatten();
+            if let Some(r) = target {
+                self.set_cursor(r.start);
+            }
+            return true;
+        }
+        let ncols = t.ncols.max(1);
+        let last = t.last_line(|b| self.buffer.byte_to_line(b));
+        let first = self.insert_table_row_after_line(last, ncols);
+        // The new row is `|  |  |…`: cell `c` is typed into 3 bytes after cell `c - 1`.
+        self.set_cursor(first + 3 * pos.col.min(ncols - 1));
+        true
+    }
+
     /// Insert a new empty body row (`|  |  |…`, `ncols` cells) after `line_idx`,
     /// keeping any trailing newline. Returns the offset of the new row's first
     /// cell's typing position (just after its `| `).
@@ -1115,17 +1366,7 @@ impl EditorState {
     /// boundary, so landing at `content.start` would sit the caret on that pipe; instead
     /// walk back to the opening `|` and land strictly between the two pipes.
     fn table_cell_landing(&self, cell: &TableCell) -> usize {
-        if cell.content.start < cell.content.end {
-            return cell.content.start;
-        }
-        let closing = cell.content.start;
-        let mut open = closing;
-        while open > 0 && self.buffer.byte_at(open - 1) != Some(b'|') {
-            open -= 1;
-        }
-        // `open` is now just past the opening `|` (or 0 if none found); keep the caret
-        // inside the cell (below the closing pipe, at or past the opening one).
-        (open + 1).min(closing.saturating_sub(1)).max(open)
+        crate::table::cell_landing(self.buffer.rope(), cell)
     }
 
     /// Cell navigation for Tab/Shift+Tab when the cursor is inside a table.
@@ -1176,10 +1417,12 @@ impl EditorState {
             }
             Some(row_pos) => {
                 let cells = cells_of(row_pos);
-                let cell_idx = cells
-                    .iter()
-                    .position(|c| c.content.end >= cursor)
-                    .unwrap_or(cells.len().saturating_sub(1));
+                // The cell whose span (content + padding) holds the caret, so a caret in
+                // the padding after the text still counts as in its cell.
+                let cell_idx = table
+                    .row(row_pos)
+                    .and_then(|r| crate::table::col_at(self.buffer.rope(), r, cursor))
+                    .unwrap_or(0);
                 if forward {
                     if cell_idx + 1 < cells.len() {
                         Some(self.table_cell_landing(&cells[cell_idx + 1]))
@@ -1265,7 +1508,7 @@ impl EditorState {
         // newline intact so it joins cleanly with whatever followed the table.
         let cursor = self.cursor().offset;
         self.buffer.delete(line_start..line_end, cursor);
-        let landing = line_start.saturating_sub(1);
+        let landing = self.snap_to_grid_cell(line_start.saturating_sub(1));
         self.selection = Selection::new(landing, landing);
         true
     }
@@ -1404,6 +1647,9 @@ impl EditorState {
     /// Smart enter: creates paragraph break or exits container on empty line.
     /// Enter: just insert a raw newline. No magic.
     pub fn enter(&mut self) {
+        if self.grid_enter() {
+            return;
+        }
         self.insert_text("\n");
     }
 
@@ -1552,7 +1798,9 @@ impl EditorState {
         // Clear tab cycle cache since content is changing
         self.tab_cycle_cache = None;
         if !self.selection.is_collapsed() {
-            self.delete_selection();
+            if !self.grid_clear_selection() {
+                self.delete_selection();
+            }
             self.propagate_checkbox_after_edit();
             return;
         }
@@ -1568,6 +1816,15 @@ impl EditorState {
         }
 
         let cursor_pos = self.cursor().offset;
+
+        // In a grid table's cell, Backspace stops at the cell's start: it never eats a pipe.
+        if let Some((t, pos)) = self.grid_cell_at(cursor_pos)
+            && self
+                .grid_caret_range(t, pos)
+                .is_some_and(|r| cursor_pos <= r.start)
+        {
+            return;
+        }
 
         if let Some((marker_range, _is_indent)) = self.backspace_range_with_type(cursor_pos) {
             // Check if we're deleting an opening code fence of an empty code block
@@ -1605,8 +1862,18 @@ impl EditorState {
     pub fn delete_forward(&mut self) {
         // Clear tab cycle cache since content is changing
         self.tab_cycle_cache = None;
+        let cursor = self.cursor().offset;
+        // In a grid table's cell, Delete stops at the cell's end: it never eats a pipe.
+        let at_cell_end = self.grid_cell_at(cursor).is_some_and(|(t, pos)| {
+            self.grid_caret_range(t, pos)
+                .is_some_and(|r| cursor >= r.end)
+        });
         if !self.selection.is_collapsed() {
-            self.delete_selection();
+            if !self.grid_clear_selection() {
+                self.delete_selection();
+            }
+        } else if at_cell_end {
+            // Nothing to delete within the cell.
         } else if self.cursor().offset < self.buffer.len_bytes() {
             let cursor_before = self.cursor().offset;
             let next = self.cursor().move_right(&self.buffer);
@@ -1625,7 +1892,16 @@ impl EditorState {
                     self.selection = Selection::select_word_at(buffer_offset, &self.buffer);
                 }
                 3 => {
-                    self.selection = Selection::select_line_at(buffer_offset, &self.buffer);
+                    // In a grid table, the line is a row: select the clicked cell instead.
+                    self.selection = match self.grid_cell_at(buffer_offset) {
+                        Some((t, pos)) => {
+                            let r = self
+                                .grid_caret_range(t, pos)
+                                .unwrap_or(buffer_offset..buffer_offset);
+                            Selection::new(r.start, r.end)
+                        }
+                        None => Selection::select_line_at(buffer_offset, &self.buffer),
+                    };
                 }
                 _ => {
                     let off = self.snap_out_of_list_prefix(buffer_offset);
@@ -3032,8 +3308,9 @@ mod tests {
                     in_table_lines += 1;
                 }
             }
-            // header + delimiter + one body row are all passed through, in-block.
-            assert_eq!(in_table_lines, 3, "caret lands on each table row in turn");
+            // The header and the body row are passed through; the delimiter row (hidden in
+            // the grid) is skipped.
+            assert_eq!(in_table_lines, 2, "caret lands on each grid row in turn");
         }
 
         #[test]
@@ -3046,6 +3323,110 @@ mod tests {
                 state.table_context_at_cursor().is_some(),
                 "the left edge / line start of a table row counts as in-table"
             );
+        }
+
+        // --- Grid editing: the caret moves and edits cell by cell ---
+
+        #[test]
+        fn arrows_walk_cell_by_cell() {
+            // Header "a"@2, "b"@6; body "1"@26, "2"@30.
+            let mut state = EditorState::new(TABLE_2X1);
+            state.set_cursor(3); // after "a"
+            state.move_right();
+            assert_eq!(
+                state.cursor().offset,
+                6,
+                "into the next cell, skipping the pipe"
+            );
+            state.move_right();
+            state.move_right();
+            assert_eq!(
+                state.cursor().offset,
+                26,
+                "past the row's end: the next row"
+            );
+            state.move_left();
+            assert_eq!(
+                state.cursor().offset,
+                7,
+                "back to the previous row's last cell"
+            );
+            state.set_cursor(26);
+            state.move_up();
+            assert_eq!(state.cursor().offset, 2, "up: same column, header row");
+            state.set_cursor(7);
+            state.move_down();
+            assert_eq!(state.cursor().offset, 30, "down skips the delimiter row");
+        }
+
+        #[test]
+        fn home_end_stay_in_the_cell() {
+            let mut state = EditorState::new("| abc | de |\n| --- | --- |\n");
+            state.set_cursor(9); // inside "de"
+            let start = state.cursor_in_direction(Direction::LineStart).offset;
+            let end = state.cursor_in_direction(Direction::LineEnd).offset;
+            assert_eq!((start, end), (8, 10));
+        }
+
+        #[test]
+        fn moves_from_outside_land_in_a_cell() {
+            let mut state = EditorState::new("para\n| a | b |\n| --- | --- |\n");
+            state.set_cursor(4); // end of "para"
+            state.move_right();
+            assert_eq!(
+                state.cursor().offset,
+                7,
+                "on the first cell's text, not the pipe"
+            );
+        }
+
+        #[test]
+        fn backspace_and_delete_stop_at_the_cell_edges() {
+            let mut state = EditorState::new(TABLE_2X1);
+            state.set_cursor(6); // start of "b"
+            state.delete_backward();
+            state.set_cursor(3); // end of "a"
+            state.delete_forward();
+            assert_eq!(state.text(), TABLE_2X1);
+        }
+
+        #[test]
+        fn typed_pipe_and_newline_stay_in_the_cell() {
+            let mut state = EditorState::new(TABLE_2X1);
+            state.set_cursor(3);
+            state.insert_typed("|x\ny");
+            assert_eq!(state.text(), "| a\\|x y | b |\n| --- | --- |\n| 1 | 2 |\n");
+        }
+
+        #[test]
+        fn enter_goes_down_and_adds_a_row_at_the_end() {
+            let mut state = EditorState::new(TABLE_2X1);
+            state.set_cursor(7); // header, "b"
+            state.enter();
+            assert_eq!(state.cursor().offset, 30, "same column, next row");
+            state.enter();
+            assert_eq!(
+                state.text(),
+                "| a | b |\n| --- | --- |\n| 1 | 2 |\n|  |  |\n"
+            );
+            let off = state.cursor().offset;
+            assert_eq!(off, 39, "between the new row's second cell's pipes");
+        }
+
+        #[test]
+        fn deleting_across_cells_empties_them() {
+            let mut state = EditorState::new(TABLE_2X1);
+            state.selection = Selection::new(2, 31); // "a" … "2"
+            state.delete_backward();
+            assert_eq!(state.text(), "|  |  |\n| --- | --- |\n|  |  |\n");
+            assert_eq!(state.cursor().offset, 2);
+        }
+
+        #[test]
+        fn triple_click_selects_the_cell() {
+            let mut state = EditorState::new("| abc | de |\n| --- | --- |\n");
+            state.handle_click(9, false, 3);
+            assert_eq!(state.selection.range(), 8..10);
         }
 
         // --- Regressions: not in a table ---

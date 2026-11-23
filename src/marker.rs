@@ -904,8 +904,15 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
             });
         }
 
+        // A table starting inside the previous one is a ghost of tree-sitter's error
+        // recovery: an all-empty row mid-table (as a Table → Insert Row adds) makes it end
+        // the table there and parse the rows after it as another `pipe_table`. The
+        // previous table's healing (`extract_table`) already took those rows back.
         if kind == "pipe_table"
             && let Some(table) = extract_table(&node, rope)
+            && !tables
+                .last()
+                .is_some_and(|prev: &TableInfo| prev.block.contains(&table.block.start))
         {
             tables.push(table);
         }

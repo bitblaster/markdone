@@ -128,6 +128,15 @@ impl UiLayer {
     /// Feed a window event to egui. Returns `true` when egui consumed it and the editor
     /// must not see it. Requests a redraw when egui needs a new frame.
     pub fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
+        // egui-winit claims every Tab (for its focus navigation, which would focus a menu
+        // button). Unless an egui text field has the keyboard, Tab belongs to the document
+        // (table cells, list nesting), so egui never sees it.
+        if let WindowEvent::KeyboardInput { event: key, .. } = event
+            && key.logical_key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab)
+            && !self.ctx.egui_wants_keyboard_input()
+        {
+            return false;
+        }
         let response = self.winit.on_window_event(window, event);
         // Pointer moves over egui belong to egui: the editor must not react to them (its
         // hover would set the text cursor under an open menu). Decided by position: the

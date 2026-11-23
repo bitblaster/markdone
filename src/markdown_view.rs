@@ -244,7 +244,8 @@ impl MarkdownView {
         doc.draw_blockquote_gutters(scene, height);
         doc.draw_horizontal_rules(scene, height);
         doc.draw_images(&mut self.text_engine, scene, height);
-        doc.draw_tables(&self.text_engine, scene, height);
+        doc.draw_tables(scene, height);
+        doc.draw_table_text(&self.text_engine, scene, height);
         doc.draw(&self.text_engine, scene, height);
         scene.pop_layer();
     }

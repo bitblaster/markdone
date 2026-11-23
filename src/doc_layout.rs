@@ -14,7 +14,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use parley::{Affinity, Cluster, Cursor, PositionedLayoutItem};
-use ropey::Rope;
 use vello::Scene;
 use vello::kurbo::{Affine, Rect, Stroke};
 use vello::peniko::{Brush, Color, Fill};
@@ -39,7 +38,9 @@ use crate::render::{
     build_cell_render, build_line_render,
 };
 use crate::segment_map::SegmentMap;
-use crate::table::{Align, RowKind, TableInfo, TableRow};
+use crate::table::{
+    Align, CellPos, RowKind, TableInfo, TableRow, cell_caret_range, cell_pos_at, cell_span, grid_ok,
+};
 use crate::text_engine::{
     StyleRun, TextEngine, display_range_selection, peniko_color, peniko_color_alpha,
 };
@@ -194,11 +195,6 @@ fn render_key(version: u64, line_idx: usize, cursor_key: usize) -> u64 {
     h.finish()
 }
 
-/// Render-key cursor sentinel for a table row when the cursor is inside the table block
-/// but on a *different* row: all such rows share one reveal state (distinct from grid's
-/// `usize::MAX` and from an on-row cursor offset, which is a real, smaller position).
-const REVEAL_ELSEWHERE: usize = usize::MAX - 1;
-
 /// The cursor's contribution to a line's render: the offset if the cursor is on the
 /// line (markers/regions there stay revealed), else a sentinel. Matches the on-line
 /// test in `build_line_render`.
@@ -231,9 +227,11 @@ pub type HeightCache = SweptCache<f32>;
 struct CellSlot {
     layout: Rc<parley::Layout<Brush>>,
     map: SegmentMap,
-    /// For an empty cell, the caret offset just inside the opening pipe (so a click lands
-    /// off the pipe); `None` for a non-empty cell, which hit-tests via `layout`/`map`.
-    empty_landing: Option<usize>,
+    /// The cell's span between its pipes (content + padding): which cell a caret offset
+    /// on this row belongs to.
+    span: Range<usize>,
+    /// Where the caret can be in this cell (see `table::cell_caret_range`).
+    caret: Range<usize>,
     /// Display-byte ranges of the cell's inline-code spans, used to paint the translucent
     /// chip behind the code glyphs (mirrors body lines' `code_ranges`).
     code_ranges: Vec<Range<usize>>,
@@ -247,25 +245,34 @@ struct MeasuredCell {
     text: String,
     runs: Vec<StyleRun>,
     map: SegmentMap,
-    empty_landing: Option<usize>,
+    span: Range<usize>,
+    caret: Range<usize>,
     code_ranges: Vec<Range<usize>>,
 }
 type CellData = Option<MeasuredCell>;
 type GridCells = Vec<Vec<CellData>>;
 
-/// Caret landing for a click on a table cell: its content start for a non-empty cell,
-/// else a spot one space in past the opening `|` (a trimmed-empty cell's content range
-/// collapses onto the closing-pipe boundary, so `content.start` would sit on that pipe).
-fn cell_caret_landing(rope: &Rope, content: &Range<usize>) -> usize {
-    if content.start < content.end {
-        return content.start;
-    }
-    let closing = content.start;
-    let mut open = closing;
-    while open > 0 && rope.get_byte(open - 1) != Some(b'|') {
-        open -= 1;
-    }
-    (open + 1).min(closing.saturating_sub(1)).max(open)
+/// The cell holding the caret while it is in a grid table: drawn as raw source (its
+/// markers visible) from its content start to `end`, which reaches past the content into
+/// the trailing padding when the caret sits there (a space just typed after the text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ActiveCell {
+    pub pos: CellPos,
+    pub end: usize,
+}
+
+/// The cell of `table` holding `cursor`, if the cursor's line is one of its rows.
+fn active_cell(snapshot: &RenderSnapshot, table: &TableInfo, cursor: usize) -> Option<ActiveCell> {
+    let rope = &snapshot.rope;
+    let cursor = cursor.min(rope.len_bytes());
+    let pos = cell_pos_at(table, rope, cursor)?;
+    let cell = table.cell(pos)?;
+    let end = if cell.content.start < cell.content.end {
+        cell.content.end.max(cursor.min(cell_span(rope, cell).end))
+    } else {
+        cell.content.end
+    };
+    Some(ActiveCell { pos, end })
 }
 
 /// A grid-rendered table's geometry + shaped cells, cached once per edit and shared
@@ -287,6 +294,10 @@ pub struct TableLayout {
     delim_height: f32,
     /// Shaped cell layouts, parallel to `row_heights` rows × columns.
     row_layouts: GridLayouts,
+    /// The caret's cell (outlined), when the caret is in this table.
+    active: Option<CellPos>,
+    /// Height (device px) of one text line, for the caret in an empty cell.
+    line_h: f32,
 }
 
 impl TableLayout {
@@ -308,13 +319,47 @@ impl TableLayout {
         }
     }
 
-    /// Map a click at cell-local X `lx` (device px from the line origin, i.e.
-    /// `click_x - pad_x`) on the grid row playing `kind` to a buffer offset inside the
-    /// clicked cell. Picks the column by `col_x` boundaries (clamping to the grid on
-    /// either side), then hit-tests within the cell's own layout → display offset →
-    /// buffer offset via its `SegmentMap`; an empty cell lands just inside its opening
-    /// pipe. Returns `None` for the (zero-height, caret-free) delimiter row.
-    fn hit_test(&self, kind: RowKind, lx: f32, cell_pad_x: f32) -> Option<usize> {
+    /// Left edge (device px, from the line origin) of the glyphs of cell `col` laid out
+    /// as `slot`: past the cell padding, shifted by the column's alignment.
+    fn text_x(&self, col: usize, slot: &CellSlot, cell_pad_x: f32) -> f32 {
+        let align = self.aligns.get(col).copied().unwrap_or(Align::Left);
+        let extra = (self.col_w[col] - slot.layout.width()).max(0.0);
+        let shift = match align {
+            Align::Left => 0.0,
+            Align::Right => extra,
+            Align::Center => extra / 2.0,
+        };
+        self.col_x[col] + cell_pad_x + shift
+    }
+
+    /// The column of the row playing `kind` whose cell holds buffer offset `off` (a pipe
+    /// belongs to the cell on its left), with that cell.
+    fn cell_holding(&self, kind: RowKind, off: usize) -> Option<(usize, &CellSlot)> {
+        let row = self.row_layouts.get(Self::row_index(kind)?)?;
+        let present = || {
+            row.iter()
+                .enumerate()
+                .filter_map(|(c, s)| Some((c, s.as_ref()?)))
+        };
+        present()
+            .find(|(_, slot)| off <= slot.span.end)
+            .or_else(|| present().next_back())
+    }
+
+    /// Map a click at cell-local (`lx`, `ly`) (device px from the row's origin, i.e. past
+    /// `pad_x` and the row's top) on the grid row playing `kind` to a buffer offset inside
+    /// the clicked cell. Picks the column by `col_x` boundaries (clamping to the grid on
+    /// either side), then hit-tests within the cell's own (possibly wrapped) layout →
+    /// display offset → buffer offset via its `SegmentMap`; an empty cell lands just inside
+    /// its opening pipe. Returns `None` for the (zero-height, caret-free) delimiter row.
+    fn hit_test(
+        &self,
+        kind: RowKind,
+        lx: f32,
+        ly: f32,
+        cell_pad_x: f32,
+        cell_pad_y: f32,
+    ) -> Option<usize> {
         let row_idx = Self::row_index(kind)?;
         let row = self.row_layouts.get(row_idx)?;
         let cols = self.col_x.len();
@@ -331,19 +376,75 @@ impl TableLayout {
             col -= 1;
         }
         let slot = row.get(col)?.as_ref()?;
-        if let Some(landing) = slot.empty_landing {
-            return Some(landing);
+        if slot.caret.is_empty() && slot.layout.width() <= 0.0 {
+            return Some(slot.caret.start);
         }
-        let align = self.aligns.get(col).copied().unwrap_or(Align::Left);
-        let extra = (self.col_w[col] - slot.layout.width()).max(0.0);
-        let shift = match align {
-            Align::Left => 0.0,
-            Align::Right => extra,
-            Align::Center => extra / 2.0,
+        let local_x = (lx - self.text_x(col, slot, cell_pad_x)).max(0.0);
+        let local_y = (ly - cell_pad_y).max(0.0);
+        let display_off = Cursor::from_point(&slot.layout, local_x, local_y).index();
+        let off = slot.map.display_to_buffer(display_off);
+        Some(off.clamp(slot.caret.start, slot.caret.end.max(slot.caret.start)))
+    }
+
+    /// The caret rectangle (device px, relative to the row's origin) for buffer offset
+    /// `off` on the row playing `kind`.
+    fn caret_rect(
+        &self,
+        kind: RowKind,
+        off: usize,
+        caret_width: f32,
+        cell_pad_x: f32,
+        cell_pad_y: f32,
+    ) -> Option<ScreenRect> {
+        let (col, slot) = self.cell_holding(kind, off)?;
+        let x = self.text_x(col, slot, cell_pad_x) as f64;
+        let y = cell_pad_y as f64;
+        if slot.layout.lines().next().is_none() {
+            return Some((x, y, x + caret_width as f64, y + self.line_h as f64));
+        }
+        let display = slot.map.buffer_to_display(off);
+        let cursor = Cursor::from_byte_index(&slot.layout, display, Affinity::Downstream);
+        let bb = cursor.geometry(&slot.layout, caret_width);
+        let (y0, mut y1) = (bb.y0 + y, bb.y1 + y);
+        if y1 - y0 < 1.0 {
+            y1 = y0 + self.line_h as f64;
+        }
+        Some((bb.x0 + x, y0, bb.x1 + x, y1))
+    }
+
+    /// Selection rectangles (device px, relative to the row's origin) for the part of
+    /// `selection` inside each cell of the row playing `kind`.
+    fn selection_rects(
+        &self,
+        kind: RowKind,
+        selection: &Range<usize>,
+        cell_pad_x: f32,
+        cell_pad_y: f32,
+    ) -> Vec<ScreenRect> {
+        let mut rects = Vec::new();
+        let Some(row) = Self::row_index(kind).and_then(|r| self.row_layouts.get(r)) else {
+            return rects;
         };
-        let local_x = (lx - (self.col_x[col] + cell_pad_x + shift)).max(0.0);
-        let display_off = Cursor::from_point(&slot.layout, local_x, 0.0).index();
-        Some(slot.map.display_to_buffer(display_off))
+        for (col, slot) in row.iter().enumerate() {
+            let Some(slot) = slot else { continue };
+            let s = selection.start.max(slot.caret.start);
+            let e = selection.end.min(slot.caret.end);
+            if s >= e {
+                continue;
+            }
+            let ds = slot.map.buffer_to_display(s);
+            let de = slot.map.buffer_to_display(e);
+            if ds >= de {
+                continue;
+            }
+            let x = self.text_x(col, slot, cell_pad_x) as f64;
+            let y = cell_pad_y as f64;
+            let sel = display_range_selection(&slot.layout, ds..de);
+            for (bb, _) in sel.geometry(&slot.layout) {
+                rects.push((bb.x0 + x, bb.y0 + y, bb.x1 + x, bb.y1 + y));
+            }
+        }
+        rects
     }
 }
 
@@ -360,15 +461,9 @@ const TABLE_BORDER: f32 = 1.0;
 /// A single column may grow to this multiple of its equal share of the width before it
 /// is capped (wider content then wraps within the column).
 const TABLE_COL_CAP_FACTOR: f32 = 2.5;
-/// Grid-render only tables under these limits; larger tables fall through to raw pipe
-/// text so the O(cells) pre-pass + cache can't blow up on pathological input.
-const TABLE_MAX_BODY_ROWS: usize = 200;
-const TABLE_MAX_CELLS: usize = 1000;
-
 /// Whether a table is small enough to grid-render (else it renders as raw pipe text).
 fn table_grid_ok(t: &TableInfo) -> bool {
-    t.body.len() <= TABLE_MAX_BODY_ROWS
-        && (t.body.len() + 1).saturating_mul(t.ncols.max(1)) <= TABLE_MAX_CELLS
+    grid_ok(t)
 }
 
 /// Content hash keying a `TableLayout`: same text + width + font ⇒ identical grid. Keyed
@@ -381,9 +476,11 @@ fn table_key(
     scale: f32,
     font_size: f32,
     max_advance: f32,
+    active: Option<ActiveCell>,
 ) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     content_hash.hash(&mut h);
+    active.hash(&mut h);
     block_start.hash(&mut h);
     scale.to_bits().hash(&mut h);
     font_size.to_bits().hash(&mut h);
@@ -419,6 +516,7 @@ fn build_table_layout(
     line_styles: &[Vec<StyledRegion>],
     params: &LayoutParams,
     max_advance: f32,
+    active: Option<ActiveCell>,
 ) -> TableLayout {
     let LayoutParams {
         scale,
@@ -440,6 +538,7 @@ fn build_table_layout(
         .collect();
     let mut grid: GridCells = Vec::with_capacity(rows.len());
     let mut natural = vec![0f32; ncols];
+    let mut header_w = vec![0f32; ncols];
     for (r, row) in rows.iter().enumerate() {
         let line_idx = snapshot
             .rope
@@ -454,8 +553,16 @@ fn build_table_layout(
         for c in 0..ncols {
             match row.cells.get(c) {
                 Some(cell) => {
+                    // The caret's cell shows its source, up to the caret if it sits past
+                    // the text (in the trailing padding).
+                    let (range, reveal) = match active {
+                        Some(a) if a.pos == (CellPos { row: r, col: c }) => {
+                            (cell.content.start..a.end, true)
+                        }
+                        _ => (cell.content.clone(), false),
+                    };
                     let (text, mut runs, map, code_ranges) =
-                        build_cell_render(snapshot, theme, cell.content.clone(), styles);
+                        build_cell_render(snapshot, theme, range, styles, reveal);
                     if is_header && !text.is_empty() {
                         // Bold the whole header cell; content color runs still win their spans.
                         let mut base = StyleRun::new(0..text.len(), fg);
@@ -466,13 +573,15 @@ fn build_table_layout(
                         .build_line(&text, scale, base_font_size, line_height, fg, None, &runs)
                         .width();
                     natural[c] = natural[c].max(w);
-                    let empty_landing = (cell.content.start >= cell.content.end)
-                        .then(|| cell_caret_landing(&snapshot.rope, &cell.content));
+                    if is_header {
+                        header_w[c] = w;
+                    }
                     rowdata.push(Some(MeasuredCell {
                         text,
                         runs,
                         map,
-                        empty_landing,
+                        span: cell_span(&snapshot.rope, cell),
+                        caret: cell_caret_range(&snapshot.rope, cell),
                         code_ranges,
                     }));
                 }
@@ -482,19 +591,9 @@ fn build_table_layout(
         grid.push(rowdata);
     }
 
-    // Column widths: cap each at a multiple of the equal share, then scale the set down
-    // if the total (plus per-cell padding + borders) still overflows the content width.
     let overhead = ncols as f32 * 2.0 * cell_pad_x + (ncols as f32 + 1.0) * border;
     let avail = (max_advance - overhead).max(1.0);
-    let col_cap = (avail / ncols as f32) * TABLE_COL_CAP_FACTOR;
-    let mut col_w: Vec<f32> = natural.iter().map(|&w| w.min(col_cap).max(1.0)).collect();
-    let sum: f32 = col_w.iter().sum();
-    if sum > avail {
-        let s = avail / sum;
-        for w in &mut col_w {
-            *w *= s;
-        }
-    }
+    let col_w = fit_columns(&natural, &header_w, avail);
 
     // Column x-origins (prefix sum of box widths + border).
     let mut col_x = Vec::with_capacity(ncols);
@@ -516,7 +615,8 @@ fn build_table_layout(
                     text,
                     runs,
                     map,
-                    empty_landing,
+                    span,
+                    caret,
                     code_ranges,
                 }) => {
                     let layout = Rc::new(engine.build_line(
@@ -532,7 +632,8 @@ fn build_table_layout(
                     layouts.push(Some(CellSlot {
                         layout,
                         map,
-                        empty_landing,
+                        span,
+                        caret,
                         code_ranges,
                     }));
                 }
@@ -554,7 +655,44 @@ fn build_table_layout(
         row_heights,
         delim_height: 0.0,
         row_layouts,
+        active: active.map(|a| a.pos),
+        line_h: base_font_size * line_height * scale,
     }
+}
+
+/// Content widths (device px) of a grid table's columns, from each column's natural width
+/// (its widest cell) and its header's width, to fit `avail`. Each column is capped at a
+/// multiple of the equal share. When the set overflows, the columns shrink in proportion
+/// to how far they exceed their header, so a header that fits stays on one line (a short
+/// column such as "Choice" next to long ones isn't squeezed to "Choi|ce"); only when even
+/// the headers don't fit does every column shrink in proportion.
+fn fit_columns(natural: &[f32], header: &[f32], avail: f32) -> Vec<f32> {
+    let cap = (avail / natural.len().max(1) as f32) * TABLE_COL_CAP_FACTOR;
+    let mut w: Vec<f32> = natural.iter().map(|&x| x.min(cap).max(1.0)).collect();
+    let sum: f32 = w.iter().sum();
+    if sum <= avail {
+        return w;
+    }
+    // A hair over the header's width, so rounding can't wrap its last letter.
+    let floor: Vec<f32> = w
+        .iter()
+        .zip(header)
+        .map(|(&x, &h)| (h + 1.0).min(x))
+        .collect();
+    let floor_sum: f32 = floor.iter().sum();
+    if floor_sum < avail {
+        // `sum > avail > floor_sum`, so the shrinkable part is positive.
+        let s = (avail - floor_sum) / (sum - floor_sum);
+        for (x, f) in w.iter_mut().zip(&floor) {
+            *x = f + (*x - f) * s;
+        }
+    } else {
+        let s = avail / sum;
+        for x in &mut w {
+            *x *= s;
+        }
+    }
+    w
 }
 
 /// Estimated row heights (device px) of a grid table, without shaping: header first, then
@@ -589,17 +727,13 @@ fn estimate_table_rows(
             natural[c] = natural[c].max(width_of(cell));
         }
     }
+    let mut header_w = vec![0f32; ncols];
+    for (c, cell) in table.header.cells.iter().enumerate().take(ncols) {
+        header_w[c] = width_of(cell);
+    }
     let overhead = ncols as f32 * 2.0 * cell_pad_x + (ncols as f32 + 1.0) * border;
     let avail = (max_advance - overhead).max(1.0);
-    let col_cap = (avail / ncols as f32) * TABLE_COL_CAP_FACTOR;
-    let mut col_w: Vec<f32> = natural.iter().map(|&w| w.min(col_cap).max(1.0)).collect();
-    let sum: f32 = col_w.iter().sum();
-    if sum > avail {
-        let s = avail / sum;
-        for w in &mut col_w {
-            *w *= s;
-        }
-    }
+    let col_w = fit_columns(&natural, &header_w, avail);
     rows.iter()
         .map(|row| {
             let lines = row
@@ -1270,6 +1404,8 @@ pub struct DocLayout {
     table_border_color: Color,
     table_bg: Color,
     table_header_bg: Color,
+    /// Outline of the caret's cell.
+    table_active_border: Color,
     /// Per-line x-offsets (from the line origin) of each blockquote gutter rule, parallel
     /// to `layouts`. Empty for non-quote lines. Painted as continuous vertical rects.
     quote_bars: Vec<Vec<f32>>,
@@ -1489,26 +1625,17 @@ impl DocLayout {
         let content_w = max_advance;
         let img_vpad = IMG_VPAD * scale;
         // Each line's total height = its ghost block above + the real line.
-        // Cursor component of a line's render key. Table rows share block-reveal state
-        // (all flip together when the cursor enters/leaves the block) — except the row
-        // the cursor actually sits on, which reveals its own markers. Three distinct
-        // sentinels keep grid / reveal-here / reveal-elsewhere from colliding.
+        // Cursor component of a line's render key. A grid table row renders the same
+        // wherever the caret is (the caret's cell is drawn by the shared `TableLayout`,
+        // keyed on it separately), so its key ignores the caret.
         let cursor_component = |i: usize, range: &Range<usize>| -> usize {
-            let onkey = cursor_key_for(range, cursor_offset);
-            match snapshot
+            if snapshot
                 .table_row_at_line(i)
-                .filter(|(t, _)| table_grid_ok(t))
+                .is_some_and(|(t, _)| table_grid_ok(t))
             {
-                Some((t, _)) => {
-                    if !t.block.contains(&cursor_line_start) {
-                        usize::MAX
-                    } else if onkey != usize::MAX {
-                        onkey
-                    } else {
-                        REVEAL_ELSEWHERE
-                    }
-                }
-                None => onkey,
+                usize::MAX
+            } else {
+                cursor_key_for(range, cursor_offset)
             }
         };
         // `i` indexes several parallel per-line inputs (styles, markers, diff).
@@ -1873,7 +2000,7 @@ impl DocLayout {
             // layout (unique per keystroke, so it bypasses the line cache). The original
             // `lr` (map/text) is kept for hit-testing; only the drawn layout changes.
             let layout = match preedit {
-                Some(pv) if i == cursor_line => {
+                Some(pv) if i == cursor_line && lr.table.is_none() => {
                     let caret_disp = lr.map.buffer_to_display(cursor_offset);
                     let (sp_text, sp_runs) =
                         splice_preedit(&lr.text, &lr.runs, caret_disp, pv.text, fg);
@@ -1924,12 +2051,19 @@ impl DocLayout {
                     .table_row_at_line(i)
                     .filter(|(t, _)| table_grid_ok(t))
                     .map(|(t, kind)| {
+                        // The caret's cell, when the caret is on one of this table's rows.
+                        let active = t
+                            .block
+                            .contains(&cursor_line_start)
+                            .then(|| active_cell(snapshot, t, cursor_offset))
+                            .flatten();
                         let tkey = table_key(
                             table_content_hash(snapshot, &t.block),
                             t.block.start,
                             scale,
                             base_font_size,
                             max_advance,
+                            active,
                         );
                         let tl = table_cache.get_or_build(tkey, || {
                             Rc::new(build_table_layout(
@@ -1940,6 +2074,7 @@ impl DocLayout {
                                 &line_styles,
                                 params,
                                 max_advance,
+                                active,
                             ))
                         });
                         (tl, kind)
@@ -2064,6 +2199,7 @@ impl DocLayout {
             table_border_color: peniko_color(theme.selection),
             table_bg: peniko_color_alpha(theme.comment, 0.05),
             table_header_bg: peniko_color(theme.surface),
+            table_active_border: peniko_color(theme.cyan),
             diff_colors,
             // A thin rule (~1/6 of a mono cell), floored so it stays visible when small.
             quote_bar_width: (k * 0.16).max(1.5),
@@ -2117,6 +2253,9 @@ impl DocLayout {
     /// Height (device px) of line `i`'s laid-out text block, for vertically centering
     /// gutter affordances against it. Zero for estimated/hidden lines.
     pub fn line_text_height(&self, line: usize) -> f32 {
+        if let Some(Some((tl, kind))) = self.table_lines.get(line) {
+            return tl.height(*kind);
+        }
         self.layouts.get(line).map(|l| l.height()).unwrap_or(0.0)
     }
 
@@ -2159,6 +2298,9 @@ impl DocLayout {
     pub fn offset_in_line_at_x(&self, line: usize, x: f32) -> Option<usize> {
         let layout = self.layouts.get(line)?;
         let lx = (x - self.pad_x).max(0.0);
+        if let Some(Some((tl, kind))) = self.table_lines.get(line) {
+            return tl.hit_test(*kind, lx, 0.0, self.table_cell_pad_x, self.table_cell_pad_y);
+        }
         let display_off = Cursor::from_point(layout, lx, 0.0).index();
         Some(self.renders[line].map.display_to_buffer(display_off))
     }
@@ -2184,6 +2326,18 @@ impl DocLayout {
     /// `caret_width` is in device px.
     pub fn caret_rect(&self, buffer_off: usize, caret_width: f32) -> Option<ScreenRect> {
         let line = self.line_of(buffer_off);
+        if let Some(Some((tl, kind))) = self.table_lines.get(line) {
+            let (x0, y0, x1, y1) = tl.caret_rect(
+                *kind,
+                buffer_off,
+                caret_width,
+                self.table_cell_pad_x,
+                self.table_cell_pad_y,
+            )?;
+            let dx = self.pad_x as f64;
+            let dy = (self.real_top(line) - self.scroll_y) as f64;
+            return Some((x0 + dx, y0 + dy, x1 + dx, y1 + dy));
+        }
         let display_off = self.renders.get(line)?.map.buffer_to_display(buffer_off);
         self.caret_rect_at(line, display_off, caret_width)
     }
@@ -2212,6 +2366,19 @@ impl DocLayout {
             if s >= e {
                 continue;
             }
+            let dx = self.pad_x as f64;
+            let dy = (self.real_top(line) - self.scroll_y) as f64;
+            if let Some((tl, kind)) = &self.table_lines[line] {
+                for (x0, y0, x1, y1) in tl.selection_rects(
+                    *kind,
+                    &selection,
+                    self.table_cell_pad_x,
+                    self.table_cell_pad_y,
+                ) {
+                    rects.push((x0 + dx, y0 + dy, x1 + dx, y1 + dy));
+                }
+                continue;
+            }
             let map = &self.renders[line].map;
             let ds = map.buffer_to_display(s);
             let de = map.buffer_to_display(e);
@@ -2220,8 +2387,6 @@ impl DocLayout {
             }
             let layout = &self.layouts[line];
             let sel = display_range_selection(layout, ds..de);
-            let dx = self.pad_x as f64;
-            let dy = (self.real_top(line) - self.scroll_y) as f64;
             for (bb, _) in sel.geometry(layout) {
                 rects.push((bb.x0 + dx, bb.y0 + dy, bb.x1 + dx, bb.y1 + dy));
             }
@@ -2253,7 +2418,8 @@ impl DocLayout {
         // Grid table row: its own text layout is empty (hidden), so hit-test the clicked
         // cell within the shared TableLayout instead of collapsing to the line start.
         if let Some((tl, kind)) = &self.table_lines[line]
-            && let Some(off) = tl.hit_test(*kind, lx, self.table_cell_pad_x)
+            && let Some(off) =
+                tl.hit_test(*kind, lx, ly, self.table_cell_pad_x, self.table_cell_pad_y)
         {
             return Some(off);
         }
@@ -2701,30 +2867,26 @@ impl DocLayout {
         }
     }
 
-    /// Paint grid-table rows: per-cell background + border rects and the shaped cell
-    /// glyphs. The header row's distinct background fill separates it from the body, so no
-    /// delimiter rule is drawn (the delimiter line has zero grid height). Call BEFORE
-    /// `draw` (a grid row's own text layout is empty, so no glyphs collide). Cell layouts
-    /// are held in the shared `TableLayout`, so this is pure drawing — no shaping.
-    pub fn draw_tables(&self, engine: &TextEngine, scene: &mut Scene, viewport_h: f32) {
+    /// Paint grid-table rows' cells: background + border rects, and an accent outline
+    /// around the caret's cell. The header row's distinct background fill separates it
+    /// from the body, so no delimiter rule is drawn (the delimiter line has zero grid
+    /// height). Call BEFORE the selection; the cell text follows with `draw_table_text`.
+    pub fn draw_tables(&self, scene: &mut Scene, viewport_h: f32) {
         let (first, last) = self.visible_range(viewport_h);
         let pad_x = self.pad_x as f64;
         let cell_pad_x = self.table_cell_pad_x;
-        let cell_pad_y = self.table_cell_pad_y;
         let border = self.table_border as f64;
+        let mut outline: Option<Rect> = None;
         for i in first..last {
             let Some((tl, kind)) = &self.table_lines[i] else {
                 continue;
             };
-            // The delimiter row is not drawn: it takes zero grid height, so the header
-            // (distinguished by its background fill) sits directly on the first body row.
             let Some(row_idx) = TableLayout::row_index(*kind) else {
                 continue;
             };
             let top = (self.real_top(i) - self.scroll_y) as f64;
             let bottom = (self.tops[i + 1] - self.scroll_y) as f64;
-            let is_header = matches!(kind, RowKind::Header);
-            let bg = if is_header {
+            let bg = if matches!(kind, RowKind::Header) {
                 self.table_header_bg
             } else {
                 self.table_bg
@@ -2741,31 +2903,61 @@ impl DocLayout {
                     None,
                     &rect,
                 );
-                // Cell glyphs, aligned within the column's content width.
-                if let Some(Some(slot)) = tl.row_layouts.get(row_idx).and_then(|r| r.get(c)) {
-                    let layout = &slot.layout;
-                    let align = tl.aligns.get(c).copied().unwrap_or(Align::Left);
-                    let extra = (tl.col_w[c] - layout.width()).max(0.0);
-                    let shift = match align {
-                        Align::Left => 0.0,
-                        Align::Right => extra,
-                        Align::Center => extra / 2.0,
-                    };
-                    let gx = cx as f32 + cell_pad_x + shift;
-                    let gy = top as f32 + cell_pad_y;
-                    // Chip behind inline code, over the cell bg but under the glyphs.
-                    if !slot.code_ranges.is_empty() {
-                        self.fill_display_ranges(
-                            scene,
-                            layout,
-                            &slot.code_ranges,
-                            gx as f64,
-                            gy as f64,
-                            self.code_bg,
-                        );
-                    }
-                    engine.draw_line(scene, layout, (gx, gy));
+                if tl.active
+                    == Some(CellPos {
+                        row: row_idx,
+                        col: c,
+                    })
+                {
+                    outline = Some(rect);
                 }
+            }
+        }
+        // Last, so no neighbouring cell's border paints over it.
+        if let Some(rect) = outline {
+            scene.stroke(
+                &Stroke::new(border * 2.0),
+                Affine::IDENTITY,
+                self.table_active_border,
+                None,
+                &rect,
+            );
+        }
+    }
+
+    /// Paint grid-table cells' text (and the chips behind their inline code), over the
+    /// cell backgrounds and the selection. Cell layouts are held in the shared
+    /// `TableLayout`, so this is pure drawing — no shaping.
+    pub fn draw_table_text(&self, engine: &TextEngine, scene: &mut Scene, viewport_h: f32) {
+        let (first, last) = self.visible_range(viewport_h);
+        let pad_x = self.pad_x;
+        let cell_pad_x = self.table_cell_pad_x;
+        let cell_pad_y = self.table_cell_pad_y;
+        for i in first..last {
+            let Some((tl, kind)) = &self.table_lines[i] else {
+                continue;
+            };
+            let Some(row) = TableLayout::row_index(*kind).and_then(|r| tl.row_layouts.get(r))
+            else {
+                continue;
+            };
+            let top = self.real_top(i) - self.scroll_y;
+            for (c, slot) in row.iter().enumerate() {
+                let Some(slot) = slot else { continue };
+                let gx = pad_x + tl.text_x(c, slot, cell_pad_x);
+                let gy = top + cell_pad_y;
+                // Chip behind inline code, over the cell bg but under the glyphs.
+                if !slot.code_ranges.is_empty() {
+                    self.fill_display_ranges(
+                        scene,
+                        &slot.layout,
+                        &slot.code_ranges,
+                        gx as f64,
+                        gy as f64,
+                        self.code_bg,
+                    );
+                }
+                engine.draw_line(scene, &slot.layout, (gx, gy));
             }
         }
     }
@@ -3145,6 +3337,7 @@ mod tests {
             table_border_color: Color::TRANSPARENT,
             table_bg: Color::TRANSPARENT,
             table_header_bg: Color::TRANSPARENT,
+            table_active_border: Color::TRANSPARENT,
             quote_bar_width: 2.0,
             quote_bar_color: Color::TRANSPARENT,
             measured_start: 0,
@@ -4028,6 +4221,25 @@ mod tests {
 
     /// The column pre-pass: `col_x` strictly increases, the widest cell drives its
     /// column's width, and the whole grid fits inside `max_advance`.
+    /// A short column next to long ones keeps its header on one line when the table
+    /// overflows, and the result fits; with no room even for the headers, everything
+    /// shrinks in proportion.
+    #[test]
+    fn fit_columns_keeps_headers_whole() {
+        let w = fit_columns(&[60.0, 400.0, 400.0], &[50.0, 30.0, 30.0], 300.0);
+        assert!(w[0] >= 50.0, "short column keeps its header width: {w:?}");
+        assert!((w.iter().sum::<f32>() - 300.0).abs() < 0.01, "fits: {w:?}");
+        assert!(w[1] > w[0] && w[2] > w[0]);
+        // Fits as is: natural widths.
+        assert_eq!(
+            fit_columns(&[60.0, 80.0], &[50.0, 30.0], 300.0),
+            vec![60.0, 80.0]
+        );
+        // Headers wider than the page: proportional.
+        let w = fit_columns(&[200.0, 200.0], &[200.0, 200.0], 100.0);
+        assert_eq!(w, vec![50.0, 50.0]);
+    }
+
     #[test]
     fn table_layout_columns_and_widest_cell() {
         use crate::buffer::Buffer;
@@ -4051,6 +4263,7 @@ mod tests {
             &styles,
             &params,
             max_advance,
+            None,
         );
 
         assert_eq!(tl.col_x.len(), 2);
@@ -4089,7 +4302,16 @@ mod tests {
         let styles = snap.inline_styles_by_line();
         let params = test_params(&theme, 1200.0);
         let table = snap.table_containing_offset(0).unwrap();
-        let tl = build_table_layout(&mut engine, &snap, &theme, table, &styles, &params, 1000.0);
+        let tl = build_table_layout(
+            &mut engine,
+            &snap,
+            &theme,
+            table,
+            &styles,
+            &params,
+            1000.0,
+            None,
+        );
 
         // row_layouts[1] is the single body row; col 1 holds `code`, col 0 is plain.
         let body = &tl.row_layouts[1];
@@ -4111,13 +4333,13 @@ mod tests {
     fn table_size_cap_engages() {
         use crate::buffer::Buffer;
         let mut doc = String::from("| a | b |\n|---|---|\n");
-        for i in 0..(TABLE_MAX_BODY_ROWS + 5) {
+        for i in 0..(crate::table::MAX_GRID_BODY_ROWS + 5) {
             doc.push_str(&format!("| r{i} | v{i} |\n"));
         }
         let mut buf: Buffer = doc.parse().unwrap();
         let snap = buf.render_snapshot();
         let table = snap.table_containing_offset(0).unwrap();
-        assert!(table.body.len() > TABLE_MAX_BODY_ROWS);
+        assert!(table.body.len() > crate::table::MAX_GRID_BODY_ROWS);
         assert!(
             !table_grid_ok(table),
             "oversized table must not grid-render"
@@ -4197,61 +4419,46 @@ mod tests {
         assert!(doc.content_height() > 0.0 && doc.content_height().is_finite());
     }
 
-    /// The reveal flip: cursor off the table → every row is a grid row (text hidden);
-    /// cursor on ANY table line → all rows revert to raw pipe text (no table ref).
+    /// With the caret in a table every row stays a grid row: the caret's cell becomes the
+    /// active one (shown as raw source), the caret is drawn inside its box, and a
+    /// selection across cells paints in each of them.
     #[test]
-    fn doc_layout_table_reveal_flip() {
+    fn doc_layout_grid_stays_with_the_caret_in_a_cell() {
         use crate::buffer::Buffer;
         let mut engine = TextEngine::new();
-        let theme = EditorTheme::dracula();
-        let src = "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n";
+        let src = "| a | **b** |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n";
         let mut buf: Buffer = src.parse().unwrap();
         let snap = buf.render_snapshot();
-        let params = test_params(&theme, 1200.0);
-        let build = |engine: &mut TextEngine, cursor: usize| {
-            DocLayout::build(
-                engine,
-                &mut LineCache::new(),
-                &mut RenderCache::new(),
-                &mut HeightCache::new(),
-                &mut TableCache::new(),
-                0,
-                &snap,
-                &theme,
-                None,
-                None,
-                &ImageCache::new(),
-                cursor,
-                &params,
-                None,
-                0,
-                f32::INFINITY,
-                &[],
-                &(0..0),
-                &std::collections::HashMap::new(),
-            )
-        };
-        // Cursor off the table (past the end): grid mode, header row hidden + flagged.
-        let off = build(&mut engine, src.len());
-        assert!(
-            off.renders[0].table.is_some(),
-            "header is a grid row off-cursor"
-        );
-        assert!(off.renders[0].text.is_empty(), "grid row text hidden");
-
-        // Cursor inside a body row (line 3, offset ~30): all rows revert to raw text.
-        let on = build(&mut engine, 30);
-        for line in 0..4 {
-            assert!(
-                on.renders[line].table.is_none(),
-                "line {line} reverts to raw text when the cursor is in the table"
-            );
-            assert!(
-                !on.renders[line].text.is_empty(),
-                "line {line} shows raw pipe text in reveal mode"
-            );
-            assert!(on.table_lines[line].is_none());
+        let cursor = src.find("**b**").unwrap() + 3;
+        let doc = build_grid_doc(&mut engine, &snap, cursor);
+        for (line, render) in doc.renders.iter().enumerate().take(4) {
+            assert!(render.table.is_some(), "line {line} is a grid row");
+            assert!(render.text.is_empty(), "line {line} text hidden");
         }
+        let (tl, _) = doc.table_lines[0].as_ref().unwrap();
+        assert_eq!(tl.active, Some(CellPos { row: 0, col: 1 }));
+        let slot = tl.row_layouts[0][1].as_ref().unwrap();
+        assert_eq!(slot.map.display_len(), 5, "the caret's cell shows `**b**`");
+
+        let caret = doc.caret_rect(cursor, 2.0).unwrap();
+        let x0 = doc.pad_x + tl.col_x[1];
+        let x1 = x0 + tl.col_w[1] + 2.0 * doc.table_cell_pad_x;
+        assert!(
+            caret.0 as f32 > x0 && (caret.0 as f32) < x1,
+            "caret {caret:?} inside the cell [{x0}, {x1}]"
+        );
+
+        let sel = src.find('1').unwrap()..src.find('2').unwrap() + 1;
+        assert_eq!(
+            doc.selection_rects(sel).len(),
+            2,
+            "one rect per selected cell"
+        );
+
+        // Off the table, no cell is active.
+        let off = build_grid_doc(&mut engine, &snap, src.len());
+        let (tl, _) = off.table_lines[0].as_ref().unwrap();
+        assert_eq!(tl.active, None);
     }
 
     /// Build a whole-document layout with the cursor off the table (grid mode).

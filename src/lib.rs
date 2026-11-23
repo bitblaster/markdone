@@ -134,6 +134,7 @@ pub mod status_bar;
 #[cfg(all(feature = "app", unix, not(target_os = "macos")))]
 pub mod system_theme;
 pub mod table;
+pub mod table_edit;
 pub mod text_engine;
 pub mod text_input;
 pub mod tokenize;

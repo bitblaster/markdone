@@ -416,6 +416,24 @@ impl Editor {
         });
     }
 
+    /// Whether the caret is in a table (the context menu then offers the Table commands).
+    pub fn in_table(&self) -> bool {
+        self.state
+            .table_cell_at(self.state.selection.head)
+            .is_some()
+    }
+
+    /// Apply a Table command at the caret's cell, as one undo step. False when the caret
+    /// is not in a table.
+    pub fn table_op(&mut self, op: crate::table_edit::TableOp) -> bool {
+        let Some((table, pos)) = self.state.table_cell_at(self.state.selection.head) else {
+            return false;
+        };
+        let edit = crate::table_edit::apply(self.state.buffer.rope(), &table, pos, op);
+        self.apply_text_edit(&edit);
+        true
+    }
+
     /// Mark the document as unsaved without editing it (see `Buffer::mark_dirty`).
     pub fn mark_dirty(&mut self) {
         self.state.buffer.mark_dirty();
@@ -489,7 +507,7 @@ impl Editor {
     }
 
     pub fn insert_str(&mut self, text: &str) {
-        self.edit(|s| s.insert_text(text));
+        self.edit(|s| s.insert_typed(text));
     }
 
     /// Insert clipboard text with context-aware paste normalization (CRLF→LF,
@@ -497,7 +515,7 @@ impl Editor {
     pub fn paste(&mut self, text: &str) {
         let ctx = PasteContext::from_buffer(&self.state.buffer, self.cursor_position());
         let transformed = transform_paste(text, &ctx);
-        self.edit(|s| s.insert_text(&transformed));
+        self.edit(|s| s.insert_typed(&transformed));
     }
 
     pub fn type_char(&mut self, c: char) {
@@ -567,7 +585,9 @@ impl Editor {
     /// (punctuation runs count as words, whitespace and line breaks are skipped).
     pub fn move_word(&mut self, forward: bool, extend: bool) {
         let head = self.state.selection.head;
-        let target = self.word_boundary(head, forward);
+        let target = self
+            .state
+            .snap_to_grid_cell(self.word_boundary(head, forward));
         self.move_to(target, extend);
     }
 

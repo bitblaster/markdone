@@ -302,7 +302,8 @@ fn visual_vertical_target(
     }
     // The adjacent visible line, entering at its first (down) or last (up) row.
     let hidden = editor.hidden_line_ranges();
-    let visible = |l: usize| !hidden.iter().any(|r| r.contains(&l));
+    // Folded lines and zero-height ones (a grid table's hidden delimiter row) are skipped.
+    let visible = |l: usize| !hidden.iter().any(|r| r.contains(&l)) && !doc.line_is_collapsed(l);
     let count = editor.line_count();
     let next = if down {
         (line + 1..count).find(|&l| visible(l))?
@@ -1081,6 +1082,8 @@ struct App {
     speller_seq: Arc<AtomicU64>,
     /// A right button press on the document waits for its release to open the menu.
     context_menu_pending: bool,
+    /// The context menu was opened in a table (it then offers the Table submenu).
+    context_menu_table: bool,
     /// Wayland file drag-and-drop listener (stopped in `exiting`).
     #[cfg(all(unix, not(target_os = "macos")))]
     dnd: Option<crate::wayland_dnd::Listener>,
@@ -1275,6 +1278,7 @@ impl App {
             dict_status: std::collections::HashMap::new(),
             speller_seq: Arc::new(AtomicU64::new(0)),
             context_menu_pending: false,
+            context_menu_table: false,
             toc_width: toc_width(),
             toc_current: None,
             fold_chevron_rects: Vec::new(),
@@ -2828,6 +2832,12 @@ impl App {
                 }
                 return;
             }
+            Command::Table(op) => {
+                if self.state.is_some() && self.doc_engine.editor.table_op(op) {
+                    self.after_format_edit();
+                }
+                return;
+            }
             Command::SpellAddWord => {
                 if let Some(menu) = self.spell_menu.take() {
                     match crate::spelling::add_to_personal(&menu.word) {
@@ -4186,7 +4196,7 @@ fn paint_document(
     doc.draw_blockquote_gutters(scene, editor_h);
     doc.draw_horizontal_rules(scene, editor_h);
     doc.draw_images(engine, scene, editor_h);
-    doc.draw_tables(engine, scene, editor_h);
+    doc.draw_tables(scene, editor_h);
     // Faint yellow tint under every visible find match EXCEPT the active one, which is
     // drawn last (below) in a distinct warm orange so the current match reads clearly.
     if let Some(find) = editor.find_state()
@@ -4239,6 +4249,7 @@ fn paint_document(
             scene.stroke(&stroke, Affine::IDENTITY, border, None, &r);
         }
     }
+    doc.draw_table_text(engine, scene, editor_h);
     doc.draw(engine, scene, editor_h);
     let cw = CARET_WIDTH * scale;
     let caret = doc
@@ -5165,6 +5176,7 @@ impl ApplicationHandler<WritEvent> for App {
                         (self.mouse_pos.1 + top) / state.scale,
                     ));
                     self.context_menu_open = true;
+                    self.context_menu_table = self.doc_engine.editor.in_table();
                     state.window.request_redraw();
                 }
             }
@@ -6204,6 +6216,7 @@ impl ApplicationHandler<WritEvent> for App {
                 let context_menu = self.context_menu;
                 let context_menu_open = std::mem::take(&mut self.context_menu_open);
                 let spell_suggestions = self.spell_menu.as_ref().map(|m| m.suggestions.clone());
+                let in_table = self.context_menu_table;
                 let dict_status = &self.dict_status;
                 let has_selection = menu_state.has_selection;
                 let exporting = self.export_running.clone();
@@ -6231,6 +6244,7 @@ impl ApplicationHandler<WritEvent> for App {
                                 context_menu_open,
                                 has_selection,
                                 spell_suggestions.as_deref(),
+                                in_table,
                             )
                         {
                             picked = Some(cmd);
@@ -7225,7 +7239,7 @@ mod tests {
     }
 
     #[test]
-    fn table_reveal_does_not_turn_click_jitter_into_selection() {
+    fn table_click_jitter_does_not_turn_into_selection() {
         let text = "Intro\n\n| Name | Value |\n| --- | --- |\n| Alpha | One |\n| Beta | Two |\n";
         let mut engine = test_doc_engine(text);
         let (w, vh, scale) = (800.0, 600.0, 1.0);
@@ -7239,14 +7253,16 @@ mod tests {
         assert_eq!(engine.editor.line_of(clicked), 4);
         engine.editor.click(clicked, false, 1);
         engine.refresh(w, scale, vh);
-        assert_ne!(
+        // The grid stays up with the caret in a cell, so the pointer is still over the
+        // clicked spot.
+        assert_eq!(
             engine
                 .doc
                 .as_ref()
                 .unwrap()
                 .hit_test(position.0, position.1),
             Some(clicked),
-            "revealing raw table text should move a different offset under the pointer"
+            "clicking into a table keeps its grid layout"
         );
 
         let mut drag = SelectionDrag::new(position, scale);

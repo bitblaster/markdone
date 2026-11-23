@@ -3,6 +3,7 @@
 //! one place, so a menu entry and its shortcut cannot drift apart.
 
 use crate::format::{Block, Inline};
+use crate::table_edit::TableOp;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -42,6 +43,8 @@ pub enum Command {
     SpellReplace(usize),
     /// Add the misspelled word of the context menu to the personal dictionary.
     SpellAddWord,
+    /// A structural edit of the table at the caret (context menu → Table).
+    Table(TableOp),
     Preferences,
     Find,
     Replace,
