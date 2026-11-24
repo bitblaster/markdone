@@ -690,13 +690,11 @@ impl BufferContent {
         }
 
         // Apply corrections in reverse order to preserve byte offsets. Each marker
-        // rewrite is fed to `tree.edit` so the follow-up parse stays incremental.
-        for (marker_range, correct_number, is_parenthesis) in corrections.into_iter().rev() {
-            let new_marker = if is_parenthesis {
-                format!("{correct_number}) ")
-            } else {
-                format!("{correct_number}. ")
-            };
+        // rewrite is fed to `tree.edit` so the follow-up parse stays incremental. Only
+        // the digits change: the delimiter and the spacing after it (an aligned
+        // `1.  item` whose continuation lines are indented to match) stay as written.
+        for (marker_range, correct_number, _) in corrections.into_iter().rev() {
+            let new_marker = correct_number.to_string();
             let new_len = new_marker.len();
 
             let start_point = self.byte_to_point(marker_range.start);
@@ -742,16 +740,19 @@ impl BufferContent {
         corrections: &mut Vec<(Range<usize>, usize, bool)>,
     ) {
         if node.kind() == "list" && self.is_ordered_list(node) {
-            let mut item_number = 1;
+            // A list counts on from its first number (CommonMark lets it start anywhere,
+            // e.g. `4.` resuming after a code block).
+            let mut next: Option<usize> = None;
             for child in node.children(&mut node.walk()) {
                 if child.kind() == "list_item"
                     && let Some((marker_range, current_number, is_parenthesis)) =
                         self.extract_ordered_marker(&child)
                 {
+                    let item_number = *next.get_or_insert(current_number);
                     if current_number != item_number {
                         corrections.push((marker_range, item_number, is_parenthesis));
                     }
-                    item_number += 1;
+                    next = Some(item_number + 1);
                 }
             }
         }
@@ -772,7 +773,8 @@ impl BufferContent {
         false
     }
 
-    /// Extract ordered list marker info: (range, current_number, is_parenthesis_style)
+    /// Extract ordered list marker info: (range of the number's digits, current_number,
+    /// is_parenthesis_style).
     fn extract_ordered_marker(
         &self,
         list_item: &tree_sitter::Node,
@@ -788,14 +790,15 @@ impl BufferContent {
                 let char_end = self.text.byte_to_char(end);
                 let slice = self.text.slice(char_start..char_end);
 
-                let number: usize = slice
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse()
-                    .unwrap_or(1);
+                let text = slice.to_string();
+                let lead = text.len() - text.trim_start().len();
+                let digits = text[lead..]
+                    .bytes()
+                    .take_while(|b| b.is_ascii_digit())
+                    .count();
+                let number: usize = text[lead..lead + digits].parse().ok()?;
 
-                return Some((start..end, number, is_parenthesis));
+                return Some((start + lead..start + lead + digits, number, is_parenthesis));
             }
         }
         None
@@ -1632,11 +1635,38 @@ mod tests {
         assert_eq!(buf.text(), "1. a\n2. b\n", "merged lists renumber");
 
         // A malformed list (2., 5.) brought to byte 0 by a leading-paragraph delete:
-        // the offset-0 descendant must still resolve into the list.
+        // the offset-0 descendant must still resolve into the list, which counts on
+        // from its first number.
         let mut buf2: Buffer = "x\n\n2. a\n5. b\n".parse().unwrap();
         let end = buf2.text().find("2. a").unwrap();
         buf2.delete(0..end, 0);
-        assert_eq!(buf2.text(), "1. a\n2. b\n", "list at offset 0 renumbers");
+        assert_eq!(buf2.text(), "2. a\n3. b\n", "list at offset 0 renumbers");
+    }
+
+    /// Renumbering changes the digits only: a list keeps its first number (one may
+    /// resume after a code block), and an aligned marker keeps its spacing, which its
+    /// continuation lines are indented to.
+    #[test]
+    fn renumbering_keeps_start_and_spacing() {
+        let mut buf: Buffer = "3. a\n9. b\n".parse().unwrap();
+        let off = buf.text().find('a').unwrap() + 1;
+        buf.insert(off, "X", off);
+        assert_eq!(buf.text(), "3. aX\n4. b\n");
+
+        let text = "1.  one\n    more of one\n2.  two\n";
+        let mut buf: Buffer = text.parse().unwrap();
+        let at = text.find("2.").unwrap();
+        buf.insert(at, "1.  new\n", at);
+        assert_eq!(
+            buf.text(),
+            "1.  one\n    more of one\n2.  new\n3.  two\n",
+            "spacing after the numbers is kept"
+        );
+        let mut buf: Buffer = "9)   a\n9)   b\n".parse().unwrap();
+        buf.insert(0, "", 0);
+        let off = buf.text().find('b').unwrap();
+        buf.insert(off, "X", off);
+        assert_eq!(buf.text(), "9)   a\n10)   Xb\n");
     }
 
     #[test]
