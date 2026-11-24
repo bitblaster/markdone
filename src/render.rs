@@ -18,7 +18,7 @@ use vello::peniko::Color;
 use crate::buffer::RenderSnapshot;
 use crate::editor::EditorTheme;
 use crate::inline::{MathSpan, StyledRegion, TextStyle};
-use crate::marker::MarkerKind;
+use crate::marker::{LineMarkers, MarkerKind};
 use crate::segment_map::{SegmentMap, Special};
 use crate::table::RowKind;
 use crate::text_engine::{StyleRun, peniko_color};
@@ -57,6 +57,9 @@ pub struct InlineImageRef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InlineCheckboxRef {
     pub checked: bool,
+    /// An invisible stand-in reserving a checkbox's width (see [`indent_ghosts`]): it
+    /// paints nothing and isn't clickable.
+    pub ghost: bool,
     /// Display byte offset of the collapsed checkbox's zero-width point.
     pub display_offset: usize,
 }
@@ -374,8 +377,15 @@ pub fn build_line_render(
     // Inline images collected during the specials pass: (buffer offset of the collapsed
     // `![alt](url)` span, url, alt). Resolved to display offsets once the map is built.
     let mut inline_image_specs: Vec<(usize, String, String)> = Vec::new();
-    // Task-item checkboxes collapsed to an inline box: (buffer offset of `[`, checked).
-    let mut inline_checkbox_specs: Vec<(usize, bool)> = Vec::new();
+    // Task-item checkboxes collapsed to an inline box: (buffer offset of `[`, checked,
+    // ghost).
+    let mut inline_checkbox_specs: Vec<(usize, bool, bool)> = Vec::new();
+    // Indentation drawn as the (invisible) markers it sits under, so text lines up.
+    let ghosts = if is_grid_table || in_code_block {
+        Vec::new()
+    } else {
+        indent_ghosts(snapshot, line_idx, &markers)
+    };
     if is_grid_table {
         // Grid mode: hide the whole line; the draw path paints the cell grid instead.
         if line_end > line_start {
@@ -423,7 +433,7 @@ pub fn build_line_render(
                     let start = marker.range.start;
                     if start >= line_start && start + 3 <= line_end {
                         specials.push(Special::Hidden(start..start + 3));
-                        inline_checkbox_specs.push((start, *checked));
+                        inline_checkbox_specs.push((start, *checked, false));
                     }
                     None
                 }
@@ -436,6 +446,30 @@ pub fn build_line_render(
                 specials.push(Special::Collapsed {
                     buffer: marker.range.clone(),
                     display: display.to_string(),
+                });
+            }
+        }
+        for g in &ghosts {
+            if g.checkbox {
+                // The marker on the first byte, then the box and the space after it.
+                let a = g.range.start;
+                specials.push(if g.marker.is_empty() {
+                    Special::Hidden(a..a + 1)
+                } else {
+                    Special::Collapsed {
+                        buffer: a..a + 1,
+                        display: g.marker.clone(),
+                    }
+                });
+                specials.push(Special::Collapsed {
+                    buffer: a + 1..g.range.end,
+                    display: " ".to_string(),
+                });
+                inline_checkbox_specs.push((a + 1, false, true));
+            } else {
+                specials.push(Special::Collapsed {
+                    buffer: g.range.clone(),
+                    display: g.marker.clone(),
                 });
             }
         }
@@ -532,8 +566,9 @@ pub fn build_line_render(
     inline_math.sort_by_key(|m| m.display_offset);
     let inline_checkboxes: Vec<InlineCheckboxRef> = inline_checkbox_specs
         .into_iter()
-        .map(|(buffer_start, checked)| InlineCheckboxRef {
+        .map(|(buffer_start, checked, ghost)| InlineCheckboxRef {
             checked,
+            ghost,
             display_offset: map.buffer_to_display(buffer_start),
         })
         .collect();
@@ -646,6 +681,14 @@ pub fn build_line_render(
         }
     }
 
+    // The indent's stand-in markers take up their width but don't show.
+    for g in &ghosts {
+        let r = map.buffer_range_to_display(g.range.clone());
+        if !r.is_empty() {
+            runs.push(StyleRun::new(r, Color::TRANSPARENT));
+        }
+    }
+
     // Revealed math: overlay LaTeX-token colors on the raw source (mono, on top of the
     // base runs). Routed through the same `latex` tokenizer + theme color map as a
     // ```latex code fence, so revealed inline/block math reads like the other languages.
@@ -709,6 +752,122 @@ pub fn build_line_render(
         misspelled,
         table: table_ref,
     }
+}
+
+/// A run of a line's indentation drawn as the marker of the list item it sits under.
+struct IndentGhost {
+    /// The indentation's buffer bytes, as wide in the source as the item's marker.
+    range: Range<usize>,
+    /// The marker as the item's line shows it (`• `, `2. `; empty for a task's `- `).
+    marker: String,
+    /// The item is a task: its checkbox (and the space after it) follows the marker.
+    checkbox: bool,
+}
+
+/// How many lines up [`indent_ghosts`] looks for the items a line's indentation sits
+/// under: a bound on the per-line cost for very long items.
+const GHOST_SCAN_LINES: usize = 200;
+
+/// The source indents a list item's continuation lines and nested items with spaces,
+/// as many as its marker's characters, but the rendered marker (a bullet, a number in a
+/// proportional font, a drawn checkbox) is wider or narrower than those spaces. So each
+/// run of indentation under an item's marker is drawn as that marker, invisible: the
+/// text below an item lines up with the item's. Indentation under no item (or not
+/// matching its marker's width) stays as plain spaces.
+fn indent_ghosts(
+    snapshot: &RenderSnapshot,
+    line_idx: usize,
+    markers: &LineMarkers,
+) -> Vec<IndentGhost> {
+    let line_start = markers.range.start;
+    let indents: Vec<&Range<usize>> = markers
+        .markers
+        .iter()
+        .filter(|m| matches!(m.kind, MarkerKind::Indent))
+        .map(|m| &m.range)
+        .collect();
+    let Some(end) = indents.iter().map(|r| r.end).max() else {
+        return Vec::new();
+    };
+    // The indentation run ending where the content (or a nested item's marker) starts.
+    let mut start = end;
+    while let Some(r) = indents.iter().find(|r| r.end == start && r.start < start) {
+        start = r.start;
+    }
+    let lo = start - line_start;
+    let mut need = end - line_start;
+    let mut ghosts = Vec::new();
+    let mut j = line_idx;
+    let floor = line_idx.saturating_sub(GHOST_SCAN_LINES);
+    'scan: while need > lo && j > floor {
+        j -= 1;
+        let above = snapshot.line_markers(j);
+        let a0 = above.range.start;
+        // The items on that line whose text starts at column `need`, innermost first.
+        loop {
+            let owner = above.markers.iter().find_map(|m| {
+                let MarkerKind::ListItem {
+                    ordered,
+                    unordered_marker,
+                    ..
+                } = &m.kind
+                else {
+                    return None;
+                };
+                let checkbox_end = above
+                    .markers
+                    .iter()
+                    .find(|c| {
+                        matches!(c.kind, MarkerKind::Checkbox { .. })
+                            && c.range.start == m.range.end
+                    })
+                    .map(|c| c.range.end - a0);
+                (m.range.end - a0 == need || checkbox_end == Some(need)).then(|| {
+                    let marker = if *ordered {
+                        snapshot.rope.byte_slice(m.range.clone()).to_string()
+                    } else if checkbox_end.is_some() {
+                        String::new()
+                    } else {
+                        unordered_marker.map_or("• ", |u| u.bullet()).to_string()
+                    };
+                    (m.range.start - a0, marker, checkbox_end.is_some())
+                })
+            });
+            let Some((ls, marker, checkbox)) = owner else {
+                break;
+            };
+            if ls < lo || need - ls < 2 {
+                break 'scan;
+            }
+            ghosts.push(IndentGhost {
+                range: line_start + ls..line_start + need,
+                marker,
+                checkbox,
+            });
+            need = ls;
+            if need <= lo {
+                break 'scan;
+            }
+        }
+        // A line with text left of `need` ends the items `need` could sit under (blank
+        // lines, and the items' own continuation lines, don't).
+        let first = above
+            .markers
+            .iter()
+            .filter(|m| !matches!(m.kind, MarkerKind::Indent | MarkerKind::BlockQuote))
+            .map(|m| m.range.start)
+            .min()
+            .unwrap_or_else(|| above.content_start());
+        let blank = snapshot
+            .rope
+            .byte_slice(first.min(above.range.end)..above.range.end)
+            .chars()
+            .all(char::is_whitespace);
+        if !blank && first - a0 < need {
+            break;
+        }
+    }
+    ghosts
 }
 
 /// The display ranges of the line's misspelled words (see [`crate::spelling`]). Code,
@@ -818,6 +977,26 @@ pub fn build_cell_render(
             push_region_specials(&mut specials, r);
         }
     }
+    // Line breaks (`<br>`) show as one, in the caret's cell too: outside code, and not
+    // inside another region's hidden syntax.
+    let line_breaks: Vec<Range<usize>> = crate::table::line_breaks(&cell_text)
+        .into_iter()
+        .map(|r| start + r.start..start + r.end)
+        .filter(|br| {
+            regions.iter().all(|r| {
+                let inside = |a: &Range<usize>| a.start < br.end && br.start < a.end;
+                !(r.style.code && inside(&r.full_range))
+                    && !inside(&(r.full_range.start..r.content_range.start))
+                    && !inside(&(r.content_range.end..r.full_range.end))
+            })
+        })
+        .collect();
+    for br in &line_breaks {
+        specials.push(Special::Collapsed {
+            buffer: br.clone(),
+            display: "\n".to_string(),
+        });
+    }
     let (text, map) = SegmentMap::build(&cell_text, start, &specials);
 
     let fg = peniko_color(theme.foreground);
@@ -852,8 +1031,17 @@ pub fn build_cell_render(
         }
         runs.push(run);
     }
+    // A `<br>` glued to a word would make the checker skip the word (a token holding a
+    // `<` isn't prose): blank the tags out, keeping every byte where it is.
+    let mut spell_text = cell_text.clone();
+    for br in &line_breaks {
+        spell_text.replace_range(
+            br.start - start..br.end - start,
+            &" ".repeat(br.end - br.start),
+        );
+    }
     let misspelled = spelling_marks(
-        &cell_text,
+        &spell_text,
         start,
         regions.iter().copied(),
         &[],
@@ -990,6 +1178,66 @@ mod tests {
         assert!(editing.inline_checkboxes.is_empty());
     }
 
+    /// Indentation under a list item draws as the item's marker, invisible, so the text
+    /// of continuation lines and nested items lines up with the item's text.
+    #[test]
+    fn indentation_under_an_item_draws_as_its_marker() {
+        let theme = EditorTheme::dracula();
+        let text = "- a\n  b\n  - c\n    d\n10. e\n    f\n- [ ] g\n  h\nplain\n  i\n";
+        let mut buf: Buffer = text.parse().unwrap();
+        let snap = buf.render_snapshot();
+        let line = |i: usize| {
+            build_line_render(
+                &snap,
+                i,
+                &theme,
+                18.0,
+                usize::MAX,
+                &[],
+                &[],
+                None,
+                &[],
+                &[],
+                None,
+            )
+        };
+        let hidden = |lr: &LineRender| {
+            lr.runs
+                .iter()
+                .filter(|r| r.color == Color::TRANSPARENT)
+                .map(|r| r.range.clone())
+                .collect::<Vec<_>>()
+        };
+        let b = line(1);
+        assert_eq!(b.text, "• b");
+        assert_eq!(hidden(&b), vec![0.."• ".len()]);
+        assert_eq!(b.content_start, line(0).content_start);
+        assert_eq!(
+            line(2).text,
+            "• • c",
+            "a nested item under its parent's text"
+        );
+        let d = line(3);
+        assert_eq!(d.text, "• • d");
+        assert_eq!(hidden(&d).len(), 2);
+        assert_eq!(line(5).text, "10. f", "under a number, the number");
+        let h = line(7);
+        assert_eq!(h.text, " h", "under a task, its box and space");
+        assert_eq!(
+            h.inline_checkboxes,
+            [InlineCheckboxRef {
+                checked: false,
+                ghost: true,
+                display_offset: 0
+            }]
+        );
+        assert_eq!(
+            line(9).text,
+            "  i",
+            "indentation under no item stays spaces"
+        );
+    }
+
     /// A completed task dims its content (muted, spanning the line) while its checkbox
     /// is drawn; an active task's content is not dimmed.
     #[test]
@@ -1022,6 +1270,7 @@ mod tests {
             done.inline_checkboxes,
             [InlineCheckboxRef {
                 checked: true,
+                ghost: false,
                 display_offset: 0
             }],
             "the checkbox is drawn, at the start of the line"

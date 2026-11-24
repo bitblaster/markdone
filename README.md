@@ -138,12 +138,17 @@ through short lines.
 
 List markers become bullets, ordered lists renumber as you edit, and task lists render
 checkboxes you can click. Blockquotes show a bar instead of `>`. Nesting is fully
-supported.
+supported, and an item's continuation lines and nested items line up under its text.
 
-Enter inserts a plain newline. Shift+Enter continues the current list or quote
-(`- item` → a new `- `), Shift+Alt+Enter adds an indented continuation paragraph. Tab
-cycles through the nesting states that fit the context (sibling item, paragraph indent,
-nested item); Shift+Tab goes back.
+Enter works as in a word processor: in a list or quote it starts the next item (`- item`
+→ a new `- `, `2.` → `3.`, a task → an unchecked box), and on an empty item it ends the
+list or quote instead; amid a list, that splits it, and the items after the text you write
+there start over from 1. (A numbered list right under a paragraph always starts at 1, the
+only number CommonMark lets interrupt a paragraph; after a blank line it may start
+anywhere.) Shift+Enter goes to a new line in the same item, indented under its
+text, without a new marker. In a code block Enter keeps the indentation. Tab cycles
+through the nesting states that fit the context (sibling item, paragraph indent, nested
+item); Shift+Tab goes back.
 
 ### Callouts
 
@@ -173,12 +178,16 @@ sources. In a code block Tab indents.
 Pipe tables render as a grid with a bold header, column alignment (`:--`, `:-:`, `--:`)
 and inline styles in the cells, and stay a grid while you edit them, as in a word
 processor: the cell with the cursor shows its Markdown source, the arrows move within and
-between cells, Tab goes to the next cell (adding a row after the last one) and Enter to the
-cell below. A `|` typed in a cell is escaped, so it can't split the table. Columns keep
-their header on one line whenever the table fits. The context menu's *Table* submenu
-clears or deletes the table, inserts and deletes rows and columns, and aligns a column;
-it rewrites the table with its columns lined up in the source. Type a header row such as
-`| Name | Age |` and press Shift+Enter to add the delimiter and a body row.
+between cells, Tab goes to the next cell (adding a row after the last one) and Ctrl+Enter
+to the cell below (adding a row after the last one). Enter starts a new line inside the
+cell: a table row is a single line of Markdown, so the break is written as `<br>`, shown
+as a line break and stepped over or deleted as one character. A `|` typed in a cell is
+escaped, so it can't split the table. A cell holds inline text only, so the paragraph
+styles (headings, lists, quotes) and code blocks are off there. Columns keep their header
+on one line whenever the table fits. The context menu's *Table* submenu clears or deletes
+the table, inserts and deletes rows and columns, and aligns a column; it rewrites the
+table with its columns lined up in the source. Type a header row such as `| Name | Age |`
+and press Enter to add the delimiter and a body row.
 
 ### Mermaid diagrams
 
@@ -340,7 +349,7 @@ links), walked through a unified cursor.
 
 Each line carries the markers of its block syntax (a task item in a blockquote has
 `[Checkbox, BlockQuote]`), each knowing the bytes to hide when the cursor is away, its
-visual substitution (`-` becomes `•`) and its continuation for Shift+Enter. Lines are laid
+visual substitution (`-` becomes `•`) and its continuation for Enter. Lines are laid
 out independently with Parley, hiding or showing markers depending on the cursor; a
 per-line map between the displayed text and the buffer offsets keeps cursor placement,
 hit-testing and diff highlights aligned.

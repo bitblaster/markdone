@@ -21,6 +21,9 @@ pub struct MenuState {
     pub recent: Vec<(String, String)>,
     /// The document has a selection (Cut / Copy enabled).
     pub has_selection: bool,
+    /// The caret is in a table: paragraph styles and block inserts are off (a table
+    /// cell holds inline text only).
+    pub in_table: bool,
 }
 
 /// Lay out the menu bar in a top panel; returns the command picked this frame, if any.
@@ -86,7 +89,7 @@ pub fn menu_bar(ui: &mut egui::Ui, state: &MenuState) -> Option<Command> {
                     );
                     titles.push(
                         ui.menu_button("Format", |ui| {
-                            format_items(ui, &mut picked);
+                            format_items(ui, &mut picked, state.in_table);
                         })
                         .response,
                     );
@@ -160,7 +163,10 @@ fn item(ui: &mut egui::Ui, label: &str, cmd: Command, enabled: bool, picked: &mu
 }
 
 /// The Text / Paragraph / Insert submenus (the Format menu and the context menu).
-pub fn format_items(ui: &mut egui::Ui, picked: &mut Option<Command>) {
+/// `in_table`: the caret is in a table, whose cells hold inline text only, so the
+/// paragraph styles and the code block (which would break the row) are off.
+pub fn format_items(ui: &mut egui::Ui, picked: &mut Option<Command>, in_table: bool) {
+    let blocks = !in_table;
     ui.menu_button("Text", |ui| {
         for (label, style) in [
             ("Bold", Inline::Bold),
@@ -173,14 +179,14 @@ pub fn format_items(ui: &mut egui::Ui, picked: &mut Option<Command>) {
         }
     });
     ui.menu_button("Paragraph", |ui| {
-        item(ui, "Normal", Command::Block(Block::Normal), true, picked);
+        item(ui, "Normal", Command::Block(Block::Normal), blocks, picked);
         for level in 1..=5u8 {
             let label = format!("Heading {level}");
             item(
                 ui,
                 &label,
                 Command::Block(Block::Heading(level)),
-                true,
+                blocks,
                 picked,
             );
         }
@@ -189,22 +195,22 @@ pub fn format_items(ui: &mut egui::Ui, picked: &mut Option<Command>) {
             ui,
             "Bulleted List",
             Command::Block(Block::Bulleted),
-            true,
+            blocks,
             picked,
         );
         item(
             ui,
             "Numbered List",
             Command::Block(Block::Numbered),
-            true,
+            blocks,
             picked,
         );
-        item(ui, "Quote", Command::Block(Block::Quote), true, picked);
+        item(ui, "Quote", Command::Block(Block::Quote), blocks, picked);
     });
     ui.menu_button("Insert", |ui| {
         item(ui, "Link", Command::InsertLink, true, picked);
         item(ui, "Image…", Command::InsertImage, true, picked);
-        item(ui, "Code Block", Command::InsertCodeBlock, true, picked);
+        item(ui, "Code Block", Command::InsertCodeBlock, blocks, picked);
         item(ui, "Footnote", Command::InsertFootnote, true, picked);
     });
 }
@@ -273,7 +279,7 @@ pub fn context_menu(
             &mut picked,
         );
         ui.separator();
-        format_items(ui, &mut picked);
+        format_items(ui, &mut picked, in_table);
         if in_table {
             ui.separator();
             table_items(ui, &mut picked);

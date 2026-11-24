@@ -2793,6 +2793,11 @@ impl App {
                 self.apply_format(crate::format::toggle_inline(&text, sel, style));
                 return;
             }
+            // A table cell holds inline text only: a paragraph style or a code block
+            // there would rewrite the row's line and break the table.
+            Command::Block(_) | Command::InsertCodeBlock if self.doc_engine.editor.in_table() => {
+                return;
+            }
             Command::Block(block) => {
                 let (text, sel) = self.text_and_selection();
                 self.apply_format(crate::format::set_block(&text, sel, block));
@@ -3555,10 +3560,11 @@ fn apply_key(
     let to_boundary = mac && modifiers.super_key();
     match &event.logical_key {
         Key::Named(NamedKey::Enter) => {
-            if shift && alt {
-                editor.shift_alt_enter();
-            } else if shift {
+            // Shift+Alt+Enter was the indented continuation that Shift+Enter now is.
+            if shift {
                 editor.shift_enter();
+            } else if ctrl || (mac && modifiers.super_key()) {
+                editor.ctrl_enter();
             } else {
                 editor.enter();
             }
@@ -6143,6 +6149,7 @@ impl ApplicationHandler<WritEvent> for App {
                     dark_mode: self.prefs.effective_mode(self.system_theme) == ThemeMode::Dark,
                     has_file: self.doc_engine.editor.file_path().is_some(),
                     has_selection: self.doc_engine.editor.selection_range().is_some(),
+                    in_table: self.doc_engine.editor.in_table(),
                     tab_count: self.tabs.len(),
                     recent: self
                         .session

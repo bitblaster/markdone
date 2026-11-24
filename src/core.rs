@@ -539,8 +539,8 @@ impl Editor {
         self.edit(|s| s.shift_enter());
     }
 
-    pub fn shift_alt_enter(&mut self) {
-        self.edit(|s| s.shift_alt_enter());
+    pub fn ctrl_enter(&mut self) {
+        self.edit(|s| s.ctrl_enter());
     }
 
     pub fn tab(&mut self) {

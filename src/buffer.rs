@@ -644,8 +644,13 @@ impl BufferContent {
         }
 
         // Renumbering only matters when the edit lands inside an ordered list, which
-        // is the uncommon case — skip the tree walk + reparse otherwise.
-        if self.edit_in_ordered_list(offset, offset + insert_len) {
+        // is the uncommon case — skip the tree walk + reparse otherwise. Or right above
+        // one: a paragraph there sets the number it starts with.
+        let next_line = self.byte_to_line(offset + insert_len) + 1;
+        let below = (next_line < self.line_count()).then(|| self.line_to_byte(next_line));
+        if self.edit_in_ordered_list(offset, offset + insert_len)
+            || below.is_some_and(|b| self.edit_in_ordered_list(b, b))
+        {
             self.normalize_ordered_lists();
         }
         if !self.suspend_caches {
@@ -741,8 +746,9 @@ impl BufferContent {
     ) {
         if node.kind() == "list" && self.is_ordered_list(node) {
             // A list counts on from its first number (CommonMark lets it start anywhere,
-            // e.g. `4.` resuming after a code block).
-            let mut next: Option<usize> = None;
+            // e.g. `4.` resuming after a code block), except right under a paragraph: only
+            // a `1.` may interrupt one, any other number just continues its text.
+            let mut next: Option<usize> = self.interrupts_paragraph(node).then_some(1);
             for child in node.children(&mut node.walk()) {
                 if child.kind() == "list_item"
                     && let Some((marker_range, current_number, is_parenthesis)) =
@@ -760,6 +766,22 @@ impl BufferContent {
         for child in node.children(&mut node.walk()) {
             self.collect_list_corrections(&child, corrections);
         }
+    }
+
+    /// The list starts on the line right after a paragraph's, with no blank line in
+    /// between. The editor's grammar takes it as a list whatever its first number, but
+    /// for CommonMark (and so GitHub, Pandoc, the export) only a list starting at 1 can
+    /// interrupt a paragraph: another number would read as more of the paragraph's text.
+    fn interrupts_paragraph(&self, list: &tree_sitter::Node) -> bool {
+        if list.prev_sibling().is_none_or(|p| p.kind() != "paragraph") {
+            return false;
+        }
+        let line = self.byte_to_line(list.start_byte());
+        if line == 0 {
+            return false;
+        }
+        let above = self.text.line(line - 1);
+        above.chars().any(|c| !c.is_whitespace() && c != '>')
     }
 
     fn is_ordered_list(&self, list_node: &tree_sitter::Node) -> bool {

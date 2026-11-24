@@ -210,6 +210,53 @@ pub fn cell_landing(rope: &Rope, cell: &TableCell) -> usize {
     (open + 1).min(closing.saturating_sub(1)).max(open)
 }
 
+/// The line-break tags a cell's text may hold. A table row is one line of Markdown, so a
+/// cell holds several lines as `<br>` (GitHub, Pandoc and HTML export all read it).
+const LINE_BREAK_TAGS: [&str; 3] = ["<br>", "<br/>", "<br />"];
+
+/// The line breaks (`<br>`, `<br/>`, `<br />`, any case) in a cell's `text`: their byte
+/// ranges, in order.
+pub fn line_breaks(text: &str) -> Vec<Range<usize>> {
+    let lower = text.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = lower[from..].find("<br").map(|i| from + i) {
+        match LINE_BREAK_TAGS.iter().find(|t| lower[i..].starts_with(*t)) {
+            Some(tag) => {
+                out.push(i..i + tag.len());
+                from = i + tag.len();
+            }
+            None => from = i + 3,
+        }
+    }
+    out
+}
+
+/// The line break ending at `off` in `rope`: its start (so the caret and Backspace skip a
+/// `<br>` as the one character it shows as).
+pub fn line_break_before(rope: &Rope, off: usize) -> Option<usize> {
+    let from = off.saturating_sub(6);
+    let tail: Vec<u8> = (from..off.min(rope.len_bytes()))
+        .map(|i| rope.byte(i).to_ascii_lowercase())
+        .collect();
+    LINE_BREAK_TAGS
+        .iter()
+        .find(|t| tail.ends_with(t.as_bytes()))
+        .map(|t| off - t.len())
+}
+
+/// The line break starting at `off` in `rope`: its end.
+pub fn line_break_after(rope: &Rope, off: usize) -> Option<usize> {
+    let to = (off + 6).min(rope.len_bytes());
+    let head: Vec<u8> = (off.min(to)..to)
+        .map(|i| rope.byte(i).to_ascii_lowercase())
+        .collect();
+    LINE_BREAK_TAGS
+        .iter()
+        .find(|t| head.starts_with(t.as_bytes()))
+        .map(|t| off + t.len())
+}
+
 /// The editable extent of `cell` for the caret: its content, or the landing spot of an
 /// empty cell.
 pub fn cell_caret_range(rope: &Rope, cell: &TableCell) -> Range<usize> {

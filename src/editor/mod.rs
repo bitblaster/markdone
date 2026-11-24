@@ -11,7 +11,7 @@ use crate::cursor::{Cursor, Selection, grapheme_column, offset_at_column, prev_g
 use crate::marker::{LineMarkers, MarkerKind, OrderedMarker, UnorderedMarker};
 use crate::table::{
     CellPos, RowKind, TableCell, TableInfo, cell_caret_range, cell_pos_at, grid_ok,
-    row_kind_at_line,
+    line_break_after, line_break_before, row_kind_at_line,
 };
 
 /// Context about the line at the cursor, used by smart editing actions.
@@ -1129,6 +1129,12 @@ impl EditorState {
         match direction {
             Direction::Left => {
                 if off > here.start {
+                    // A `<br>` shows as one line break: step over it whole.
+                    if let Some(br) = line_break_before(self.buffer.rope(), off)
+                        && br >= here.start
+                    {
+                        return Some(br);
+                    }
                     let left = self.cursor().move_left(&self.buffer).offset;
                     return Some(left.max(here.start));
                 }
@@ -1142,6 +1148,11 @@ impl EditorState {
             }
             Direction::Right => {
                 if off < here.end {
+                    if let Some(br) = line_break_after(self.buffer.rope(), off)
+                        && br <= here.end
+                    {
+                        return Some(br);
+                    }
                     let right = self.cursor().move_right(&self.buffer).offset;
                     return Some(right.min(here.end));
                 }
@@ -1238,7 +1249,9 @@ impl EditorState {
         for ch in text.chars() {
             match ch {
                 '\r' => continue,
-                '\n' | '\t' => out.push(' '),
+                // A table row is one line: a line break in a cell is `<br>`.
+                '\n' => out.push_str("<br>"),
+                '\t' => out.push(' '),
                 '|' if !escaped => out.push_str("\\|"),
                 c => out.push(c),
             }
@@ -1644,25 +1657,19 @@ impl EditorState {
         }
     }
 
-    /// Smart enter: creates paragraph break or exits container on empty line.
-    /// Enter: just insert a raw newline. No magic.
+    /// Enter, as word processors and Markdown editors (Zettlr) do it: a new item in a
+    /// list or quote (the next number, an unchecked box), and an empty item or quote line
+    /// ends its list or quote instead; in a code block, the next line keeps the indent; in
+    /// a table cell, a line break inside the cell (`<br>`: a table row is one line). A
+    /// lone pipe-header row becomes a table.
     pub fn enter(&mut self) {
-        if self.grid_enter() {
+        if self.grid_cell_at(self.selection.head).is_some() {
+            self.insert_typed("<br>");
             return;
         }
-        self.insert_text("\n");
-    }
-
-    /// Shift+Enter: continue container (add markers from current line).
-    /// In code blocks, copies leading whitespace for indentation.
-    pub fn shift_enter(&mut self) {
         if self.maybe_create_table() {
             return;
         }
-        if self.maybe_add_table_row() {
-            return;
-        }
-        // In code blocks, copy leading whitespace from current line
         if self.cursor_in_code_block() {
             let indent = self.current_line_leading_whitespace();
             self.insert_text("\n");
@@ -1671,17 +1678,122 @@ impl EditorState {
             }
             return;
         }
-
+        if self.end_empty_container() {
+            return;
+        }
         let Some(ctx) = self.line_context() else {
             self.insert_text("\n");
             return;
         };
-
+        // Before the text (in or ahead of the markers): just move the line down.
+        if self.cursor().offset < ctx.line.content_start() {
+            self.insert_text("\n");
+            return;
+        }
         let continuation = ctx.line.continuation_rope(self.buffer.rope());
         self.insert_text("\n");
         if !continuation.is_empty() {
             self.insert_text(&continuation);
         }
+    }
+
+    /// Enter on a list item or quote line with no text: end it, like a word processor.
+    /// A list item loses its marker (and checkbox), keeping the quotes around it; a bare
+    /// quote line loses its innermost `>`. Returns true if it fired.
+    fn end_empty_container(&mut self) -> bool {
+        let Some(ctx) = self.line_context() else {
+            return false;
+        };
+        let line = &ctx.line;
+        let has_list = line
+            .markers
+            .iter()
+            .any(|m| matches!(m.kind, MarkerKind::ListItem { .. }));
+        // Markers are innermost first: reversed, the quotes in document order.
+        let quotes: Vec<Range<usize>> = line
+            .markers
+            .iter()
+            .rev()
+            .filter(|m| matches!(m.kind, MarkerKind::BlockQuote))
+            .map(|m| m.range.clone())
+            .collect();
+        if !has_list && quotes.is_empty() {
+            return false;
+        }
+        let content_start = line.content_start().min(line.range.end);
+        if !self
+            .buffer
+            .slice_cow(content_start..line.range.end)
+            .trim()
+            .is_empty()
+        {
+            return false;
+        }
+        let keep = if has_list {
+            quotes.len()
+        } else {
+            quotes.len() - 1
+        };
+        let prefix: String = quotes[..keep]
+            .iter()
+            .map(|r| self.buffer.slice_cow(r.clone()).into_owned())
+            .collect();
+        let mut end = line.range.end;
+        if self.buffer.byte_at(end.saturating_sub(1)) == Some(b'\n') {
+            end -= 1;
+        }
+        // A line right after an item continues its paragraph (a "lazy" line): a blank
+        // line before this one makes whatever is typed on it a paragraph of its own. (A
+        // numbered list right under that paragraph then starts over from 1: see
+        // `Buffer::normalize_ordered_lists`.)
+        let idx = self.buffer.byte_to_line(line.range.start);
+        let before = if has_list && idx > 0 && !self.buffer.is_line_empty(idx - 1) {
+            format!("{}\n", prefix.trim_end())
+        } else {
+            String::new()
+        };
+        self.selection = Selection::new(line.range.start, end);
+        self.insert_text(&format!("{before}{prefix}"));
+        let caret = line.range.start + before.len() + prefix.len();
+        self.selection = Selection::new(caret, caret);
+        true
+    }
+
+    /// Shift+Enter: a new line in the same item, without a new marker: under a list
+    /// item's text (indented to it), inside the quote, or a line break in a table cell.
+    pub fn shift_enter(&mut self) {
+        if self.grid_cell_at(self.selection.head).is_some() {
+            self.insert_typed("<br>");
+            return;
+        }
+        let indent = match self.line_context() {
+            Some(ctx) if !self.cursor_in_code_block() => {
+                let has_list = ctx
+                    .line
+                    .markers
+                    .iter()
+                    .any(|m| matches!(m.kind, MarkerKind::ListItem { .. }));
+                if has_list {
+                    ctx.line.nested_paragraph_indent(self.buffer.rope())
+                } else {
+                    ctx.line.continuation_rope(self.buffer.rope())
+                }
+            }
+            _ => String::new(),
+        };
+        self.insert_text("\n");
+        if !indent.is_empty() {
+            self.insert_text(&indent);
+        }
+    }
+
+    /// Ctrl+Enter: in a table, the next row (the same column; a new row after the last
+    /// one); elsewhere, Enter.
+    pub fn ctrl_enter(&mut self) {
+        if self.grid_enter() || self.maybe_add_table_row() {
+            return;
+        }
+        self.enter();
     }
 
     /// Get leading whitespace (spaces/tabs) from the current line.
@@ -1695,41 +1807,6 @@ impl EditorState {
             .chars()
             .take_while(|c| *c == ' ' || *c == '\t')
             .collect()
-    }
-
-    /// Shift+Alt+Enter: create indented continuation (for nested paragraphs).
-    /// For lists: newline + indent (no list marker)
-    /// For blockquotes alone: newline + indent (exits blockquote)
-    /// For nested (e.g. `> - item`): newline + outer markers + indent
-    pub fn shift_alt_enter(&mut self) {
-        let indent = {
-            let Some(ctx) = self.line_context() else {
-                self.insert_text("\n");
-                return;
-            };
-
-            let has_list = ctx
-                .line
-                .markers
-                .iter()
-                .any(|m| matches!(m.kind, MarkerKind::ListItem { .. }));
-            let has_blockquote = ctx
-                .line
-                .markers
-                .iter()
-                .any(|m| matches!(m.kind, MarkerKind::BlockQuote));
-
-            if has_blockquote && !has_list {
-                "  ".to_string()
-            } else {
-                ctx.line.nested_paragraph_indent(self.buffer.rope())
-            }
-        };
-
-        self.insert_text("\n");
-        if !indent.is_empty() {
-            self.insert_text(&indent);
-        }
     }
 
     /// Shift+Tab: cycle backward through nesting states.
@@ -1818,12 +1895,20 @@ impl EditorState {
         let cursor_pos = self.cursor().offset;
 
         // In a grid table's cell, Backspace stops at the cell's start: it never eats a pipe.
+        // A line break (`<br>`) goes whole.
         if let Some((t, pos)) = self.grid_cell_at(cursor_pos)
-            && self
-                .grid_caret_range(t, pos)
-                .is_some_and(|r| cursor_pos <= r.start)
+            && let Some(cell) = self.grid_caret_range(t, pos)
         {
-            return;
+            if cursor_pos <= cell.start {
+                return;
+            }
+            if let Some(br) = line_break_before(self.buffer.rope(), cursor_pos)
+                && br >= cell.start
+            {
+                self.buffer.delete(br..cursor_pos, cursor_pos);
+                self.selection = Selection::new(br, br);
+                return;
+            }
         }
 
         if let Some((marker_range, _is_indent)) = self.backspace_range_with_type(cursor_pos) {
@@ -1874,6 +1959,11 @@ impl EditorState {
             }
         } else if at_cell_end {
             // Nothing to delete within the cell.
+        } else if let Some(br) = line_break_after(self.buffer.rope(), cursor)
+            .filter(|_| self.grid_cell_at(cursor).is_some())
+        {
+            // A line break (`<br>`) in a cell goes whole.
+            self.buffer.delete(cursor..br, cursor);
         } else if self.cursor().offset < self.buffer.len_bytes() {
             let cursor_before = self.cursor().offset;
             let next = self.cursor().move_right(&self.buffer);
@@ -2410,10 +2500,10 @@ mod tests {
     // These test the simplified, non-controlling editing paradigm.
     // ========================================================================
 
-    mod raw_enter_tests {
+    mod enter_tests {
         use super::*;
 
-        // --- Enter: always raw \n ---
+        // --- Enter: a new item, or the end of an empty one (like Zettlr) ---
 
         #[test]
         fn enter_on_paragraph_inserts_newline() {
@@ -2430,45 +2520,119 @@ mod tests {
         }
 
         #[test]
-        fn enter_on_list_item_inserts_newline_no_marker() {
+        fn enter_on_list_item_continues_list() {
             let mut state = editor_with_cursor("- item one|");
             state.enter();
-            assert_editor_eq(&state, "- item one\n|");
+            assert_editor_eq(&state, "- item one\n- |");
         }
 
         #[test]
-        fn enter_on_blockquote_inserts_newline_no_marker() {
+        fn enter_on_numbered_item_continues_with_next_number() {
+            let mut state = editor_with_cursor("1. one\n2. two|");
+            state.enter();
+            assert_editor_eq(&state, "1. one\n2. two\n3. |");
+        }
+
+        #[test]
+        fn enter_on_task_continues_with_unchecked_box() {
+            let mut state = editor_with_cursor("- [x] done|");
+            state.enter();
+            assert_editor_eq(&state, "- [x] done\n- [ ] |");
+        }
+
+        #[test]
+        fn enter_mid_item_splits_it() {
+            let mut state = editor_with_cursor("- one|two");
+            state.enter();
+            assert_editor_eq(&state, "- one\n- |two");
+        }
+
+        #[test]
+        fn enter_before_the_marker_moves_the_item_down() {
+            let mut state = editor_with_cursor("x\n|- item");
+            state.enter();
+            assert_editor_eq(&state, "x\n\n|- item");
+        }
+
+        #[test]
+        fn enter_on_blockquote_continues_blockquote() {
             let mut state = editor_with_cursor("> quote|");
             state.enter();
-            assert_editor_eq(&state, "> quote\n|");
+            assert_editor_eq(&state, "> quote\n> |");
         }
 
         #[test]
-        fn enter_on_nested_container_inserts_newline_no_markers() {
+        fn enter_on_nested_container_continues_all() {
             let mut state = editor_with_cursor("> - item|");
             state.enter();
-            assert_editor_eq(&state, "> - item\n|");
+            assert_editor_eq(&state, "> - item\n> - |");
         }
 
         #[test]
-        fn enter_on_empty_list_item_inserts_newline_keeps_marker() {
+        fn enter_on_empty_list_item_ends_the_list() {
             let mut state = editor_with_cursor("- item one\n- |");
             state.enter();
-            assert_editor_eq(&state, "- item one\n- \n|");
+            assert_editor_eq(&state, "- item one\n\n|");
         }
 
         #[test]
-        fn enter_on_empty_blockquote_inserts_newline_keeps_marker() {
+        fn enter_on_empty_task_ends_the_list() {
+            let mut state = editor_with_cursor("- [ ] a\n- [ ] |");
+            state.enter();
+            assert_editor_eq(&state, "- [ ] a\n\n|");
+        }
+
+        #[test]
+        fn enter_on_empty_item_in_quote_keeps_the_quote() {
+            let mut state = editor_with_cursor("> - a\n> - |");
+            state.enter();
+            assert_editor_eq(&state, "> - a\n>\n> |");
+        }
+
+        /// Ending an item amid a list splits it: text typed on the line left is a
+        /// paragraph, and the items after it a list of their own, starting over from 1
+        /// (the only number a list right under a paragraph may start with).
+        #[test]
+        fn enter_on_empty_item_mid_list_splits_the_list() {
+            let mut state = editor_with_cursor("1. a\n2. |\n3. c\n4. d\n");
+            state.enter();
+            assert_editor_eq(&state, "1. a\n\n|\n2. c\n3. d\n");
+            state.insert_typed("x");
+            assert_editor_eq(&state, "1. a\n\nx|\n1. c\n2. d\n");
+            // Another number under the paragraph goes back to 1.
+            let at = state.buffer.text().find("1. c").unwrap();
+            state.selection = Selection::new(at, at + 1);
+            state.insert_typed("5");
+            assert_eq!(state.buffer.text(), "1. a\n\nx\n1. c\n2. d\n");
+            // After a blank line, a list may start anywhere.
+            let at = state.buffer.text().find("1. c").unwrap();
+            state.selection = Selection::new(at, at);
+            state.insert_text("\n");
+            assert_eq!(state.buffer.text(), "1. a\n\nx\n\n1. c\n2. d\n");
+            state.selection = Selection::new(at + 1, at + 2);
+            state.insert_typed("5");
+            assert_eq!(state.buffer.text(), "1. a\n\nx\n\n5. c\n6. d\n");
+        }
+
+        #[test]
+        fn enter_on_empty_item_after_a_blank_line_adds_no_other() {
+            let mut state = editor_with_cursor("- a\n\n- |");
+            state.enter();
+            assert_editor_eq(&state, "- a\n\n|");
+        }
+
+        #[test]
+        fn enter_on_empty_blockquote_line_ends_the_quote() {
             let mut state = editor_with_cursor("> quote one\n> |");
             state.enter();
-            assert_editor_eq(&state, "> quote one\n> \n|");
+            assert_editor_eq(&state, "> quote one\n|");
         }
 
         #[test]
-        fn enter_in_code_block_inserts_newline() {
-            let mut state = editor_with_cursor("```rust\nlet x = 1;|");
+        fn enter_in_code_block_keeps_indent() {
+            let mut state = editor_with_cursor("```rust\n    let x = 1;|\n```");
             state.enter();
-            assert_editor_eq(&state, "```rust\nlet x = 1;\n|");
+            assert_editor_eq(&state, "```rust\n    let x = 1;\n    |\n```");
         }
 
         #[test]
@@ -2486,27 +2650,34 @@ mod tests {
             assert_editor_eq(&state, "First sentence.\nSecond sentence.\n|");
         }
 
-        // --- Shift+Enter: continue container ---
+        // --- Shift+Enter: a new line in the same item, no marker ---
 
         #[test]
-        fn shift_enter_on_list_item_continues_list() {
+        fn shift_enter_on_list_item_indents_under_its_text() {
             let mut state = editor_with_cursor("- item one|");
             state.shift_enter();
-            assert_editor_eq(&state, "- item one\n- |");
+            assert_editor_eq(&state, "- item one\n  |");
         }
 
         #[test]
-        fn shift_enter_on_blockquote_continues_blockquote() {
+        fn shift_enter_on_numbered_item_indents_under_its_text() {
+            let mut state = editor_with_cursor("1. item|");
+            state.shift_enter();
+            assert_editor_eq(&state, "1. item\n   |");
+        }
+
+        #[test]
+        fn shift_enter_on_nested_container_stays_inside() {
+            let mut state = editor_with_cursor("> - item|");
+            state.shift_enter();
+            assert_editor_eq(&state, "> - item\n>   |");
+        }
+
+        #[test]
+        fn shift_enter_on_blockquote_stays_in_the_quote() {
             let mut state = editor_with_cursor("> quote|");
             state.shift_enter();
             assert_editor_eq(&state, "> quote\n> |");
-        }
-
-        #[test]
-        fn shift_enter_on_nested_container_continues_all() {
-            let mut state = editor_with_cursor("> - item|");
-            state.shift_enter();
-            assert_editor_eq(&state, "> - item\n> - |");
         }
 
         #[test]
@@ -2517,40 +2688,19 @@ mod tests {
         }
 
         #[test]
-        fn shift_enter_on_heading_just_inserts_newline() {
-            let mut state = editor_with_cursor("# Hello|");
+        fn shift_enter_in_code_block_just_inserts_newline() {
+            let mut state = editor_with_cursor("```\n  code|");
             state.shift_enter();
-            assert_editor_eq(&state, "# Hello\n|");
+            assert_editor_eq(&state, "```\n  code\n|");
         }
 
-        // --- Shift+Alt+Enter: indented continuation ---
+        // --- Ctrl+Enter: Enter outside tables ---
 
         #[test]
-        fn shift_alt_enter_on_list_item_creates_indent() {
-            let mut state = editor_with_cursor("- item one|");
-            state.shift_alt_enter();
-            assert_editor_eq(&state, "- item one\n  |");
-        }
-
-        #[test]
-        fn shift_alt_enter_on_blockquote_creates_indent_outside() {
-            let mut state = editor_with_cursor("> quote|");
-            state.shift_alt_enter();
-            assert_editor_eq(&state, "> quote\n  |");
-        }
-
-        #[test]
-        fn shift_alt_enter_on_nested_container_creates_indent_inside() {
-            let mut state = editor_with_cursor("> - item|");
-            state.shift_alt_enter();
-            assert_editor_eq(&state, "> - item\n>   |");
-        }
-
-        #[test]
-        fn shift_alt_enter_on_paragraph_just_inserts_newline() {
-            let mut state = editor_with_cursor("Hello world|");
-            state.shift_alt_enter();
-            assert_editor_eq(&state, "Hello world\n|");
+        fn ctrl_enter_outside_tables_is_enter() {
+            let mut state = editor_with_cursor("- item|");
+            state.ctrl_enter();
+            assert_editor_eq(&state, "- item\n- |");
         }
     }
 
@@ -3030,19 +3180,19 @@ mod tests {
         // --- Stage 5: creation via smart Enter ---
 
         #[test]
-        fn enter_inserts_raw_newline_never_creates_table() {
-            // Plain Enter is "no magic" — table creation is Shift+Enter only.
+        fn shift_enter_on_lone_pipe_header_just_inserts_newline() {
+            // Table creation is Enter's: Shift+Enter stays a plain new line.
             let mut state = EditorState::new("| a | b |");
             state.set_cursor(9); // end of line
-            state.enter();
+            state.shift_enter();
             assert_eq!(state.text(), "| a | b |\n");
         }
 
         #[test]
-        fn shift_enter_completes_lone_pipe_header_into_table() {
+        fn enter_completes_lone_pipe_header_into_table() {
             let mut state = EditorState::new("| a | b |");
             state.set_cursor(9);
-            state.shift_enter();
+            state.enter();
             assert_eq!(state.text(), "| a | b |\n| --- | --- |\n|  |  |");
             assert_eq!(state.cursor().offset, 26);
         }
@@ -3145,10 +3295,10 @@ mod tests {
         }
 
         #[test]
-        fn shift_enter_in_table_adds_matched_row() {
+        fn ctrl_enter_in_last_row_adds_matched_row() {
             let mut state = EditorState::new(TABLE_2X1);
             state.set_cursor(26); // inside body[0]
-            state.shift_enter();
+            state.ctrl_enter();
             assert_eq!(
                 state.text(),
                 "| a | b |\n| --- | --- |\n| 1 | 2 |\n|  |  |\n"
@@ -3223,7 +3373,7 @@ mod tests {
         fn backspace_removes_just_added_empty_table_row() {
             let mut state = EditorState::new(TABLE_2X1);
             state.set_cursor(26); // inside body[0]
-            state.shift_enter(); // adds an empty row, caret inside it
+            state.ctrl_enter(); // adds an empty row, caret inside it
             assert!(state.text().ends_with("|  |  |\n"));
             state.delete_backward(); // one backspace removes the whole empty row
             assert_eq!(state.text(), TABLE_2X1);
@@ -3395,16 +3545,19 @@ mod tests {
             let mut state = EditorState::new(TABLE_2X1);
             state.set_cursor(3);
             state.insert_typed("|x\ny");
-            assert_eq!(state.text(), "| a\\|x y | b |\n| --- | --- |\n| 1 | 2 |\n");
+            assert_eq!(
+                state.text(),
+                "| a\\|x<br>y | b |\n| --- | --- |\n| 1 | 2 |\n"
+            );
         }
 
         #[test]
-        fn enter_goes_down_and_adds_a_row_at_the_end() {
+        fn ctrl_enter_goes_down_and_adds_a_row_at_the_end() {
             let mut state = EditorState::new(TABLE_2X1);
             state.set_cursor(7); // header, "b"
-            state.enter();
+            state.ctrl_enter();
             assert_eq!(state.cursor().offset, 30, "same column, next row");
-            state.enter();
+            state.ctrl_enter();
             assert_eq!(
                 state.text(),
                 "| a | b |\n| --- | --- |\n| 1 | 2 |\n|  |  |\n"
@@ -3439,10 +3592,38 @@ mod tests {
         }
 
         #[test]
-        fn shift_enter_outside_table_still_continues_list() {
+        fn enter_outside_table_still_continues_list() {
             let mut state = editor_with_cursor("- item one|");
-            state.shift_enter();
+            state.enter();
             assert_editor_eq(&state, "- item one\n- |");
+        }
+
+        /// Enter (and Shift+Enter) in a cell breaks the line inside the cell: `<br>`,
+        /// as a table row is one line. The caret steps over it, and Backspace or Delete
+        /// remove it, as the one character it shows as.
+        #[test]
+        fn enter_in_a_cell_breaks_the_line_inside_it() {
+            let mut state = EditorState::new(TABLE_2X1);
+            state.set_cursor(3); // after "a"
+            state.enter();
+            assert_eq!(state.text(), "| a<br> | b |\n| --- | --- |\n| 1 | 2 |\n");
+            assert_eq!(state.cursor().offset, 7);
+            state.shift_enter();
+            assert_eq!(
+                state.text(),
+                "| a<br><br> | b |\n| --- | --- |\n| 1 | 2 |\n"
+            );
+            state.move_left();
+            assert_eq!(state.cursor().offset, 7, "one step back over a `<br>`");
+            state.move_left();
+            assert_eq!(state.cursor().offset, 3);
+            state.move_right();
+            assert_eq!(state.cursor().offset, 7);
+            state.delete_backward();
+            assert_eq!(state.text(), "| a<br> | b |\n| --- | --- |\n| 1 | 2 |\n");
+            assert_eq!(state.cursor().offset, 3);
+            state.delete_forward();
+            assert_eq!(state.text(), TABLE_2X1);
         }
     }
 

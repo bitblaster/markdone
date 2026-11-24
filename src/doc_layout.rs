@@ -803,7 +803,8 @@ fn resolve_inline_checkboxes(
                 InlineImageDraw {
                     brush: None,
                     baseline_offset: drop,
-                    checkbox: Some(c.checked),
+                    checkbox: (!c.ghost).then_some(c.checked),
+                    spacer: c.ghost,
                 },
             )
         })
@@ -865,6 +866,8 @@ struct InlineImageDraw {
     baseline_offset: f32,
     /// A task checkbox to paint in the box instead of an image: `Some(checked)`.
     checkbox: Option<bool>,
+    /// The box only takes up room: nothing is painted in it.
+    spacer: bool,
 }
 
 /// Inline git-diff decorations for one real line (added-line bg + word ranges).
@@ -1129,6 +1132,7 @@ fn resolve_inline_images(
                             brush,
                             baseline_offset: 0.0,
                             checkbox: None,
+                            spacer: false,
                         },
                     )
                 }
@@ -1150,6 +1154,7 @@ fn resolve_inline_images(
                             brush: None,
                             baseline_offset: 0.0,
                             checkbox: None,
+                            spacer: false,
                         },
                     )
                 }
@@ -1160,6 +1165,7 @@ fn resolve_inline_images(
                         brush: None,
                         baseline_offset: 0.0,
                         checkbox: None,
+                        spacer: false,
                     },
                 ),
             };
@@ -1226,6 +1232,7 @@ fn resolve_inline_math(
                             brush,
                             baseline_offset: descent,
                             checkbox: None,
+                            spacer: false,
                         },
                     )
                 }
@@ -1236,6 +1243,7 @@ fn resolve_inline_math(
                         brush: None,
                         baseline_offset: 0.0,
                         checkbox: None,
+                        spacer: false,
                     },
                 ),
             };
@@ -2683,6 +2691,9 @@ impl DocLayout {
                 let Some(draw) = draws.get(pib.id as usize) else {
                     continue;
                 };
+                if draw.spacer {
+                    continue;
+                }
                 let x = self.pad_x as f64 + pib.x as f64;
                 let y = gy as f64 + pib.y as f64 + draw.baseline_offset as f64;
                 if let Some(checked) = draw.checkbox {
@@ -4562,6 +4573,54 @@ mod tests {
         let wrold = src.find("wrold").unwrap();
         assert_eq!(doc.misspelled_at(wrold + 2), Some(wrold..wrold + 5));
         assert_eq!(doc.misspelled_at(src.find("hello").unwrap()), None);
+    }
+
+    /// A `<br>` in a cell is a line break there, in the caret's cell too: the cell lays
+    /// out on two lines, and the caret right after the tag sits on the second.
+    #[test]
+    fn line_break_in_a_cell_starts_a_new_line() {
+        use crate::buffer::Buffer;
+        let mut engine = TextEngine::new();
+        let src = "| a<br>b | c |\n|---|---|\n| 1 | 2 |\n";
+        let mut buf: Buffer = src.parse().unwrap();
+        let snap = buf.render_snapshot();
+
+        let doc = build_grid_doc(&mut engine, &snap, src.len());
+        let (tl, _) = doc.table_lines[0].as_ref().unwrap();
+        let cell = tl.row_layouts[0][0].as_ref().unwrap();
+        assert_eq!(cell.layout.lines().count(), 2, "two lines in the cell");
+        let one_line = tl.row_layouts[0][1].as_ref().unwrap();
+        assert!(
+            tl.row_heights[0] > tl.row_heights[1],
+            "the header row grows"
+        );
+        assert_eq!(one_line.layout.lines().count(), 1);
+
+        let br = src.find("<br>").unwrap();
+        let doc = build_grid_doc(&mut engine, &snap, br + 4);
+        let (tl, _) = doc.table_lines[0].as_ref().unwrap();
+        let cell = tl.row_layouts[0][0].as_ref().unwrap();
+        assert_eq!(cell.layout.lines().count(), 2, "the caret's cell too");
+        let before = doc.caret_rect(br, 2.0).unwrap();
+        let after = doc.caret_rect(br + 4, 2.0).unwrap();
+        assert!(
+            after.1 > before.1,
+            "caret after the break on the next line: {before:?} {after:?}"
+        );
+
+        // Enter at the end of a cell's text: nothing after the break yet, and the caret
+        // still goes down to the new, empty line.
+        let src = "| a<br> | c |\n|---|---|\n| 1 | 2 |\n";
+        let mut buf: Buffer = src.parse().unwrap();
+        let snap = buf.render_snapshot();
+        let br = src.find("<br>").unwrap();
+        let doc = build_grid_doc(&mut engine, &snap, br + 4);
+        let before = doc.caret_rect(br, 2.0).unwrap();
+        let after = doc.caret_rect(br + 4, 2.0).unwrap();
+        assert!(
+            after.1 > before.1,
+            "on the new empty line: {before:?} {after:?}"
+        );
     }
 
     /// Build a whole-document layout with the cursor off the table (grid mode).
