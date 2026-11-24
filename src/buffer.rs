@@ -85,6 +85,24 @@ pub struct RenderSnapshot {
     parsed: Rc<ParsedNodes>,
     /// Number of lines in the document
     line_count: usize,
+    /// Every line's byte range (no trailing newline), see [`line_ranges`].
+    line_ranges: Rc<Vec<Range<usize>>>,
+}
+
+/// Every line's byte range, trailing newline excluded (as [`compute_line_byte_range`]),
+/// in one pass over the rope. Looking a line up in the rope costs about a microsecond,
+/// which a long document's layout used to pay several times for each of its lines on
+/// every keystroke.
+fn line_ranges(rope: &Rope) -> Vec<Range<usize>> {
+    let mut ranges = Vec::with_capacity(rope.len_lines());
+    let mut start = 0;
+    for line in rope.lines() {
+        let len = line.len_bytes();
+        let newline = len > 0 && line.byte(len - 1) == b'\n';
+        ranges.push(start..start + len - usize::from(newline));
+        start += len;
+    }
+    ranges
 }
 
 /// A fenced code block's line structure (see [`RenderSnapshot::fenced_blocks`]).
@@ -127,7 +145,10 @@ impl RenderSnapshot {
     }
 
     pub fn line_byte_range(&self, line_idx: usize) -> Range<usize> {
-        compute_line_byte_range(&self.rope, line_idx)
+        match self.line_ranges.get(line_idx) {
+            Some(range) => range.clone(),
+            None => compute_line_byte_range(&self.rope, line_idx),
+        }
     }
 
     /// Compute LineMarkers for a specific line on demand. O(log n) binary search + marker extraction.
@@ -145,17 +166,7 @@ impl RenderSnapshot {
         if n == 0 {
             return buckets;
         }
-        // One pass over the lines (each holds its line break): per-line lookups in the rope
-        // cost a few microseconds each, ~10 ms for a long document.
-        let line_starts: Vec<usize> = self
-            .rope
-            .lines()
-            .scan(0, |start, line| {
-                let s = *start;
-                *start += line.len_bytes();
-                Some(s)
-            })
-            .collect();
+        let line_starts: Vec<usize> = self.line_ranges.iter().map(|r| r.start).collect();
         // Line containing byte `off` (the last line whose start is <= off).
         let line_of = |off: usize| line_starts.partition_point(|&s| s <= off).saturating_sub(1);
 
@@ -533,6 +544,9 @@ pub struct BufferContent {
     /// revert/reapply edits via history) so the O(n) caches rebuild once at the end
     /// instead of per sub-edit. No consumer may read `parsed`/`inline_styles` while set.
     suspend_caches: bool,
+    /// Every line's byte range, for the `version` it was computed at (see
+    /// [`line_ranges`]); recomputed by the first snapshot after an edit.
+    line_ranges: (u64, Rc<Vec<Range<usize>>>),
 }
 
 impl BufferContent {
@@ -547,6 +561,7 @@ impl BufferContent {
             inline_styles: Rc::new(Vec::new()),
             version: NEXT_VERSION.fetch_add(1, Ordering::Relaxed),
             suspend_caches: false,
+            line_ranges: (u64::MAX, Rc::new(Vec::new())),
         }
     }
 
@@ -885,7 +900,12 @@ impl BufferContent {
             self.rebuild_code_highlight_cache();
         }
 
+        if self.line_ranges.0 != self.version {
+            self.line_ranges = (self.version, Rc::new(line_ranges(&self.text)));
+        }
+
         RenderSnapshot {
+            line_ranges: Rc::clone(&self.line_ranges.1),
             rope: self.text.clone(),
             inline_styles: Rc::clone(&self.inline_styles),
             code_highlights: Rc::clone(&self.code_highlight_cache.highlights),
@@ -1221,6 +1241,7 @@ impl FromStr for Buffer {
             inline_styles: Rc::new(Vec::new()),
             version: NEXT_VERSION.fetch_add(1, Ordering::Relaxed),
             suspend_caches: false,
+            line_ranges: (u64::MAX, Rc::new(Vec::new())),
         };
 
         content.update_caches();
@@ -1235,6 +1256,31 @@ impl FromStr for Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one-pass line table matches the per-line rope lookups, line breaks of every
+    /// kind ropey knows and a missing final newline included.
+    #[test]
+    fn line_ranges_match_per_line_lookups() {
+        for text in [
+            "",
+            "\n",
+            "one",
+            "one\ntwo\n",
+            "a\r\nb\rc\u{2028}d\n\ne",
+            "# T\n\n| a | b |\n|---|---|\n| é | ü |\n",
+        ] {
+            let rope = Rope::from_str(text);
+            let table = line_ranges(&rope);
+            assert_eq!(table.len(), rope.len_lines(), "{text:?}");
+            for (i, range) in table.iter().enumerate() {
+                assert_eq!(
+                    *range,
+                    compute_line_byte_range(&rope, i),
+                    "{text:?} line {i}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn revisions_are_unique_across_edits_and_replacement_buffers() {
