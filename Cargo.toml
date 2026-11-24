@@ -1,6 +1,6 @@
 [package]
 name = "markdone"
-version = "0.3.0"
+version = "0.4.0"
 description = "A fast, lightweight Markdown editor with live inline rendering (forked from writ)"
 # Forked from writ by Wilfred Denton (MIT), https://github.com/wilfreddenton/writ
 authors = ["Wilfred Denton <wilfred@hey.com>"]
