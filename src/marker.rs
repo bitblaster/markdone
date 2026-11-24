@@ -690,13 +690,12 @@ fn parse_continuation_uncached(rope: &Rope, start: usize, end: usize) -> Vec<Mar
 
     let content = rope_slice_cow(rope, start, end);
     let bytes = content.as_bytes();
-    let tree =
-        PARSER.with_borrow_mut(|parser| parser.parse_with(&mut |byte, _| &bytes[byte..], None));
+    let tree = PARSER.with_borrow_mut(|parser| parser.parse_blocks(bytes));
     let Some(tree) = tree else {
         return markers;
     };
 
-    let root = tree.block_tree().root_node();
+    let root = tree.root_node();
     let mut last_marker_end = 0usize;
     let mut first_marker_seen = false;
 
@@ -785,6 +784,22 @@ fn atx_marker_level(kind: &str) -> Option<u8> {
     }
 }
 
+/// The name of a block-grammar node's kind. `Node::kind` measures and checks a C string
+/// on every call, a good part of walking a long document's tree; this reads a table.
+fn block_kind(node: &Node) -> &'static str {
+    static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        let language = tree_sitter::Language::from(tree_sitter_md::LANGUAGE);
+        (0..language.node_kind_count() as u16)
+            .map(|id| language.node_kind_for_id(id).unwrap_or(""))
+            .collect()
+    });
+    names
+        .get(node.kind_id() as usize)
+        .copied()
+        .unwrap_or_else(|| node.kind())
+}
+
 /// Collect all nodes as owned NodeInfo structs (no lifetimes).
 /// Used for lazy LineMarkers computation during rendering.
 pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
@@ -808,7 +823,7 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
     loop {
         let node = cursor.node();
         // `Node::kind` is a C-string lookup + strlen + UTF-8 check per call; read it once.
-        let kind = node.kind();
+        let kind = block_kind(&node);
 
         while let Some(&(end_byte, _)) = checked_task_stack.last() {
             if node.start_byte() >= end_byte {
@@ -1014,7 +1029,12 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
             in_code_block,
         });
 
-        if cursor.goto_first_child() {
+        // An inline leaf's children are its punctuation tokens (most of the tree's nodes),
+        // which no marker reads; only a named one (a quote's `>` continuing a paragraph)
+        // matters, so a leaf without any is not descended into.
+        let bare_leaf =
+            matches!(kind, "inline" | "pipe_table_cell") && node.named_child_count() == 0;
+        if !bare_leaf && cursor.goto_first_child() {
             kind_stack.push(kind);
             continue;
         }

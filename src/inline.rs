@@ -728,22 +728,11 @@ pub struct StyledRegion {
 
 /// Extract all inline styles from a markdown tree.
 /// Returns a flat Vec sorted by start byte position.
-pub fn extract_all_inline_styles(tree: &MarkdownTree, rope: &Rope) -> Vec<StyledRegion> {
+pub fn extract_all_inline_styles(tree: &MarkdownTree, _rope: &Rope) -> Vec<StyledRegion> {
     let mut styles = Vec::new();
-    // The parser already stores every inline subtree; iterate them directly instead of
-    // re-walking the whole block tree to rediscover the nodes they hang off. Each tree's
-    // regions are cached on the tree and survive its reuse across edits (same text, only
-    // shifted), so an edit re-extracts just the paragraph/cell it touched.
-    for (i, inline_tree) in tree.inline_trees().iter().enumerate() {
-        let Some((slot, start)) = tree.inline_styles_cache(i) else {
-            collect_from_inline_tree(inline_tree.root_node(), rope, &mut styles);
-            continue;
-        };
-        let (cached_start, regions) = slot.get_or_init(|| {
-            let mut own = Vec::new();
-            collect_from_inline_tree(inline_tree.root_node(), rope, &mut own);
-            (start, std::sync::Arc::new(own))
-        });
+    // Each inline leaf's regions were extracted when it was parsed and survive its reuse
+    // across edits (same text, only shifted), so this is a copy, shifted where needed.
+    for (start, (cached_start, regions)) in tree.inline_styles() {
         let delta = start as isize - *cached_start as isize;
         if delta == 0 {
             styles.extend(regions.iter().cloned());
@@ -759,6 +748,14 @@ pub fn extract_all_inline_styles(tree: &MarkdownTree, rope: &Rope) -> Vec<Styled
         }
     }
     styles.sort_by_key(|s| s.full_range.start);
+    styles
+}
+
+/// The styled regions of one inline tree (its root node), for [`MarkdownTree`]'s
+/// per-leaf cache.
+pub fn inline_tree_styles(root: Node, rope: &Rope) -> Vec<StyledRegion> {
+    let mut styles = Vec::new();
+    collect_from_inline_tree(root, rope, &mut styles);
     styles
 }
 

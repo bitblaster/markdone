@@ -178,6 +178,14 @@ inherits = "release"
 lto = false
 codegen-units = 16
 
+[[example]]
+name = "typebench"
+required-features = ["app"]
+
+[[example]]
+name = "memprobe"
+required-features = ["app"]
+
 [dev-dependencies]
 vello = "0.10"
 

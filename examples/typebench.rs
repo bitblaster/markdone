@@ -16,14 +16,16 @@ fn main() {
         ed.len()
     );
     ed.set_cursor(ed.len() / 2);
-    let lines = ed.line_count();
+    // The app scans the lines in view (plus a margin), not the whole document.
+    let mid = ed.line_count() / 2;
+    let lines = mid.saturating_sub(60)..mid + 60;
     for i in 0..n {
         let c = (b'a' + (i % 26) as u8) as char;
         let t = Instant::now();
         ed.type_char(c);
         let t_type = t.elapsed();
         let t = Instant::now();
-        ed.refresh_detection(0..lines);
+        ed.refresh_detection(lines.clone());
         let t_det = t.elapsed();
         println!(
             "key {i:2}: type_char {:7.2} ms | refresh_detection {:7.2} ms",

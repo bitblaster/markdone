@@ -1,7 +1,6 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::OnceLock;
 use tree_sitter_highlight::{
     Highlight, HighlightConfiguration, HighlightEvent, Highlighter as TSHighlighter,
 };
@@ -80,7 +79,7 @@ fn normalized_lang(lang: &str) -> Cow<'_, str> {
 /// point, so callers (the code-block highlight cache, revealed-math styling) never
 /// special-case which backend a language uses.
 enum Backend {
-    /// Boxed — a `HighlightConfiguration` is large, and it lives behind an `Arc` anyway.
+    /// Boxed — a `HighlightConfiguration` is large.
     TreeSitter(Box<HighlightConfiguration>),
     /// `fn(source) -> spans`, each span's `highlight_id` from [`highlight_id`].
     Tokenizer(fn(&str) -> Vec<HighlightSpan>),
@@ -88,7 +87,6 @@ enum Backend {
 
 pub struct Highlighter {
     inner: TSHighlighter,
-    languages: HashMap<String, Arc<Backend>>,
 }
 
 impl Default for Highlighter {
@@ -97,119 +95,139 @@ impl Default for Highlighter {
     }
 }
 
-impl Highlighter {
-    pub fn new() -> Self {
-        let inner = TSHighlighter::new();
-        let mut languages = HashMap::new();
+/// A language code fences can name: its names, and how to build its highlighting, done
+/// once per process on its first use. Compiling a grammar's queries takes tens of
+/// milliseconds; doing all of them for every document opened made opening one cost half
+/// a second, code or not.
+struct Language {
+    aliases: &'static [&'static str],
+    build: fn() -> Option<Backend>,
+    backend: OnceLock<Option<Backend>>,
+}
 
-        let mut register = |aliases: &[&str], backend: Backend| {
-            let backend = Arc::new(backend);
-            for a in aliases {
-                languages.insert((*a).to_string(), Arc::clone(&backend));
-            }
-        };
+impl Language {
+    const fn new(aliases: &'static [&'static str], build: fn() -> Option<Backend>) -> Self {
+        Self {
+            aliases,
+            build,
+            backend: OnceLock::new(),
+        }
+    }
+}
 
-        // Tree-sitter grammars. Rust uses Zed's highlights.scm (broader coverage than the
-        // upstream query); Bash uses its crate's bundled query.
-        let rust = tree_sitter_rust::LANGUAGE.into();
-        if let Some(config) =
-            Self::create_config(rust, "rust", include_str!("../queries/rust/highlights.scm"))
-        {
-            register(&["rust", "rs"], Backend::TreeSitter(Box::new(config)));
-        }
-        let bash = tree_sitter_bash::LANGUAGE.into();
-        if let Some(config) = Self::create_config(bash, "bash", tree_sitter_bash::HIGHLIGHT_QUERY) {
-            register(
-                &["bash", "sh", "shell"],
-                Backend::TreeSitter(Box::new(config)),
-            );
-        }
+fn tree_sitter(
+    language: tree_sitter::Language,
+    name: &str,
+    highlights_query: &str,
+) -> Option<Backend> {
+    Highlighter::create_config(language, name, highlights_query)
+        .map(|config| Backend::TreeSitter(Box::new(config)))
+}
 
-        // Grammars with the queries bundled in their crates.
-        let grammars: [(&[&str], tree_sitter::Language, &str, String); 4] = [
-            (
-                &["java"],
-                tree_sitter_java::LANGUAGE.into(),
-                "java",
-                tree_sitter_java::HIGHLIGHTS_QUERY.to_string(),
+static LANGUAGES: [Language; 11] = [
+    // Rust uses Zed's highlights.scm (broader coverage than the upstream query); Bash
+    // uses its crate's bundled query.
+    Language::new(&["rust", "rs"], || {
+        tree_sitter(
+            tree_sitter_rust::LANGUAGE.into(),
+            "rust",
+            include_str!("../queries/rust/highlights.scm"),
+        )
+    }),
+    Language::new(&["bash", "sh", "shell"], || {
+        tree_sitter(
+            tree_sitter_bash::LANGUAGE.into(),
+            "bash",
+            tree_sitter_bash::HIGHLIGHT_QUERY,
+        )
+    }),
+    Language::new(&["java"], || {
+        tree_sitter(
+            tree_sitter_java::LANGUAGE.into(),
+            "java",
+            tree_sitter_java::HIGHLIGHTS_QUERY,
+        )
+    }),
+    Language::new(&["python", "py", "python3"], || {
+        tree_sitter(
+            tree_sitter_python::LANGUAGE.into(),
+            "python",
+            tree_sitter_python::HIGHLIGHTS_QUERY,
+        )
+    }),
+    Language::new(&["c", "h"], || {
+        tree_sitter(
+            tree_sitter_c::LANGUAGE.into(),
+            "c",
+            tree_sitter_c::HIGHLIGHT_QUERY,
+        )
+    }),
+    // C++'s query only adds to C's (its grammar extends C's); C++ captures last.
+    Language::new(&["cpp", "c++", "cc", "cxx", "hpp"], || {
+        tree_sitter(
+            tree_sitter_cpp::LANGUAGE.into(),
+            "cpp",
+            &format!(
+                "{}\n{}",
+                tree_sitter_c::HIGHLIGHT_QUERY,
+                tree_sitter_cpp::HIGHLIGHT_QUERY
             ),
-            (
-                &["python", "py", "python3"],
-                tree_sitter_python::LANGUAGE.into(),
-                "python",
-                tree_sitter_python::HIGHLIGHTS_QUERY.to_string(),
-            ),
-            (
-                &["c", "h"],
-                tree_sitter_c::LANGUAGE.into(),
-                "c",
-                tree_sitter_c::HIGHLIGHT_QUERY.to_string(),
-            ),
-            // C++'s query only adds to C's (its grammar extends C's); C++ captures last.
-            (
-                &["cpp", "c++", "cc", "cxx", "hpp"],
-                tree_sitter_cpp::LANGUAGE.into(),
-                "cpp",
-                format!(
-                    "{}\n{}",
-                    tree_sitter_c::HIGHLIGHT_QUERY,
-                    tree_sitter_cpp::HIGHLIGHT_QUERY
-                ),
-            ),
-        ];
-        for (aliases, language, name, query) in grammars {
-            if let Some(config) = Self::create_config(language, name, &query) {
-                register(aliases, Backend::TreeSitter(Box::new(config)));
-            }
-        }
-        // PHP: the `php_only` grammar parses bare PHP code, as a Markdown snippet usually
-        // is; the `php` one expects a `<?php` tag and treats the rest as HTML text.
-        if let Some(config) = Self::create_config(
+        )
+    }),
+    // PHP: the `php_only` grammar parses bare PHP code, as a Markdown snippet usually
+    // is; the `php` one expects a `<?php` tag and treats the rest as HTML text.
+    Language::new(&["php"], || {
+        tree_sitter(
             tree_sitter_php::LANGUAGE_PHP_ONLY.into(),
             "php",
             tree_sitter_php::HIGHLIGHTS_QUERY,
-        ) {
-            register(&["php"], Backend::TreeSitter(Box::new(config)));
-        }
-        // JavaScript (the grammar is already linked for TypeScript), JSX included.
-        let javascript_query = format!(
-            "{JAVASCRIPT_HIGHLIGHT_QUERY}\n{}",
-            tree_sitter_javascript::JSX_HIGHLIGHT_QUERY
-        );
-        if let Some(config) = Self::create_config(
+        )
+    }),
+    // JavaScript (the grammar is already linked for TypeScript), JSX included.
+    Language::new(&["javascript", "js", "jsx", "mjs", "cjs"], || {
+        tree_sitter(
             tree_sitter_javascript::LANGUAGE.into(),
             "javascript",
-            &javascript_query,
-        ) {
-            register(
-                &["javascript", "js", "jsx", "mjs", "cjs"],
-                Backend::TreeSitter(Box::new(config)),
-            );
+            &format!(
+                "{JAVASCRIPT_HIGHLIGHT_QUERY}\n{}",
+                tree_sitter_javascript::JSX_HIGHLIGHT_QUERY
+            ),
+        )
+    }),
+    // TypeScript's query only covers its extensions to JavaScript. Later patterns win in
+    // tree-sitter-highlight, so keep the TypeScript-specific captures last.
+    Language::new(&["typescript", "ts"], || {
+        tree_sitter(
+            LANGUAGE_TYPESCRIPT.into(),
+            "typescript",
+            &format!("{JAVASCRIPT_HIGHLIGHT_QUERY}\n{TYPESCRIPT_HIGHLIGHTS_QUERY}"),
+        )
+    }),
+    // Tokenizer-backed languages (no publishable grammar crate): a ```mermaid / ```latex
+    // code fence highlights through the normal code-block path, and revealed `$…$` math
+    // styles via `highlight(content, "latex")`.
+    Language::new(&["mermaid"], || {
+        Some(Backend::Tokenizer(tokenize::highlight_mermaid))
+    }),
+    Language::new(&["latex", "tex"], || {
+        Some(Backend::Tokenizer(tokenize::highlight_latex))
+    }),
+];
+
+/// The highlighting of the language a fence names, built on first use.
+fn backend(lang: &str) -> Option<&'static Backend> {
+    let lang = normalized_lang(lang);
+    let language = LANGUAGES
+        .iter()
+        .find(|l| l.aliases.contains(&lang.as_ref()))?;
+    language.backend.get_or_init(language.build).as_ref()
+}
+
+impl Highlighter {
+    pub fn new() -> Self {
+        Self {
+            inner: TSHighlighter::new(),
         }
-
-        // TypeScript's query only covers its extensions to JavaScript. Later patterns
-        // win in tree-sitter-highlight, so keep the TypeScript-specific captures last.
-        let typescript_query =
-            format!("{JAVASCRIPT_HIGHLIGHT_QUERY}\n{TYPESCRIPT_HIGHLIGHTS_QUERY}");
-        if let Some(config) =
-            Self::create_config(LANGUAGE_TYPESCRIPT.into(), "typescript", &typescript_query)
-        {
-            register(&["typescript", "ts"], Backend::TreeSitter(Box::new(config)));
-        }
-
-        // Tokenizer-backed languages (no publishable grammar crate). Registered ungated:
-        // a ```mermaid / ```latex code fence highlights through the normal code-block path,
-        // and revealed `$…$` math styles via `highlight(content, "latex")`.
-        register(
-            &["mermaid"],
-            Backend::Tokenizer(tokenize::highlight_mermaid),
-        );
-        register(
-            &["latex", "tex"],
-            Backend::Tokenizer(tokenize::highlight_latex),
-        );
-
-        Self { inner, languages }
     }
 
     /// Build a tree-sitter highlight config from a grammar + `highlights.scm`, configured to
@@ -232,15 +250,16 @@ impl Highlighter {
     }
 
     pub fn supports_language(&self, lang: &str) -> bool {
-        self.languages.contains_key(normalized_lang(lang).as_ref())
+        let lang = normalized_lang(lang);
+        LANGUAGES.iter().any(|l| l.aliases.contains(&lang.as_ref()))
     }
 
     pub fn highlight(&mut self, code: &str, language: &str) -> Vec<HighlightSpan> {
-        let Some(backend) = self.languages.get(normalized_lang(language).as_ref()) else {
+        let Some(backend) = backend(language) else {
             return Vec::new();
         };
 
-        let config = match backend.as_ref() {
+        let config = match backend {
             Backend::Tokenizer(f) => return f(code),
             Backend::TreeSitter(config) => config.as_ref(),
         };

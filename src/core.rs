@@ -968,12 +968,21 @@ impl Editor {
         if self.detection_key.as_ref() == Some(&(version, lines.clone())) {
             return;
         }
+        let t0 = std::time::Instant::now();
         let (refs, urls) = self.detect_links(lines.start, lines.end);
         self.github_refs_by_line = refs;
         self.naked_urls_by_line = urls;
+        let t1 = std::time::Instant::now();
         #[cfg(feature = "math")]
         {
             self.math_spans_by_line = self.detect_math(lines.start, lines.end);
+        }
+        if crate::buffer::edit_profile_enabled() {
+            eprintln!(
+                "[markdone-edit] detect links {:6.2} ms | math {:6.2} ms",
+                (t1 - t0).as_secs_f64() * 1e3,
+                t1.elapsed().as_secs_f64() * 1e3
+            );
         }
         self.detection_key = Some((version, lines));
     }

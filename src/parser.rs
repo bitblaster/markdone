@@ -1,9 +1,8 @@
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::inline::StyledRegion;
 
-use tree_sitter::{InputEdit, Language, Node, Parser, Point, Range, Tree};
+use tree_sitter::{InputEdit, Language, Node, Parser, Point, Range, Tree, TreeCursor};
 use tree_sitter_md::{INLINE_LANGUAGE, LANGUAGE};
 
 pub struct MarkdownParser {
@@ -12,37 +11,38 @@ pub struct MarkdownParser {
     inline_language: Language,
 }
 
-/// Byte ranges an inline tree was parsed over (its `set_included_ranges`). An inline
-/// parse depends only on these ranges and the text inside them, so this is the key under
-/// which an unchanged inline tree can be reused on the next parse.
+/// Byte ranges an inline leaf (a paragraph's or heading's content, a table cell) was
+/// parsed over (its `set_included_ranges`). An inline parse depends only on these ranges
+/// and the text inside them, so this is the key under which a leaf's styles can be reused
+/// on the next parse.
 type InlineKey = Vec<(usize, usize)>;
 
-/// Styled regions extracted from one inline tree, with the tree's span start at
-/// extraction time. A reused tree has identical text, so its regions are these shifted
-/// by (current span start − `.0`): see [`MarkdownTree::inline_styles_cache`].
+/// Styled regions extracted from one inline leaf, with the leaf's span start at
+/// extraction time. Unchanged text gives the same regions shifted by (current span start
+/// − `.0`): see [`MarkdownTree::inline_styles`].
 pub type CachedInlineStyles = (usize, Arc<Vec<StyledRegion>>);
 
+/// A document's block tree, plus the inline styles of each inline leaf.
+///
+/// The inline trees themselves are not kept: their styles are all the editor reads from
+/// them, and tree-sitter trees are heavy (some 300 bytes per node, a node every few
+/// bytes of text): keeping one per paragraph and cell doubled the memory a document takes.
 #[derive(Debug, Clone)]
 pub struct MarkdownTree {
     block_tree: Tree,
-    inline_trees: Vec<Tree>,
-    inline_indices: HashMap<usize, usize>,
-    /// Parallel to `inline_trees`: the included byte ranges each one was parsed over,
-    /// kept in current-text coordinates by `edit`, or `None` once an edit touched them
-    /// (the tree's content is then stale and it must be re-parsed, not reused).
+    /// The included byte ranges of each inline leaf, in document order, kept in
+    /// current-text coordinates by `edit`, or `None` once an edit touched them (the
+    /// styles are then stale and the leaf must be re-parsed, not reused).
     inline_keys: Vec<Option<InlineKey>>,
-    /// Parallel to `inline_trees`: lazily extracted styles, carried over with the tree
-    /// when it is reused so unchanged paragraphs/cells are not re-walked on every edit.
-    inline_styles: Vec<OnceLock<CachedInlineStyles>>,
+    /// Parallel to `inline_keys`: each leaf's styles.
+    inline_styles: Vec<CachedInlineStyles>,
 }
 
 impl MarkdownTree {
     pub fn edit(&mut self, edit: &InputEdit) {
         self.block_tree.edit(edit);
-        for inline_tree in self.inline_trees.iter_mut() {
-            inline_tree.edit(edit);
-        }
         let delta = edit.new_end_byte as isize - edit.old_end_byte as isize;
+
         for key in self.inline_keys.iter_mut() {
             let Some(ranges) = key.as_mut() else { continue };
             let (Some(first), Some(last)) = (ranges.first(), ranges.last()) else {
@@ -69,21 +69,68 @@ impl MarkdownTree {
         &self.block_tree
     }
 
-    pub fn inline_tree(&self, parent: &Node) -> Option<&Tree> {
-        let index = *self.inline_indices.get(&parent.id())?;
-        Some(&self.inline_trees[index])
+    /// Each inline leaf's styles with its current span start (the first byte of its
+    /// included ranges), in document order. Leaves stale since an edit are left out.
+    pub fn inline_styles(&self) -> impl Iterator<Item = (usize, &CachedInlineStyles)> {
+        self.inline_keys
+            .iter()
+            .zip(&self.inline_styles)
+            .filter_map(|(key, styles)| Some((key.as_ref()?.first()?.0, styles)))
     }
 
-    pub fn inline_trees(&self) -> &[Tree] {
-        &self.inline_trees
+    /// The included ranges of each inline leaf, in document order (`None`: stale).
+    #[cfg(test)]
+    fn inline_keys(&self) -> &[Option<InlineKey>] {
+        &self.inline_keys
     }
+}
 
-    /// For inline tree `i`: its style cache slot and current span start (the first byte
-    /// of its included ranges), or `None` when the key is unknown (stale since an edit).
-    pub fn inline_styles_cache(&self, i: usize) -> Option<(&OnceLock<CachedInlineStyles>, usize)> {
-        let start = self.inline_keys.get(i)?.as_ref()?.first()?.0;
-        Some((self.inline_styles.get(i)?, start))
+/// Call `f` with the cursor on each inline leaf (a node of one of the `leaf` kinds: the
+/// nodes whose text the inline grammar parses), in document order, from the cursor's
+/// node down. Node kinds are compared by id: `Node::kind` measures and checks a C string.
+fn visit_leaves(cursor: &mut TreeCursor, leaf: &[u16], f: &mut dyn FnMut(&mut TreeCursor)) {
+    if leaf.contains(&cursor.node().kind_id()) {
+        f(cursor);
+        return;
     }
+    if !cursor.goto_first_child() {
+        return;
+    }
+    loop {
+        visit_leaves(cursor, leaf, f);
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+    cursor.goto_parent();
+}
+
+/// The ranges the inline grammar parses for the leaf under the cursor: its text minus
+/// its named children (block continuation markers such as a quote's `>` on its later
+/// lines). The cursor is left on the leaf.
+fn leaf_ranges(cursor: &mut TreeCursor, ranges: &mut Vec<Range>) {
+    let node = cursor.node();
+    let mut range = node.range();
+    ranges.clear();
+    // Most children are punctuation tokens: skip them unless a named one is there.
+    if node.named_child_count() > 0 && cursor.goto_first_child() {
+        while cursor.goto_next_sibling() {
+            if !cursor.node().is_named() {
+                continue;
+            }
+            let child_range = cursor.node().range();
+            ranges.push(Range {
+                start_byte: range.start_byte,
+                start_point: range.start_point,
+                end_byte: child_range.start_byte,
+                end_point: child_range.start_point,
+            });
+            range.start_byte = child_range.end_byte;
+            range.start_point = child_range.end_point;
+        }
+        cursor.goto_parent();
+    }
+    ranges.push(range);
 }
 
 impl Default for MarkdownParser {
@@ -100,16 +147,22 @@ impl Default for MarkdownParser {
 }
 
 impl MarkdownParser {
+    /// Parse the document whose text `callback` reads, reusing `old_tree` (edited to the
+    /// new text): the block tree incrementally, and the styles of every inline leaf whose
+    /// ranges are unchanged. A new or changed leaf is parsed and `styles_of` extracts its
+    /// styles from the inline tree's root.
     pub fn parse_with<T: AsRef<[u8]>, F: FnMut(usize, Point) -> T>(
         &mut self,
         callback: &mut F,
-        old_tree: Option<&MarkdownTree>,
+        old_tree: Option<MarkdownTree>,
+        styles_of: &mut dyn FnMut(Node) -> Vec<StyledRegion>,
     ) -> Option<MarkdownTree> {
         let MarkdownParser {
             parser,
             block_language,
             inline_language,
         } = self;
+        let t_block = std::time::Instant::now();
         parser
             .set_included_ranges(&[])
             .expect("Can not set included ranges to whole document");
@@ -118,121 +171,112 @@ impl MarkdownParser {
             .expect("Could not load block grammar");
         let block_tree = parser.parse_with_options(
             callback,
-            old_tree.map(|tree| &tree.block_tree),
+            old_tree.as_ref().map(|tree| &tree.block_tree),
             None, // No progress callback
         )?;
-        let len = old_tree.map_or(0, |t| t.inline_trees.len());
-        let mut inline_trees = Vec::with_capacity(len);
-        let mut inline_indices = HashMap::with_capacity(len);
-        let mut inline_keys = Vec::with_capacity(len);
-        let mut inline_styles = Vec::with_capacity(len);
-        // Old inline trees untouched by the edits since the last parse, by their included
-        // ranges. A new leaf with the exact same ranges has identical inline input, so its
-        // tree is reused (`Tree::clone` is a cheap ref-counted copy) instead of re-parsed.
-        // Without this every keystroke re-ran the inline grammar over every paragraph and
-        // table cell of the document.
-        let reusable: HashMap<&[(usize, usize)], usize> = old_tree
-            .map(|old| {
-                old.inline_keys
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, k)| k.as_deref().map(|k| (k, i)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut key: InlineKey = Vec::new();
+        let t_inline = std::time::Instant::now();
+
+        // Every leaf is looked for again: tree-sitter's `changed_ranges` misses some block
+        // changes here (a table turning into a paragraph reports nothing), so the walk
+        // can't be narrowed to where the text changed. Unchanged leaves reuse their styles.
+        let (old_keys, old_styles) = match old_tree {
+            Some(old) => (old.inline_keys, old.inline_styles),
+            None => (Vec::new(), Vec::new()),
+        };
+        let mut inline_keys = Vec::with_capacity(old_keys.len());
+        let mut inline_styles = Vec::with_capacity(old_keys.len());
+        let mut reparsed = 0usize;
+        let mut old_i = 0;
+        let mut failed = false;
         parser
             .set_language(inline_language)
             .expect("Could not load inline grammar");
-        let mut tree_cursor = block_tree.walk();
-
-        // The leaf nodes whose inner text gets a second (inline) parse pass.
-        let is_leaf = |kind: &str| kind == "inline" || kind == "pipe_table_cell";
-
-        // Reused across nodes: the interstitial ranges fed to `set_included_ranges`.
-        let mut ranges: Vec<Range> = Vec::new();
-        let mut i = 0;
-        'outer: loop {
-            let node = loop {
-                let kind = tree_cursor.node().kind();
-                if is_leaf(kind) || !tree_cursor.goto_first_child() {
-                    while !tree_cursor.goto_next_sibling() {
-                        if !tree_cursor.goto_parent() {
-                            break 'outer;
-                        }
+        let leaf_kinds = [
+            block_language.id_for_node_kind("inline", true),
+            block_language.id_for_node_kind("pipe_table_cell", true),
+        ];
+        {
+            let mut cursor = block_tree.walk();
+            let mut ranges: Vec<Range> = Vec::new();
+            visit_leaves(&mut cursor, &leaf_kinds, &mut |cursor| {
+                if failed {
+                    return;
+                }
+                leaf_ranges(cursor, &mut ranges);
+                let key: InlineKey = ranges.iter().map(|r| (r.start_byte, r.end_byte)).collect();
+                // Skip the old leaves that start before this one (gone, or stale), then
+                // reuse the next if it covers exactly the same ranges.
+                let start = key[0].0;
+                while old_i < old_keys.len()
+                    && old_keys[old_i]
+                        .as_ref()
+                        .is_none_or(|k| k.first().is_none_or(|f| f.0 < start))
+                {
+                    old_i += 1;
+                }
+                let leaf_styles = match old_keys.get(old_i) {
+                    Some(Some(k)) if *k == key => {
+                        old_i += 1;
+                        old_styles[old_i - 1].clone()
                     }
-                }
-                if is_leaf(tree_cursor.node().kind()) {
-                    break tree_cursor.node();
-                }
-            };
-            // Carve the node's range into the gaps BETWEEN its named children: each pushed
-            // range runs from the current cursor to the next child's start, then advances
-            // past that child. This excludes the children's own spans (which get their own
-            // injection) so the block highlighter only re-parses the interstitial text.
-            let mut range = node.range();
-            ranges.clear();
-            if tree_cursor.goto_first_child() {
-                while tree_cursor.goto_next_sibling() {
-                    if !tree_cursor.node().is_named() {
-                        continue;
+                    _ => {
+                        reparsed += 1;
+                        let tree = parser
+                            .set_included_ranges(&ranges)
+                            .ok()
+                            .and_then(|()| parser.parse_with_options(callback, None, None));
+                        let Some(tree) = tree else {
+                            failed = true;
+                            return;
+                        };
+                        (start, Arc::new(styles_of(tree.root_node())))
                     }
-                    let child_range = tree_cursor.node().range();
-                    ranges.push(Range {
-                        start_byte: range.start_byte,
-                        start_point: range.start_point,
-                        end_byte: child_range.start_byte,
-                        end_point: child_range.start_point,
-                    });
-                    range.start_byte = child_range.end_byte;
-                    range.start_point = child_range.end_point;
-                }
-                tree_cursor.goto_parent();
-            }
-            ranges.push(range);
-            key.clear();
-            key.extend(ranges.iter().map(|r| (r.start_byte, r.end_byte)));
-            let (inline_tree, styles) = match (reusable.get(key.as_slice()), old_tree) {
-                (Some(&j), Some(old)) => {
-                    (old.inline_trees[j].clone(), old.inline_styles[j].clone())
-                }
-                _ => {
-                    parser.set_included_ranges(&ranges).ok()?;
-                    let tree = parser.parse_with_options(
-                        callback, None, None, // No progress callback
-                    )?;
-                    (tree, OnceLock::new())
-                }
-            };
-            inline_trees.push(inline_tree);
-            inline_styles.push(styles);
-            inline_keys.push(Some(key.clone()));
-            inline_indices.insert(node.id(), i);
-            i += 1;
+                };
+                inline_styles.push(leaf_styles);
+                inline_keys.push(Some(key));
+            });
         }
-        drop(tree_cursor);
-        inline_trees.shrink_to_fit();
-        inline_indices.shrink_to_fit();
-        inline_keys.shrink_to_fit();
-        inline_styles.shrink_to_fit();
+        if failed {
+            return None;
+        }
+        if crate::buffer::edit_profile_enabled() {
+            eprintln!(
+                "[markdone-edit]   block {:6.2} ms | inline {:6.2} ms ({} leaves, {reparsed} parsed)",
+                (t_inline - t_block).as_secs_f64() * 1e3,
+                t_inline.elapsed().as_secs_f64() * 1e3,
+                inline_keys.len(),
+            );
+        }
         Some(MarkdownTree {
             block_tree,
-            inline_trees,
-            inline_indices,
             inline_keys,
             inline_styles,
         })
     }
 
+    /// Parse `text` into its block tree alone (no inline leaves).
+    pub fn parse_blocks(&mut self, text: &[u8]) -> Option<Tree> {
+        self.parser
+            .set_included_ranges(&[])
+            .expect("Can not set included ranges to whole document");
+        self.parser
+            .set_language(&self.block_language)
+            .expect("Could not load block grammar");
+        self.parser.parse(text, None)
+    }
+
     #[cfg(test)]
-    pub fn parse(&mut self, text: &[u8], old_tree: Option<&MarkdownTree>) -> Option<MarkdownTree> {
-        self.parse_with(&mut |byte, _| &text[byte..], old_tree)
+    pub fn parse(&mut self, text: &[u8], old_tree: Option<MarkdownTree>) -> Option<MarkdownTree> {
+        let rope = ropey::Rope::from_str(std::str::from_utf8(text).unwrap());
+        self.parse_with(&mut |byte, _| &text[byte..], old_tree, &mut |root| {
+            crate::inline::inline_tree_styles(root, &rope)
+        })
     }
 
     pub fn parse_rope(
         &mut self,
         rope: &ropey::Rope,
-        old_tree: Option<&MarkdownTree>,
+        old_tree: Option<MarkdownTree>,
     ) -> Option<MarkdownTree> {
         self.parse_with(
             &mut |byte, _| {
@@ -240,6 +284,7 @@ impl MarkdownParser {
                 &chunk.as_bytes()[byte - chunk_start..]
             },
             old_tree,
+            &mut |root| crate::inline::inline_tree_styles(root, rope),
         )
     }
 }
@@ -270,9 +315,8 @@ mod tests {
         }
         let mut out = String::new();
         walk(tree.block_tree().root_node(), &mut out);
-        for t in tree.inline_trees() {
-            out.push_str("\n--inline: ");
-            walk(t.root_node(), &mut out);
+        for key in tree.inline_keys() {
+            out.push_str(&format!("\n--inline: {key:?}"));
         }
         out
     }
@@ -337,7 +381,7 @@ mod tests {
                 old_end_position,
                 new_end_position,
             });
-            tree = parser.parse(text.as_bytes(), Some(&tree)).unwrap();
+            tree = parser.parse(text.as_bytes(), Some(tree)).unwrap();
             let fresh = MarkdownParser::default()
                 .parse(text.as_bytes(), None)
                 .unwrap();
@@ -358,56 +402,32 @@ mod tests {
 
     #[test]
     fn inline_ranges() {
+        // The paragraph's `[content]` is a shortcut link, before and after an edit above
+        // it (its styles are then reused, shifted).
         let code = "# title\n\nInline [content].\n";
         let mut parser = MarkdownParser::default();
         let mut tree = parser.parse(code.as_bytes(), None).unwrap();
+        let rope = ropey::Rope::from_str(code);
+        let link = |tree: &MarkdownTree, rope: &ropey::Rope| {
+            crate::inline::extract_all_inline_styles(tree, rope)
+                .into_iter()
+                .map(|r| r.full_range)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(link(&tree, &rope), vec![16..25]);
 
-        let section = tree.block_tree().root_node().child(0).unwrap();
-        assert_eq!(section.kind(), "section");
-        let heading = section.child(0).unwrap();
-        assert_eq!(heading.kind(), "atx_heading");
-        let paragraph = section.child(1).unwrap();
-        assert_eq!(paragraph.kind(), "paragraph");
-        let inline = paragraph.child(0).unwrap();
-        assert_eq!(inline.kind(), "inline");
-        assert_eq!(
-            tree.inline_tree(&inline)
-                .unwrap()
-                .root_node()
-                .child(0)
-                .unwrap()
-                .kind(),
-            "shortcut_link"
-        );
-
-        let code = "# Title\n\nInline [content].\n";
+        let code = "# Title!\n\nInline [content].\n";
         tree.edit(&InputEdit {
-            start_byte: 2,
-            old_end_byte: 3,
-            new_end_byte: 3,
-            start_position: Point { row: 0, column: 2 },
-            old_end_position: Point { row: 0, column: 3 },
-            new_end_position: Point { row: 0, column: 3 },
+            start_byte: 7,
+            old_end_byte: 7,
+            new_end_byte: 8,
+            start_position: Point { row: 0, column: 7 },
+            old_end_position: Point { row: 0, column: 7 },
+            new_end_position: Point { row: 0, column: 8 },
         });
-        let tree = parser.parse(code.as_bytes(), Some(&tree)).unwrap();
-
-        let section = tree.block_tree().root_node().child(0).unwrap();
-        assert_eq!(section.kind(), "section");
-        let heading = section.child(0).unwrap();
-        assert_eq!(heading.kind(), "atx_heading");
-        let paragraph = section.child(1).unwrap();
-        assert_eq!(paragraph.kind(), "paragraph");
-        let inline = paragraph.child(0).unwrap();
-        assert_eq!(inline.kind(), "inline");
-        assert_eq!(
-            tree.inline_tree(&inline)
-                .unwrap()
-                .root_node()
-                .named_child(0)
-                .unwrap()
-                .kind(),
-            "shortcut_link"
-        );
+        let tree = parser.parse(code.as_bytes(), Some(tree)).unwrap();
+        let rope = ropey::Rope::from_str(code);
+        assert_eq!(link(&tree, &rope), vec![17..26]);
     }
 
     #[test]
@@ -428,7 +448,7 @@ mod tests {
             old_end_position: Point { row: 0, column: 2 },
             new_end_position: Point { row: 0, column: 0 },
         });
-        let tree2 = parser.parse(code2.as_bytes(), Some(&tree1_edited)).unwrap();
+        let tree2 = parser.parse(code2.as_bytes(), Some(tree1_edited)).unwrap();
 
         let ranges: Vec<_> = tree2
             .block_tree()

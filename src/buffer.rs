@@ -23,7 +23,7 @@ use crate::mermaid::MermaidBlock;
 use crate::parser::{MarkdownParser, MarkdownTree};
 
 /// `MARKDONE_PROFILE=1`: per-edit timing of the parse and cache passes on stderr.
-fn edit_profile_enabled() -> bool {
+pub(crate) fn edit_profile_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MARKDONE_PROFILE").is_some_and(|v| v != "0"))
 }
@@ -145,7 +145,17 @@ impl RenderSnapshot {
         if n == 0 {
             return buckets;
         }
-        let line_starts: Vec<usize> = (0..n).map(|i| self.line_byte_range(i).start).collect();
+        // One pass over the lines (each holds its line break): per-line lookups in the rope
+        // cost a few microseconds each, ~10 ms for a long document.
+        let line_starts: Vec<usize> = self
+            .rope
+            .lines()
+            .scan(0, |start, line| {
+                let s = *start;
+                *start += line.len_bytes();
+                Some(s)
+            })
+            .collect();
         // Line containing byte `off` (the last line whose start is <= off).
         let line_of = |off: usize| line_starts.partition_point(|&s| s <= off).saturating_sub(1);
 
@@ -610,7 +620,7 @@ impl BufferContent {
         if let Some(ref mut tree) = self.tree {
             tree.edit(&edit);
         }
-        self.tree = self.parser.parse_rope(&self.text, self.tree.as_ref());
+        self.tree = self.parser.parse_rope(&self.text, self.tree.take());
         if edit_profile_enabled() {
             eprintln!(
                 "[markdone-edit] parse {:6.2} ms",
@@ -697,7 +707,7 @@ impl BufferContent {
             }
         }
 
-        self.tree = self.parser.parse_rope(&self.text, self.tree.as_ref());
+        self.tree = self.parser.parse_rope(&self.text, self.tree.take());
         true
     }
 
@@ -956,6 +966,7 @@ impl BufferContent {
     }
 
     fn rebuild_code_highlight_cache(&mut self) {
+        let t0 = std::time::Instant::now();
         let highlights = Rc::make_mut(&mut self.code_highlight_cache.highlights);
         highlights.clear();
 
@@ -986,6 +997,13 @@ impl BufferContent {
         }
 
         self.code_highlight_cache.valid = true;
+        if edit_profile_enabled() {
+            eprintln!(
+                "[markdone-edit] code highlight {:6.2} ms ({} blocks)",
+                t0.elapsed().as_secs_f64() * 1e3,
+                self.parsed.code_blocks.len()
+            );
+        }
     }
 }
 
