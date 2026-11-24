@@ -1256,9 +1256,173 @@ impl FromStr for Buffer {
     }
 }
 
+/// The test corpus of `buffer::tests` (every construct), for other modules' tests.
+#[cfg(test)]
+pub(crate) fn tests_corpus() -> &'static str {
+    tests::EDIT_CORPUS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A document using every construct the editor treats specially.
+    pub(crate) const EDIT_CORPUS: &str = "# Title\n\nA paragraph with **bold**, *italic*, `code`, [a link](https://e.com), \
+==highlight==, <u>under</u> and a note[^1].\nIts second line.\n\n## Lists\n\n- one\n- two\n  - nested\n- [ ] task\n\
+- [x] done\n\n1. first\n2. second\n3. third\n\n> A quote\n> on two lines\n\n> [!note] Callout\n> body\n\n\
+| Col A | Col B |\n|:---|---:|\n| a *x* | b |\n| c | `d` |\n\n```rust\nfn main() {}\n```\n\n\
+Math $x^2$ inline and a block:\n\n$$\na + b\n$$\n\n---\n\n[^1]: The note.\n";
+
+    /// Everything derived from the text, in a comparable form.
+    fn derived_state(buf: &mut Buffer) -> String {
+        let snap = buf.render_snapshot();
+        let mut out = format!("{:?}\n{:?}\n", buf.parsed(), snap.inline_styles);
+        for i in 0..snap.line_count() {
+            out.push_str(&format!(
+                "{i}: {:?} {:?}\n",
+                snap.line_byte_range(i),
+                snap.line_markers(i)
+            ));
+        }
+        out.push_str(&format!("{:?}", snap.code_highlights));
+        out
+    }
+
+    /// Ordered-list numbers made uniform: the one change an edit may make beyond the
+    /// requested one is renumbering a list.
+    fn without_list_numbers(text: &str) -> String {
+        let re = regex::Regex::new(r"(?m)^([ \t>]*)\d+([.)])").unwrap();
+        re.replace_all(text, "${1}N$2").into_owned()
+    }
+
+    /// The data-safety net for the incremental machinery (reused parses and styles, the
+    /// line table, the node walk): after each of many random edits the text is exactly
+    /// what was asked for (bar list renumbering), and everything derived from it, which
+    /// commands read to compute their own edits, equals a freshly opened document's.
+    /// Undoing everything gives the original text back, redoing gives the last one.
+    #[test]
+    fn random_edits_keep_text_and_state_exact() {
+        let corpus = std::env::var("MARKDONE_EDIT_TEST_FILE")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_else(|| EDIT_CORPUS.repeat(3));
+        let snippets = [
+            "a",
+            "xyz ",
+            " ",
+            "\n",
+            "\n\n",
+            "|",
+            "| x |",
+            "> ",
+            "- ",
+            "1. ",
+            "7) ",
+            "* ",
+            "```",
+            "```rust\n",
+            "~~",
+            "**",
+            "==",
+            "`",
+            "[",
+            "](u)",
+            "- [ ] ",
+            "# ",
+            "$",
+            "$$\n",
+            "é",
+            "😀",
+            "\t",
+            "<u>",
+            "</u>",
+            "{.underline}",
+            "[^2]",
+            "---\n",
+        ];
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut rnd = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let mut buf: Buffer = corpus.parse().unwrap();
+        let mut shadow = corpus.clone();
+        for step in 0..1500 {
+            let len = shadow.len();
+            let mut start = rnd(len + 1);
+            while !shadow.is_char_boundary(start) {
+                start -= 1;
+            }
+            let mut end = (start + rnd(12)).min(len);
+            while !shadow.is_char_boundary(end) {
+                end += 1;
+            }
+            let snippet = snippets[rnd(snippets.len())];
+            // Same-length replacements too: a paragraph keeps its extent, so only its
+            // invalidation keeps its old styles from being reused.
+            let marks = ["*", "`", "_", "~", "=", "|", ">", "#", "[", "]", "x"];
+            let one_char = start < len
+                && shadow[start..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.len_utf8() == 1);
+            match rnd(4) {
+                3 if one_char => {
+                    let mark = marks[rnd(marks.len())];
+                    buf.replace(start..start + 1, mark, start);
+                    shadow.replace_range(start..start + 1, mark);
+                }
+                0 => {
+                    buf.insert(start, snippet, start);
+                    shadow.insert_str(start, snippet);
+                }
+                1 if end > start => {
+                    buf.delete(start..end, start);
+                    shadow.replace_range(start..end, "");
+                }
+                _ => {
+                    buf.replace(start..end, snippet, start);
+                    shadow.replace_range(start..end, snippet);
+                }
+            }
+            let text = buf.text();
+            assert_eq!(
+                without_list_numbers(&text),
+                without_list_numbers(&shadow),
+                "step {step}: the text differs from the requested edit"
+            );
+            shadow = text;
+            let snap = buf.render_snapshot();
+            for i in 0..snap.line_count() {
+                assert_eq!(
+                    snap.line_byte_range(i),
+                    compute_line_byte_range(&snap.rope, i),
+                    "step {step}: line {i}'s range"
+                );
+            }
+            let mut fresh: Buffer = shadow.parse().unwrap();
+            assert_eq!(
+                derived_state(&mut buf),
+                derived_state(&mut fresh),
+                "step {step}: derived state differs from a fresh parse"
+            );
+        }
+        let last = buf.text();
+        while buf.undo().is_some() {}
+        assert_eq!(
+            buf.text(),
+            corpus,
+            "undoing everything restores the original"
+        );
+        while buf.redo().is_some() {}
+        assert_eq!(
+            buf.text(),
+            last,
+            "redoing everything restores the last text"
+        );
+    }
 
     /// The one-pass line table matches the per-line rope lookups, line breaks of every
     /// kind ropey knows and a missing final newline included.

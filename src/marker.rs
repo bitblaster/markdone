@@ -803,6 +803,12 @@ fn block_kind(node: &Node) -> &'static str {
 /// Collect all nodes as owned NodeInfo structs (no lifetimes).
 /// Used for lazy LineMarkers computation during rendering.
 pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
+    collect_node_infos_with(root, rope, true)
+}
+
+/// [`collect_node_infos`], optionally (`skip_bare_leaves = false`, for tests) walking
+/// every node as it used to, punctuation inside inline leaves included.
+fn collect_node_infos_with(root: &Node, rope: &Rope, skip_bare_leaves: bool) -> ParsedNodes {
     let mut cursor = root.walk();
     let mut nodes = Vec::new();
     let mut code_blocks = Vec::new();
@@ -1032,8 +1038,9 @@ pub fn collect_node_infos(root: &Node, rope: &Rope) -> ParsedNodes {
         // An inline leaf's children are its punctuation tokens (most of the tree's nodes),
         // which no marker reads; only a named one (a quote's `>` continuing a paragraph)
         // matters, so a leaf without any is not descended into.
-        let bare_leaf =
-            matches!(kind, "inline" | "pipe_table_cell") && node.named_child_count() == 0;
+        let bare_leaf = skip_bare_leaves
+            && matches!(kind, "inline" | "pipe_table_cell")
+            && node.named_child_count() == 0;
         if !bare_leaf && cursor.goto_first_child() {
             kind_stack.push(kind);
             continue;
@@ -1241,6 +1248,55 @@ pub fn is_line_in_code_block(nodes: &[NodeInfo], line_start: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Skipping inline leaves' punctuation tokens changes nothing anything reads: every
+    /// line's markers and flags, and the structures (tables, headings, lists, fences,
+    /// callouts), are those of the full walk, on a document with every construct and on
+    /// the README.
+    #[test]
+    fn skipping_leaf_punctuation_changes_no_marker() {
+        let corpus = crate::buffer::tests_corpus();
+        let readme = include_str!("../README.md");
+        for text in [corpus, readme] {
+            let buf: Buffer = text.parse().unwrap();
+            let root = buf.tree().unwrap().block_tree().root_node();
+            let fast = collect_node_infos_with(&root, buf.rope(), true);
+            let full = collect_node_infos_with(&root, buf.rope(), false);
+            assert!(
+                fast.nodes.len() < full.nodes.len(),
+                "punctuation was skipped"
+            );
+            assert_eq!(
+                format!(
+                    "{:?}{:?}{:?}{:?}{:?}",
+                    fast.code_blocks, fast.tables, fast.headings, fast.list_items, fast.callouts
+                ),
+                format!(
+                    "{:?}{:?}{:?}{:?}{:?}",
+                    full.code_blocks, full.tables, full.headings, full.list_items, full.callouts
+                ),
+            );
+            for line in 0..buf.rope().len_lines() {
+                let range = buf.line_byte_range(line);
+                assert_eq!(
+                    format!(
+                        "{:?} {} {}",
+                        markers_at_from_infos(&fast.nodes, buf.rope(), range.start, range.end),
+                        is_line_in_checked_task(&fast.nodes, range.start),
+                        is_line_in_code_block(&fast.nodes, range.start),
+                    ),
+                    format!(
+                        "{:?} {} {}",
+                        markers_at_from_infos(&full.nodes, buf.rope(), range.start, range.end),
+                        is_line_in_checked_task(&full.nodes, range.start),
+                        is_line_in_code_block(&full.nodes, range.start),
+                    ),
+                    "line {line}: {:?}",
+                    buf.rope().line(line)
+                );
+            }
+        }
+    }
     use crate::buffer::Buffer;
     #[cfg(feature = "editor")]
     use crate::outline::current_heading_index;

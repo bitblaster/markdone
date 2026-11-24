@@ -321,6 +321,34 @@ mod tests {
         out
     }
 
+    /// The inline leaves' ranges as the walk computed them before it was optimized: a
+    /// plain recursive traversal of every node, and each leaf's ranges cut at its named
+    /// children but the first (the original loop moved to the first child and then on to
+    /// each next sibling, so the first child was never looked at).
+    fn naive_keys(tree: &MarkdownTree) -> Vec<Option<InlineKey>> {
+        fn walk(node: tree_sitter::Node, out: &mut Vec<Option<InlineKey>>) {
+            if node.kind() == "inline" || node.kind() == "pipe_table_cell" {
+                let mut key = Vec::new();
+                let mut start = node.start_byte();
+                let mut c = node.walk();
+                for child in node.children(&mut c).skip(1).filter(|n| n.is_named()) {
+                    key.push((start, child.start_byte()));
+                    start = child.end_byte();
+                }
+                key.push((start, node.end_byte()));
+                out.push(Some(key));
+                return;
+            }
+            let mut c = node.walk();
+            for child in node.children(&mut c) {
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(tree.block_tree().root_node(), &mut out);
+        out
+    }
+
     fn point_at(text: &str, byte: usize) -> Point {
         let before = &text[..byte];
         let row = before.matches('\n').count();
@@ -385,6 +413,11 @@ mod tests {
             let fresh = MarkdownParser::default()
                 .parse(text.as_bytes(), None)
                 .unwrap();
+            assert_eq!(
+                tree.inline_keys(),
+                naive_keys(&fresh).as_slice(),
+                "step {step}: the inline leaves differ from a plain traversal"
+            );
             assert_eq!(
                 dump(&tree),
                 dump(&fresh),
