@@ -26,6 +26,7 @@ const MAX_RASTER: f32 = 900.0;
 /// A `$$…$$` display-math block. `block` is the whole delimited span (for the reveal
 /// test); `content` is the LaTeX source; `anchor_line` is the first line, which carries
 /// the rendered image (other block lines collapse to zero height).
+#[derive(Clone)]
 pub struct MathBlock {
     pub block: Range<usize>,
     pub content: Range<usize>,

@@ -87,6 +87,17 @@ pub struct RenderSnapshot {
     line_count: usize,
     /// Every line's byte range (no trailing newline), see [`line_ranges`].
     line_ranges: Rc<Vec<Range<usize>>>,
+    /// Whole-document results computed on first use, shared by every snapshot of this
+    /// text version (the layout and the link scan both ask on each keystroke).
+    memo: Rc<SnapshotMemo>,
+}
+
+/// See [`RenderSnapshot::memo`].
+#[derive(Default)]
+struct SnapshotMemo {
+    styles_by_line: std::cell::OnceCell<Rc<Vec<Vec<StyledRegion>>>>,
+    #[cfg(feature = "math")]
+    math_blocks: std::cell::OnceCell<Vec<MathBlock>>,
 }
 
 /// Every line's byte range, trailing newline excluded (as [`compute_line_byte_range`]),
@@ -94,14 +105,49 @@ pub struct RenderSnapshot {
 /// which a long document's layout used to pay several times for each of its lines on
 /// every keystroke.
 fn line_ranges(rope: &Rope) -> Vec<Range<usize>> {
+    // The bytes are scanned for every line break ropey knows (its `lines` iterator looks
+    // each line up from the root, several times slower): LF, CR LF, CR, VT, FF, and
+    // NEL, LS, PS. Ropey keeps a CR LF pair and a character's bytes in one chunk.
     let mut ranges = Vec::with_capacity(rope.len_lines());
     let mut start = 0;
-    for line in rope.lines() {
-        let len = line.len_bytes();
-        let newline = len > 0 && line.byte(len - 1) == b'\n';
-        ranges.push(start..start + len - usize::from(newline));
-        start += len;
+    let mut pos = 0;
+    for chunk in rope.chunks() {
+        let b = chunk.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            // The bytes after a break that's part of the line (all but LF's).
+            let kept = match b[i] {
+                b'\n' => {
+                    ranges.push(start..pos + i);
+                    start = pos + i + 1;
+                    i += 1;
+                    continue;
+                }
+                b'\r' if b.get(i + 1) == Some(&b'\n') => {
+                    ranges.push(start..pos + i + 1);
+                    start = pos + i + 2;
+                    i += 2;
+                    continue;
+                }
+                b'\r' | 0x0B | 0x0C => 1,
+                0xC2 if b.get(i + 1) == Some(&0x85) => 2,
+                0xE2 if b.get(i + 1) == Some(&0x80)
+                    && matches!(b.get(i + 2), Some(0xA8 | 0xA9)) =>
+                {
+                    3
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            ranges.push(start..pos + i + kept);
+            start = pos + i + kept;
+            i += kept;
+        }
+        pos += b.len();
     }
+    ranges.push(start..pos);
     ranges
 }
 
@@ -160,15 +206,26 @@ impl RenderSnapshot {
     /// pass — the whole-document replacement for calling `inline_styles_in_range`
     /// per line, which is O(n²) because `styles_in_range` scans all earlier styles.
     /// No synthetic checkbox regions (callers that need them inject per line).
-    pub fn inline_styles_by_line(&self) -> Vec<Vec<StyledRegion>> {
+    pub fn inline_styles_by_line(&self) -> Rc<Vec<Vec<StyledRegion>>> {
+        Rc::clone(
+            self.memo
+                .styles_by_line
+                .get_or_init(|| Rc::new(self.bucket_inline_styles())),
+        )
+    }
+
+    fn bucket_inline_styles(&self) -> Vec<Vec<StyledRegion>> {
         let n = self.line_count;
         let mut buckets: Vec<Vec<StyledRegion>> = vec![Vec::new(); n];
         if n == 0 {
             return buckets;
         }
-        let line_starts: Vec<usize> = self.line_ranges.iter().map(|r| r.start).collect();
         // Line containing byte `off` (the last line whose start is <= off).
-        let line_of = |off: usize| line_starts.partition_point(|&s| s <= off).saturating_sub(1);
+        let line_of = |off: usize| {
+            self.line_ranges
+                .partition_point(|r| r.start <= off)
+                .saturating_sub(1)
+        };
 
         for region in self.inline_styles.iter() {
             let first = line_of(region.full_range.start).min(n - 1);
@@ -355,6 +412,14 @@ impl RenderSnapshot {
     /// (in the viewport-windowed link scan). A single byte-level pass over the rope.
     #[cfg(feature = "math")]
     pub fn math_blocks(&self) -> Vec<MathBlock> {
+        self.memo
+            .math_blocks
+            .get_or_init(|| self.scan_math_blocks())
+            .clone()
+    }
+
+    #[cfg(feature = "math")]
+    fn scan_math_blocks(&self) -> Vec<MathBlock> {
         // Byte positions where a `$$` delimiter begins.
         let mut delims: Vec<usize> = Vec::new();
         let mut prev_dollar = false;
@@ -422,6 +487,9 @@ impl RenderSnapshot {
 struct CodeHighlightCache {
     highlights: Rc<Vec<(Range<usize>, Vec<HighlightSpan>)>>,
     valid: bool,
+    /// Each block's spans (relative to its content) by a hash of its language and
+    /// content, from the last rebuild: an edit re-highlights only the blocks it changed.
+    by_content: std::collections::HashMap<u64, Rc<Vec<HighlightSpan>>>,
 }
 
 impl Default for CodeHighlightCache {
@@ -429,6 +497,7 @@ impl Default for CodeHighlightCache {
         Self {
             highlights: Rc::new(Vec::new()),
             valid: false,
+            by_content: Default::default(),
         }
     }
 }
@@ -545,8 +614,9 @@ pub struct BufferContent {
     /// instead of per sub-edit. No consumer may read `parsed`/`inline_styles` while set.
     suspend_caches: bool,
     /// Every line's byte range, for the `version` it was computed at (see
-    /// [`line_ranges`]); recomputed by the first snapshot after an edit.
-    line_ranges: (u64, Rc<Vec<Range<usize>>>),
+    /// [`line_ranges`]); recomputed by the first snapshot after an edit. With it, the
+    /// snapshots' shared memo of whole-document results for that version.
+    line_ranges: (u64, Rc<Vec<Range<usize>>>, Rc<SnapshotMemo>),
 }
 
 impl BufferContent {
@@ -561,7 +631,7 @@ impl BufferContent {
             inline_styles: Rc::new(Vec::new()),
             version: NEXT_VERSION.fetch_add(1, Ordering::Relaxed),
             suspend_caches: false,
-            line_ranges: (u64::MAX, Rc::new(Vec::new())),
+            line_ranges: (u64::MAX, Rc::default(), Rc::default()),
         }
     }
 
@@ -926,11 +996,16 @@ impl BufferContent {
         }
 
         if self.line_ranges.0 != self.version {
-            self.line_ranges = (self.version, Rc::new(line_ranges(&self.text)));
+            self.line_ranges = (
+                self.version,
+                Rc::new(line_ranges(&self.text)),
+                Rc::default(),
+            );
         }
 
         RenderSnapshot {
             line_ranges: Rc::clone(&self.line_ranges.1),
+            memo: Rc::clone(&self.line_ranges.2),
             rope: self.text.clone(),
             inline_styles: Rc::clone(&self.inline_styles),
             code_highlights: Rc::clone(&self.code_highlight_cache.highlights),
@@ -1012,8 +1087,11 @@ impl BufferContent {
 
     fn rebuild_code_highlight_cache(&mut self) {
         let t0 = std::time::Instant::now();
-        let highlights = Rc::make_mut(&mut self.code_highlight_cache.highlights);
-        highlights.clear();
+        // A new list: the last snapshot may still share the old one (`make_mut` would
+        // copy it whole, only to clear it).
+        let mut highlights = Vec::new();
+        let previous = std::mem::take(&mut self.code_highlight_cache.by_content);
+        let mut reused = 0usize;
 
         for code_block in &self.parsed.code_blocks {
             let language = code_block.info_string_range.as_ref().and_then(|range| {
@@ -1032,19 +1110,38 @@ impl BufferContent {
                 let slice = self.text.slice(char_start..char_end);
                 let code_content = slice.to_string();
 
-                let mut spans = self.highlighter.highlight(&code_content, &lang);
-                for span in &mut spans {
-                    span.range.start += code_block.content_range.start;
-                    span.range.end += code_block.content_range.start;
-                }
+                let key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    (&lang, &code_content).hash(&mut h);
+                    h.finish()
+                };
+                let known = self.code_highlight_cache.by_content.get(&key);
+                let relative = match known.or_else(|| previous.get(&key)) {
+                    Some(spans) => {
+                        reused += 1;
+                        Rc::clone(spans)
+                    }
+                    None => Rc::new(self.highlighter.highlight(&code_content, &lang)),
+                };
+                let at = code_block.content_range.start;
+                let spans = relative
+                    .iter()
+                    .map(|span| HighlightSpan {
+                        range: span.range.start + at..span.range.end + at,
+                        highlight_id: span.highlight_id,
+                    })
+                    .collect();
                 highlights.push((code_block.block_range.clone(), spans));
+                self.code_highlight_cache.by_content.insert(key, relative);
             }
         }
 
+        self.code_highlight_cache.highlights = Rc::new(highlights);
         self.code_highlight_cache.valid = true;
         if edit_profile_enabled() {
             eprintln!(
-                "[markdone-edit] code highlight {:6.2} ms ({} blocks)",
+                "[markdone-edit] code highlight {:6.2} ms ({} blocks, {reused} reused)",
                 t0.elapsed().as_secs_f64() * 1e3,
                 self.parsed.code_blocks.len()
             );
@@ -1266,7 +1363,7 @@ impl FromStr for Buffer {
             inline_styles: Rc::new(Vec::new()),
             version: NEXT_VERSION.fetch_add(1, Ordering::Relaxed),
             suspend_caches: false,
-            line_ranges: (u64::MAX, Rc::new(Vec::new())),
+            line_ranges: (u64::MAX, Rc::default(), Rc::default()),
         };
 
         content.update_caches();
@@ -1456,6 +1553,10 @@ Math $x^2$ inline and a block:\n\n$$\na + b\n$$\n\n---\n\n[^1]: The note.\n";
             "one",
             "one\ntwo\n",
             "a\r\nb\rc\u{2028}d\n\ne",
+            "v\x0Bf\x0Cn\u{0085}p\u{2029}r\r",
+            "\r\n\r\r\n\n",
+            "€\u{2028}\u{2027}\u{0084}x",
+            &"é line of text, long enough\r\n".repeat(400),
             "# T\n\n| a | b |\n|---|---|\n| é | ü |\n",
         ] {
             let rope = Rope::from_str(text);
