@@ -34,7 +34,7 @@ use crate::mermaid;
 #[cfg(feature = "math")]
 use crate::render::InlineMathRef;
 use crate::render::{
-    CalloutHeader, ImageRef, InlineCheckboxRef, InlineImageRef, LineRender, TableCtx,
+    CalloutHeader, CellRender, ImageRef, InlineCheckboxRef, InlineImageRef, LineRender, TableCtx,
     build_cell_render, build_line_render,
 };
 use crate::segment_map::SegmentMap;
@@ -235,6 +235,10 @@ struct CellSlot {
     /// Display-byte ranges of the cell's inline-code spans, used to paint the translucent
     /// chip behind the code glyphs (mirrors body lines' `code_ranges`).
     code_ranges: Vec<Range<usize>>,
+    /// Display-byte ranges of the cell's `==highlighted==` text.
+    mark_ranges: Vec<Range<usize>>,
+    /// Display-byte ranges of the cell's misspelled words (wavy underline).
+    misspelled: Vec<Range<usize>>,
 }
 type CellLayout = Option<CellSlot>;
 type GridLayouts = Vec<Vec<CellLayout>>;
@@ -248,6 +252,8 @@ struct MeasuredCell {
     span: Range<usize>,
     caret: Range<usize>,
     code_ranges: Vec<Range<usize>>,
+    mark_ranges: Vec<Range<usize>>,
+    misspelled: Vec<Range<usize>>,
 }
 type CellData = Option<MeasuredCell>;
 type GridCells = Vec<Vec<CellData>>;
@@ -481,6 +487,9 @@ fn table_key(
     let mut h = std::collections::hash_map::DefaultHasher::new();
     content_hash.hash(&mut h);
     active.hash(&mut h);
+    // A dictionary or a personal word changes which words are marked.
+    #[cfg(feature = "app")]
+    crate::spelling::generation().hash(&mut h);
     block_start.hash(&mut h);
     scale.to_bits().hash(&mut h);
     font_size.to_bits().hash(&mut h);
@@ -561,8 +570,14 @@ fn build_table_layout(
                         }
                         _ => (cell.content.clone(), false),
                     };
-                    let (text, mut runs, map, code_ranges) =
-                        build_cell_render(snapshot, theme, range, styles, reveal);
+                    let CellRender {
+                        text,
+                        mut runs,
+                        map,
+                        code_ranges,
+                        mark_ranges,
+                        misspelled,
+                    } = build_cell_render(snapshot, theme, range, styles, reveal);
                     if is_header && !text.is_empty() {
                         // Bold the whole header cell; content color runs still win their spans.
                         let mut base = StyleRun::new(0..text.len(), fg);
@@ -583,6 +598,8 @@ fn build_table_layout(
                         span: cell_span(&snapshot.rope, cell),
                         caret: cell_caret_range(&snapshot.rope, cell),
                         code_ranges,
+                        mark_ranges,
+                        misspelled,
                     }));
                 }
                 None => rowdata.push(None),
@@ -618,6 +635,8 @@ fn build_table_layout(
                     span,
                     caret,
                     code_ranges,
+                    mark_ranges,
+                    misspelled,
                 }) => {
                     let layout = Rc::new(engine.build_line(
                         &text,
@@ -635,6 +654,8 @@ fn build_table_layout(
                         span,
                         caret,
                         code_ranges,
+                        mark_ranges,
+                        misspelled,
                     }));
                 }
                 None => layouts.push(None),
@@ -1380,6 +1401,8 @@ pub struct DocLayout {
     image_bg: Color,
     /// Background chip painted behind inline `code` spans.
     code_bg: Color,
+    /// The marker-pen background of `==highlighted==` text.
+    mark_bg: Color,
     /// Fenced code blocks drawn as boxes (see `draw_code_blocks`), and their baked chrome
     /// (device px + theme colors).
     code_boxes: Vec<CodeBox>,
@@ -1391,6 +1414,9 @@ pub struct DocLayout {
     /// The wavy underline of misspelled words: its color and stroke width (device px).
     misspelled_color: Color,
     misspelled_width: f32,
+    /// The caret's buffer offset when the layout was built: the misspelled word it sits
+    /// right after (being typed) in a table cell isn't underlined.
+    caret: usize,
     code_box_pad: f32,
     code_label_size: f32,
     code_label_color: Color,
@@ -1538,6 +1564,7 @@ impl DocLayout {
             is_hr: false,
             image: None,
             code_ranges: Vec::new(),
+            mark_ranges: Vec::new(),
             inline_images: Vec::new(),
             inline_math: Vec::new(),
             inline_checkboxes: Vec::new(),
@@ -2180,6 +2207,13 @@ impl DocLayout {
             // No background chip: green + monospace already reads as inline code, and a
             // translucent fill only muddies the diff line tint and selection it composites with.
             code_bg: Color::TRANSPARENT,
+            // A marker pen: the themes' yellows are dark on light backgrounds (to read
+            // as text), so light themes get a classic highlighter yellow.
+            mark_bg: if theme.is_light() {
+                Color::from_rgba8(0xFF, 0xD8, 0x3D, 0x8C)
+            } else {
+                peniko_color_alpha(theme.yellow, 0.3)
+            },
             code_boxes,
             // The image-placeholder tint: a faint panel that reads as "not prose".
             code_box_bg: peniko_color_alpha(theme.comment, 0.08),
@@ -2188,6 +2222,7 @@ impl DocLayout {
             checkbox_border: peniko_color(theme.comment),
             misspelled_color: peniko_color(theme.red),
             misspelled_width: scale.max(1.0),
+            caret: cursor_offset,
             code_box_pad: 6.0 * scale,
             code_label_size: 12.0 * scale,
             code_label_color: peniko_color(theme.comment),
@@ -2225,6 +2260,14 @@ impl DocLayout {
     /// The buffer range of the misspelled (underlined) word at buffer offset `off`.
     pub fn misspelled_at(&self, off: usize) -> Option<Range<usize>> {
         let i = self.line_of(off);
+        if let Some(Some((tl, kind))) = self.table_lines.get(i) {
+            let (_, slot) = tl.cell_holding(*kind, off)?;
+            return slot
+                .misspelled
+                .iter()
+                .map(|r| slot.map.display_to_buffer(r.start)..slot.map.display_to_buffer(r.end))
+                .find(|r| r.start <= off && off <= r.end);
+        }
         let render = self.renders.get(i)?;
         render
             .misspelled
@@ -2578,11 +2621,12 @@ impl DocLayout {
 
     /// Underline the display `ranges` of `layout` (drawn at `top_y`) with a wavy line,
     /// just under the text's baseline: the misspelled words.
-    fn draw_misspelled(
+    fn draw_misspelled<'a>(
         &self,
         scene: &mut Scene,
         layout: &parley::Layout<Brush>,
-        ranges: &[Range<usize>],
+        ranges: impl IntoIterator<Item = &'a Range<usize>>,
+        left_x: f32,
         top_y: f32,
     ) {
         let w = self.misspelled_width as f64;
@@ -2597,7 +2641,7 @@ impl DocLayout {
                     continue;
                 };
                 let y = top_y as f64 + (metrics.baseline + metrics.descent * 0.6) as f64;
-                let (x0, x1) = (self.pad_x as f64 + bb.x0, self.pad_x as f64 + bb.x1);
+                let (x0, x1) = (left_x as f64 + bb.x0, left_x as f64 + bb.x1);
                 if x1 - x0 < step {
                     continue;
                 }
@@ -2759,7 +2803,18 @@ impl DocLayout {
                 self.draw_ghost(engine, scene, ghost, gy, viewport_h);
                 gy += ghost.height;
             }
-            // Background chips behind inline code, under the real line's glyphs.
+            // Highlighter background, then the chips behind inline code, under the real
+            // line's glyphs.
+            let marks = &self.renders[i].mark_ranges;
+            if !marks.is_empty() {
+                self.fill_word_ranges(
+                    scene,
+                    &self.layouts[i],
+                    marks,
+                    real_top as f64,
+                    self.mark_bg,
+                );
+            }
             let code = &self.renders[i].code_ranges;
             if !code.is_empty() {
                 self.fill_word_ranges(scene, &self.layouts[i], code, real_top as f64, self.code_bg);
@@ -2771,7 +2826,7 @@ impl DocLayout {
             engine.draw_line(scene, &self.layouts[i], (self.pad_x, real_top));
             let misspelled = &self.renders[i].misspelled;
             if !misspelled.is_empty() {
-                self.draw_misspelled(scene, &self.layouts[i], misspelled, real_top);
+                self.draw_misspelled(scene, &self.layouts[i], misspelled, self.pad_x, real_top);
             }
         }
         // Trailing deletions below the last real line (a hunk anchored past the end).
@@ -2946,7 +3001,18 @@ impl DocLayout {
                 let Some(slot) = slot else { continue };
                 let gx = pad_x + tl.text_x(c, slot, cell_pad_x);
                 let gy = top + cell_pad_y;
-                // Chip behind inline code, over the cell bg but under the glyphs.
+                // Highlighter background and the chip behind inline code, over the cell bg
+                // but under the glyphs.
+                if !slot.mark_ranges.is_empty() {
+                    self.fill_display_ranges(
+                        scene,
+                        &slot.layout,
+                        &slot.mark_ranges,
+                        gx as f64,
+                        gy as f64,
+                        self.mark_bg,
+                    );
+                }
                 if !slot.code_ranges.is_empty() {
                     self.fill_display_ranges(
                         scene,
@@ -2958,6 +3024,13 @@ impl DocLayout {
                     );
                 }
                 engine.draw_line(scene, &slot.layout, (gx, gy));
+                // The word just typed (the caret right after it) isn't marked yet, as on
+                // body lines.
+                let marked = slot
+                    .misspelled
+                    .iter()
+                    .filter(|r| slot.map.display_to_buffer(r.end) != self.caret);
+                self.draw_misspelled(scene, &slot.layout, marked, gx, gy);
             }
         }
     }
@@ -3293,6 +3366,7 @@ mod tests {
                         is_hr: false,
                         image: None,
                         code_ranges: Vec::new(),
+                        mark_ranges: Vec::new(),
                         inline_images: Vec::new(),
                         inline_math: Vec::new(),
                         inline_checkboxes: Vec::new(),
@@ -3320,6 +3394,7 @@ mod tests {
             image_border: Color::TRANSPARENT,
             image_bg: Color::TRANSPARENT,
             code_bg: Color::TRANSPARENT,
+            mark_bg: Color::TRANSPARENT,
             code_boxes: Vec::new(),
             code_box_bg: Color::TRANSPARENT,
             checkbox_on: Color::TRANSPARENT,
@@ -3327,6 +3402,7 @@ mod tests {
             checkbox_border: Color::TRANSPARENT,
             misspelled_color: Color::TRANSPARENT,
             misspelled_width: 1.0,
+            caret: 0,
             code_box_pad: 0.0,
             code_label_size: 12.0,
             code_label_color: Color::TRANSPARENT,
@@ -4459,6 +4535,33 @@ mod tests {
         let off = build_grid_doc(&mut engine, &snap, src.len());
         let (tl, _) = off.table_lines[0].as_ref().unwrap();
         assert_eq!(tl.active, None);
+    }
+
+    /// Table cells are spell checked like prose: a misspelled word in a cell is marked
+    /// (and found by `misspelled_at`, for the context menu), one in inline code is not.
+    #[cfg(feature = "app")]
+    #[test]
+    fn grid_cells_are_spell_checked() {
+        use crate::buffer::Buffer;
+        let dict = spellbook::Dictionary::new("SET UTF-8\n", "3\nhello\nworld\ncell\n").unwrap();
+        crate::spelling::install_dictionaries(vec![dict]);
+        let mut engine = TextEngine::new();
+        let src = "| hello | wrold |\n|---|---|\n| `wrold` | cell |\n";
+        let mut buf: Buffer = src.parse().unwrap();
+        let snap = buf.render_snapshot();
+        let doc = build_grid_doc(&mut engine, &snap, src.len());
+        crate::spelling::install(None);
+
+        let (tl, _) = doc.table_lines[0].as_ref().unwrap();
+        let cell = |r: usize, c: usize| tl.row_layouts[r][c].as_ref().unwrap();
+        assert!(cell(0, 0).misspelled.is_empty(), "`hello` is right");
+        assert_eq!(cell(0, 1).misspelled, vec![0..5], "`wrold` is marked");
+        assert!(cell(1, 0).misspelled.is_empty(), "inline code isn't prose");
+        assert!(cell(1, 1).misspelled.is_empty());
+
+        let wrold = src.find("wrold").unwrap();
+        assert_eq!(doc.misspelled_at(wrold + 2), Some(wrold..wrold + 5));
+        assert_eq!(doc.misspelled_at(src.find("hello").unwrap()), None);
     }
 
     /// Build a whole-document layout with the cursor off the table (grid mode).

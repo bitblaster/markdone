@@ -109,6 +109,8 @@ pub struct LineRender {
     /// Display byte ranges of inline `code` spans, for painting a subtle background
     /// chip behind them (they'd otherwise be indistinguishable in a monospace body).
     pub code_ranges: Vec<Range<usize>>,
+    /// Display ranges of `==highlighted==` text: a marker-pen background behind them.
+    pub mark_ranges: Vec<Range<usize>>,
     /// This line is a standalone image (`![alt](url)` as the whole paragraph): its
     /// markdown text is hidden and an image block is drawn instead. `None` while the
     /// cursor is on the line, so the raw markdown is revealed for editing.
@@ -203,7 +205,7 @@ fn styled_run_for(
     run.italic = style.italic;
     run.mono = style.code;
     run.strikethrough = style.strikethrough;
-    run.underline = region.link_url.is_some();
+    run.underline = region.link_url.is_some() || style.underline;
     (run, is_code_chip)
 }
 
@@ -554,6 +556,7 @@ pub fn build_line_render(
     let fg = peniko_color(theme.foreground);
     let mut runs = Vec::new();
     let mut code_ranges: Vec<Range<usize>> = Vec::new();
+    let mut mark_ranges: Vec<Range<usize>> = Vec::new();
 
     if is_grid_table {
         // Grid mode: text is hidden, so there are no runs to build (cells are styled
@@ -630,6 +633,9 @@ pub fn build_line_render(
                 }
                 let (mut run, is_code_chip) =
                     styled_run_for(region, theme, r.clone(), content_color);
+                if region.style.highlight {
+                    mark_ranges.push(r.clone());
+                }
                 if is_code_chip {
                     code_ranges.push(r);
                 }
@@ -678,7 +684,7 @@ pub fn build_line_render(
         spelling_marks(
             &line_text,
             line_start,
-            &inline,
+            inline.iter(),
             math_spans,
             latex_ranges,
             cursor_on_line.then(|| cursor_offset.saturating_sub(line_start)),
@@ -696,6 +702,7 @@ pub fn build_line_render(
         is_hr,
         image,
         code_ranges,
+        mark_ranges,
         inline_images,
         inline_math,
         inline_checkboxes,
@@ -708,10 +715,10 @@ pub fn build_line_render(
 /// images, footnote markers, shortened URLs, links' targets and math are not prose and
 /// are left out; so is the word at `caret` (being typed).
 #[cfg(feature = "app")]
-fn spelling_marks(
+fn spelling_marks<'a>(
     line_text: &str,
     line_start: usize,
-    regions: &[StyledRegion],
+    regions: impl IntoIterator<Item = &'a StyledRegion>,
     math_spans: &[MathSpan],
     latex_ranges: &[Range<usize>],
     caret: Option<usize>,
@@ -749,16 +756,30 @@ fn spelling_marks(
 }
 
 #[cfg(not(feature = "app"))]
-fn spelling_marks(
+fn spelling_marks<'a>(
     _line_text: &str,
     _line_start: usize,
-    _regions: &[StyledRegion],
+    _regions: impl IntoIterator<Item = &'a StyledRegion>,
     _math_spans: &[MathSpan],
     _latex_ranges: &[Range<usize>],
     _caret: Option<usize>,
     _map: &SegmentMap,
 ) -> Vec<Range<usize>> {
     Vec::new()
+}
+
+/// A table cell's inline content ready to shape: see [`build_cell_render`].
+pub struct CellRender {
+    pub text: String,
+    pub runs: Vec<StyleRun>,
+    pub map: SegmentMap,
+    /// Display ranges of the cell's inline-code spans (their chips).
+    pub code_ranges: Vec<Range<usize>>,
+    /// Display ranges of `==highlighted==` text: a marker-pen background behind them.
+    pub mark_ranges: Vec<Range<usize>>,
+    /// Display ranges of the cell's misspelled words, the word being typed included (the
+    /// grid layout is shared across caret moves; the drawing spares that word).
+    pub misspelled: Vec<Range<usize>>,
 }
 
 /// Build the display text, style runs, and segment map for a single table cell's
@@ -774,7 +795,7 @@ pub fn build_cell_render(
     line_styles: &[StyledRegion],
     // The caret's cell: show its raw source (markers visible, dimmed) for editing.
     reveal: bool,
-) -> (String, Vec<StyleRun>, SegmentMap, Vec<Range<usize>>) {
+) -> CellRender {
     let rope = &snapshot.rope;
     let start = cell_range.start;
     let end = cell_range.end.max(start);
@@ -816,18 +837,38 @@ pub fn build_cell_render(
         }
     }
     let mut code_ranges = Vec::new();
+    let mut mark_ranges = Vec::new();
     for r in &regions {
         let dr = map.buffer_range_to_display(r.content_range.clone());
         if dr.is_empty() {
             continue;
         }
         let (run, is_code_chip) = styled_run_for(r, theme, dr.clone(), fg);
+        if r.style.highlight {
+            mark_ranges.push(dr.clone());
+        }
         if is_code_chip {
             code_ranges.push(dr);
         }
         runs.push(run);
     }
-    (text, runs, map, code_ranges)
+    let misspelled = spelling_marks(
+        &cell_text,
+        start,
+        regions.iter().copied(),
+        &[],
+        &[],
+        None,
+        &map,
+    );
+    CellRender {
+        text,
+        runs,
+        map,
+        code_ranges,
+        mark_ranges,
+        misspelled,
+    }
 }
 
 #[cfg(test)]
@@ -1324,13 +1365,14 @@ mod tests {
         let (table, _) = snap.table_row_at_line(0).unwrap();
 
         let bold_cell = table.header.cells[0].content.clone();
-        let (text, runs, _map, _code) =
+        let CellRender { text, runs, .. } =
             build_cell_render(&snap, &theme, bold_cell.clone(), &styles[0], false);
         assert_eq!(text, "hi", "markers hidden, content shown");
         assert!(runs.iter().any(|r| r.bold), "cell content is bold");
         // The caret's cell shows its source, markers included, content still bold.
-        let (text, runs, map, _code) =
-            build_cell_render(&snap, &theme, bold_cell.clone(), &styles[0], true);
+        let CellRender {
+            text, runs, map, ..
+        } = build_cell_render(&snap, &theme, bold_cell.clone(), &styles[0], true);
         assert_eq!(text, "**hi**", "markers shown in the caret's cell");
         assert!(runs.iter().any(|r| r.bold));
         assert_eq!(
@@ -1340,7 +1382,11 @@ mod tests {
         );
 
         let plain_cell = table.header.cells[1].content.clone();
-        let (ptext, pruns, _, _) = build_cell_render(&snap, &theme, plain_cell, &styles[0], false);
+        let CellRender {
+            text: ptext,
+            runs: pruns,
+            ..
+        } = build_cell_render(&snap, &theme, plain_cell, &styles[0], false);
         assert_eq!(ptext, "plain");
         assert!(pruns.is_empty(), "a plain cell needs no style runs");
     }

@@ -256,6 +256,12 @@ pub fn install(speller: Option<Speller>) {
     GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Make in-memory `dictionaries` the active speller.
+#[cfg(test)]
+pub fn install_dictionaries(dictionaries: Vec<spellbook::Dictionary>) {
+    install(Some(Speller { dictionaries }));
+}
+
 /// Whether spell checking is on (with at least one dictionary).
 pub fn is_active() -> bool {
     SPELLER.read().map(|s| s.is_some()).unwrap_or(false)

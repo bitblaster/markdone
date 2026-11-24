@@ -22,7 +22,6 @@ pub struct TextEdit {
 pub enum Inline {
     Bold,
     Italic,
-    Underline,
     Strikethrough,
     Highlight,
     Code,
@@ -33,7 +32,6 @@ impl Inline {
         match self {
             Inline::Bold => ("**", "**"),
             Inline::Italic => ("*", "*"),
-            Inline::Underline => ("<u>", "</u>"),
             Inline::Strikethrough => ("~~", "~~"),
             Inline::Highlight => ("==", "=="),
             Inline::Code => ("`", "`"),
@@ -397,8 +395,6 @@ mod tests {
         let e = toggle_inline(t, 4..4, Inline::Code);
         assert_eq!(apply(t, &e), "say `` world");
         assert_eq!(e.selection, 5..5);
-        let e = toggle_inline("a b", 2..3, Inline::Underline);
-        assert_eq!(apply("a b", &e), "a <u>b</u>");
         // Selecting the markers too also removes them.
         let e = toggle_inline("x ==y== z", 2..7, Inline::Highlight);
         assert_eq!(apply("x ==y== z", &e), "x y z");

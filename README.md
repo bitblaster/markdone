@@ -117,7 +117,7 @@ to jump to it; the current section is highlighted. Drag the panel edge to resize
 
 ### Formatting and editing
 
-The *Format* menu, the context menu and the shortcuts apply bold, italic, underline,
+The *Format* menu, the context menu and the shortcuts apply bold, italic,
 strikethrough, highlight and code, turn lines into headings, lists or quotes, and insert
 links, images and code blocks. Pasting rich text (from a web page or an office suite)
 converts it to Markdown; *Paste without Style* keeps the plain text, and *Copy as HTML*

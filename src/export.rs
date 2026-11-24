@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd, TextMergeStream};
+use pulldown_cmark::{
+    BrokenLink, CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd, TextMergeStream,
+};
 
 use crate::callout::{CalloutKind, parse_callout_header};
 use crate::editor::EditorTheme;
@@ -230,7 +232,14 @@ fn render_body(markdown: &str, base_dir: Option<&Path>) -> String {
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_MATH;
-    let mut input = TextMergeStream::new(Parser::new_ext(markdown, options)).peekable();
+    // Pandoc's underline, `[text]{.underline}`: an undefined shortcut reference followed
+    // by the attribute becomes a link to a placeholder, turned into `<u>` below.
+    let underline = |link: BrokenLink<'_>| {
+        underline_attribute_len(&markdown[link.span.end..])
+            .map(|_| (CowStr::from(UNDERLINE_URL), CowStr::from("")))
+    };
+    let parser = Parser::new_with_broken_link_callback(markdown, options, Some(underline));
+    let mut input = TextMergeStream::new(parser).peekable();
     let mut out: Vec<Event> = Vec::new();
     let mut highlighter = Highlighter::new();
     let code_theme = EditorTheme::catppuccin_latte();
@@ -356,8 +365,139 @@ fn render_body(markdown: &str, base_dir: Option<&Path>) -> String {
         }
     }
     let mut html = String::new();
-    pulldown_cmark::html::push_html(&mut html, out.into_iter());
+    pulldown_cmark::html::push_html(&mut html, highlights_and_underlines(out).into_iter());
     html
+}
+
+/// The destination given to `[text]{.underline}` spans while parsing.
+const UNDERLINE_URL: &str = "markdone:underline";
+
+/// The length of a Pandoc attribute block that underlines (`{.underline}`, other classes
+/// and attributes allowed) at the start of `rest`, on its line.
+fn underline_attribute_len(rest: &str) -> Option<usize> {
+    let attrs = rest.strip_prefix('{')?;
+    let close = attrs.find(['}', '\n'])?;
+    (attrs[close..].starts_with('}')
+        && attrs[..close].split_whitespace().any(|a| a == ".underline"))
+    .then_some(close + 2)
+}
+
+/// Turn `==text==` into `<mark>` and the `[text]{.underline}` placeholders into `<u>`, as
+/// the editor shows them. A highlight doesn't cross a block or a line break; an opening
+/// `==` left unclosed stays text.
+fn highlights_and_underlines(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
+    let mut out: Vec<Event> = Vec::with_capacity(events.len());
+    let mut open_mark: Option<usize> = None;
+    let mut links: Vec<bool> = Vec::new();
+    let mut strip_attribute = false;
+    for event in events {
+        let boundary = match &event {
+            Event::Start(tag) => !is_inline_tag(tag),
+            Event::End(tag) => !is_inline_tag_end(tag),
+            Event::Html(_) | Event::SoftBreak | Event::HardBreak | Event::Rule => true,
+            _ => false,
+        };
+        if boundary && let Some(i) = open_mark.take() {
+            out[i] = Event::Text("==".into());
+        }
+        match event {
+            Event::Start(Tag::Link { ref dest_url, .. }) => {
+                let ours = dest_url.as_ref() == UNDERLINE_URL;
+                links.push(ours);
+                out.push(if ours {
+                    Event::InlineHtml("<u>".into())
+                } else {
+                    event
+                });
+            }
+            Event::End(TagEnd::Link) => {
+                if links.pop() == Some(true) {
+                    out.push(Event::InlineHtml("</u>".into()));
+                    strip_attribute = true;
+                } else {
+                    out.push(event);
+                }
+            }
+            Event::Text(text) => {
+                let mut text: &str = &text;
+                if std::mem::take(&mut strip_attribute)
+                    && let Some(n) = underline_attribute_len(text)
+                {
+                    text = &text[n..];
+                }
+                let b = text.as_bytes();
+                let space = |j: usize| b.get(j).is_some_and(|c| c.is_ascii_whitespace());
+                let mut from = 0;
+                let mut i = 0;
+                while i < b.len() {
+                    if b[i] != b'=' {
+                        i += 1;
+                        continue;
+                    }
+                    let start = i;
+                    while i < b.len() && b[i] == b'=' {
+                        i += 1;
+                    }
+                    if i - start != 2 {
+                        continue;
+                    }
+                    let closes = open_mark.is_some() && (start == 0 || !space(start - 1));
+                    let opens = !closes && !space(i);
+                    if !closes && !opens {
+                        continue;
+                    }
+                    if start > from {
+                        out.push(Event::Text(text[from..start].to_string().into()));
+                    }
+                    if closes {
+                        open_mark = None;
+                        out.push(Event::InlineHtml("</mark>".into()));
+                    } else {
+                        if let Some(prev) = open_mark.take() {
+                            out[prev] = Event::Text("==".into());
+                        }
+                        open_mark = Some(out.len());
+                        out.push(Event::InlineHtml("<mark>".into()));
+                    }
+                    from = i;
+                }
+                if from < b.len() {
+                    out.push(Event::Text(text[from..].to_string().into()));
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    if let Some(i) = open_mark {
+        out[i] = Event::Text("==".into());
+    }
+    out
+}
+
+fn is_inline_tag(tag: &Tag) -> bool {
+    matches!(
+        tag,
+        Tag::Emphasis
+            | Tag::Strong
+            | Tag::Strikethrough
+            | Tag::Superscript
+            | Tag::Subscript
+            | Tag::Link { .. }
+            | Tag::Image { .. }
+    )
+}
+
+fn is_inline_tag_end(tag: &TagEnd) -> bool {
+    matches!(
+        tag,
+        TagEnd::Emphasis
+            | TagEnd::Strong
+            | TagEnd::Strikethrough
+            | TagEnd::Superscript
+            | TagEnd::Subscript
+            | TagEnd::Link
+            | TagEnd::Image
+    )
 }
 
 /// Point a relative image at its absolute `file://` location.
@@ -576,6 +716,28 @@ mod tests {
         assert!(md.contains("- uno\n- due"), "{md}");
         assert!(md.contains("```\nlet x = 1;\n```"), "{md}");
         assert_eq!(html_to_markdown("<p> </p>"), None);
+    }
+
+    /// Highlights and every underline syntax come out as `<mark>` and `<u>`; code and an
+    /// unclosed `==` stay as written.
+    #[test]
+    fn highlights_and_underlines_are_exported() {
+        let html = markdown_fragment(
+            "a ==b **c**== d [e f]{.underline} <ins>g</ins> `==h==` i == j\n",
+            None,
+        );
+        assert!(html.contains("<mark>b <strong>c</strong></mark>"), "{html}");
+        assert!(html.contains("<u>e f</u> <ins>g</ins>"), "{html}");
+        assert!(!html.contains("{.underline}"), "{html}");
+        assert!(html.contains("<code>==h==</code>"), "{html}");
+        assert!(html.contains("i == j"), "{html}");
+        let html = markdown_fragment("x ==y\n\nz== w\n", None);
+        assert!(
+            !html.contains("mark"),
+            "no highlight across paragraphs: {html}"
+        );
+        let html = markdown_fragment("[k]\n\n[l]: https://e.com\n", None);
+        assert!(html.contains("<p>[k]</p>"), "{html}");
     }
 
     #[test]

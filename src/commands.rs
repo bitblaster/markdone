@@ -94,7 +94,6 @@ impl Command {
             Command::PasteWithoutStyle => "Ctrl+Shift+V",
             Command::Inline(Inline::Bold) => "Ctrl+B",
             Command::Inline(Inline::Italic) => "Ctrl+I",
-            Command::Inline(Inline::Underline) => "Ctrl+U",
             Command::Inline(Inline::Strikethrough) => "Ctrl+Shift+X",
             Command::Inline(Inline::Highlight) => "Ctrl+Shift+H",
             Command::Inline(Inline::Code) => "Ctrl+`",
@@ -190,7 +189,6 @@ pub fn format_shortcut(
     Some(match (c.to_ascii_lowercase().as_str(), shift) {
         ("b", false) => Command::Inline(Inline::Bold),
         ("i", false) => Command::Inline(Inline::Italic),
-        ("u", false) => Command::Inline(Inline::Underline),
         ("x", true) => Command::Inline(Inline::Strikethrough),
         ("h", true) => Command::Inline(Inline::Highlight),
         ("k", false) => Command::InsertLink,

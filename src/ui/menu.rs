@@ -165,7 +165,6 @@ pub fn format_items(ui: &mut egui::Ui, picked: &mut Option<Command>) {
         for (label, style) in [
             ("Bold", Inline::Bold),
             ("Italic", Inline::Italic),
-            ("Underline", Inline::Underline),
             ("Strikethrough", Inline::Strikethrough),
             ("Highlight", Inline::Highlight),
             ("Inline Code", Inline::Code),

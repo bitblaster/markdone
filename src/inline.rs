@@ -649,6 +649,10 @@ pub struct TextStyle {
     pub italic: bool,
     pub code: bool,
     pub strikethrough: bool,
+    /// Underlined: `<u>…</u>`, `<ins>…</ins>` or Pandoc's `[…]{.underline}`.
+    pub underline: bool,
+    /// Highlighted: `==…==`.
+    pub highlight: bool,
     pub heading_level: u8,
 }
 
@@ -695,6 +699,8 @@ impl TextStyle {
             italic: self.italic || other.italic,
             code: self.code || other.code,
             strikethrough: self.strikethrough || other.strikethrough,
+            underline: self.underline || other.underline,
+            highlight: self.highlight || other.highlight,
             heading_level: self.heading_level.max(other.heading_level),
         }
     }
@@ -758,7 +764,154 @@ pub fn extract_all_inline_styles(tree: &MarkdownTree, rope: &Rope) -> Vec<Styled
 
 /// Collect styled regions from an inline tree.
 fn collect_from_inline_tree(node: Node, rope: &Rope, styles: &mut Vec<StyledRegion>) {
+    let first = styles.len();
     collect_from_inline_tree_inner(node, rope, styles, false);
+    let start = node.start_byte();
+    let end = node.end_byte().min(rope.len_bytes());
+    if start < end {
+        let text = rope
+            .slice(rope.byte_to_char(start)..rope.byte_to_char(end))
+            .to_string();
+        let found = scan_marks_and_underlines(&text, start, &styles[first..]);
+        styles.extend(found);
+    }
+}
+
+/// The inline styles tree-sitter doesn't know, found in `text` (an inline tree's source,
+/// starting at buffer offset `base`): `==highlight==` and the HTML underlines `<u>…</u>`
+/// and `<ins>…</ins>`, each within one line. `known` are the tree's regions: a span
+/// inside code, a footnote/shortened URL, or whose markers fall in a region's hidden
+/// syntax (a link's target…) is left alone.
+fn scan_marks_and_underlines(text: &str, base: usize, known: &[StyledRegion]) -> Vec<StyledRegion> {
+    let blocked = |r: &Range<usize>| {
+        known.iter().any(|k| {
+            let overlaps = |a: &Range<usize>| a.start < r.end && r.start < a.end;
+            if k.style.code || k.display_text.is_some() || k.is_image {
+                overlaps(&k.full_range)
+            } else {
+                overlaps(&(k.full_range.start..k.content_range.start))
+                    || overlaps(&(k.content_range.end..k.full_range.end))
+            }
+        })
+    };
+    let mut out = Vec::new();
+    let mut push = |open: Range<usize>, close: Range<usize>, style: TextStyle| {
+        let (open, close) = (
+            base + open.start..base + open.end,
+            base + close.start..base + close.end,
+        );
+        if !blocked(&open) && !blocked(&close) {
+            out.push(StyledRegion {
+                full_range: open.start..close.end,
+                content_range: open.end..close.start,
+                style,
+                ..Default::default()
+            });
+        }
+    };
+    let mut line_start = 0;
+    for line in text.split_inclusive('\n') {
+        let line = line.trim_end_matches('\n');
+        for (open, close) in highlight_pairs(line) {
+            push(
+                line_start + open.start..line_start + open.end,
+                line_start + close.start..line_start + close.end,
+                TextStyle {
+                    highlight: true,
+                    ..Default::default()
+                },
+            );
+        }
+        for (open, close) in html_underline_pairs(line) {
+            push(
+                line_start + open.start..line_start + open.end,
+                line_start + close.start..line_start + close.end,
+                TextStyle {
+                    underline: true,
+                    ..Default::default()
+                },
+            );
+        }
+        line_start += line.len() + 1;
+    }
+    out
+}
+
+/// The `==…==` pairs of `line`: the opening `==` followed by a non-space, the closing one
+/// preceded by a non-space, neither part of a longer run of `=` (so `a == b`, `===` and
+/// `x == y == z` stay text). Returns the two markers' ranges.
+pub fn highlight_pairs(line: &str) -> Vec<(Range<usize>, Range<usize>)> {
+    let b = line.as_bytes();
+    // Runs of exactly two `=`.
+    let mut marks = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'=' {
+            let start = i;
+            while i < b.len() && b[i] == b'=' {
+                i += 1;
+            }
+            if i - start == 2 {
+                marks.push(start);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    let space_at = |j: usize| j >= b.len() || b[j].is_ascii_whitespace();
+    let mut pairs = Vec::new();
+    let mut open: Option<usize> = None;
+    for m in marks {
+        match open {
+            Some(o) if m > o + 2 && !space_at(m - 1) => {
+                pairs.push((o..o + 2, m..m + 2));
+                open = None;
+            }
+            _ if !space_at(m + 2) => open = Some(m),
+            _ => {}
+        }
+    }
+    pairs
+}
+
+/// The `<u>…</u>` and `<ins>…</ins>` pairs of `line` (tags in any case), with the
+/// tags' ranges.
+fn html_underline_pairs(line: &str) -> Vec<(Range<usize>, Range<usize>)> {
+    let lower = line.to_ascii_lowercase();
+    let mut pairs = Vec::new();
+    for (open_tag, close_tag) in [("<u>", "</u>"), ("<ins>", "</ins>")] {
+        let mut from = 0;
+        while let Some(o) = lower[from..].find(open_tag).map(|o| from + o) {
+            let content = o + open_tag.len();
+            let Some(c) = lower[content..].find(close_tag).map(|c| content + c) else {
+                break;
+            };
+            if c > content {
+                pairs.push((o..content, c..c + close_tag.len()));
+            }
+            from = c + close_tag.len();
+        }
+    }
+    pairs
+}
+
+/// The end (exclusive, buffer offset) of a Pandoc attribute block that underlines,
+/// `{.underline}` (other classes and attributes allowed), starting at `at`.
+fn underline_attribute_end(rope: &Rope, at: usize) -> Option<usize> {
+    if at >= rope.len_bytes() {
+        return None;
+    }
+    let line = rope.byte_to_line(at);
+    let line_end = rope.line_to_byte(line + 1).min(rope.len_bytes());
+    let rest = rope
+        .slice(rope.byte_to_char(at)..rope.byte_to_char(line_end))
+        .to_string();
+    let attrs = rest.strip_prefix('{')?;
+    let close = attrs.find('}')?;
+    attrs[..close]
+        .split_whitespace()
+        .any(|a| a == ".underline")
+        .then_some(at + close + 2)
 }
 
 /// Inner function that tracks whether we're inside a strikethrough.
@@ -904,6 +1057,21 @@ fn extract_link_region(node: &Node, rope: &Rope) -> Option<StyledRegion> {
         if text == "[ ]" || text == "[x]" || text == "[X]" {
             return None;
         }
+    }
+
+    // Pandoc's underline, `[text]{.underline}` (tree-sitter sees a shortcut link).
+    if node.kind() == "shortcut_link"
+        && let Some(attr_end) = underline_attribute_end(rope, full_end)
+    {
+        return Some(StyledRegion {
+            full_range: full_start..attr_end,
+            content_range: full_start + 1..full_end - 1,
+            style: TextStyle {
+                underline: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
     }
 
     let mut content_start = full_start;
@@ -1172,6 +1340,58 @@ mod tests {
         // content_range excludes all delimiters (2..5 for just "hey")
         assert_eq!(styles[0].full_range, 0..7);
         assert_eq!(styles[0].content_range, 2..5);
+    }
+
+    /// `==…==` highlights; spaced or longer runs of `=` and code spans stay text.
+    #[test]
+    fn test_highlight() {
+        let styles = get_styles("a ==b c== d\n");
+        assert_eq!(styles.len(), 1);
+        assert!(styles[0].style.highlight);
+        assert_eq!(
+            (
+                styles[0].full_range.clone(),
+                styles[0].content_range.clone()
+            ),
+            (2..9, 4..7)
+        );
+
+        let styles = get_styles("==**x**== and `==y==`\n");
+        let marks: Vec<_> = styles.iter().filter(|s| s.style.highlight).collect();
+        assert_eq!(marks.len(), 1, "{styles:?}");
+        assert_eq!(marks[0].content_range, 2..7, "bold inside a highlight");
+
+        for text in ["a == b == c\n", "=== x ===\n", "x ==y\n"] {
+            assert!(
+                get_styles(text).iter().all(|s| !s.style.highlight),
+                "{text:?} has no highlight"
+            );
+        }
+    }
+
+    /// Every underline syntax: `<u>`, `<ins>` (tags in any case) and Pandoc's
+    /// `[…]{.underline}`, whose markers hide like other delimiters.
+    #[test]
+    fn test_underline_variants() {
+        let styles = get_styles("a <u>b</u> <INS>c</INS> [d e]{.underline} f\n");
+        let under: Vec<_> = styles
+            .iter()
+            .filter(|s| s.style.underline)
+            .map(|s| (s.full_range.clone(), s.content_range.clone()))
+            .collect();
+        assert_eq!(
+            under,
+            vec![(2..10, 5..6), (11..23, 16..17), (24..41, 25..28)]
+        );
+        assert!(styles.iter().all(|s| s.link_url.is_none()));
+
+        // A plain `[text]` or another attribute is not an underline.
+        for text in ["[d]\n", "[d]{.smallcaps}\n", "`<u>x</u>`\n"] {
+            assert!(
+                get_styles(text).iter().all(|s| !s.style.underline),
+                "{text:?} has no underline"
+            );
+        }
     }
 
     // GitHub reference detection tests
