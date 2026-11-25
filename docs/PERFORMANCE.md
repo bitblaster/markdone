@@ -77,6 +77,14 @@ In the app each key also redraws, about 27 ms per key in all before this work.
   re-highlights only the blocks it changed. Identical blocks share one entry. 1.6 →
   0.16 ms.
 
+- **Memory goes back to the system after a document is opened or closed** (Linux):
+  glibc keeps freed memory to reuse it, and gives back on its own only the top of its
+  heap, not the holes a closed document leaves among live data. Closing a 400 KB
+  document freed 25 MB but returned 1 MB. `release_free_memory` (`src/shell.rs`) calls
+  `malloc_trim` after the next frame (0.4-2 ms); the process then measures as after a
+  fresh start. `MARKDONE_PROFILE=1` logs each trim and `MARKDONE_DROPTEST=1` measures
+  closing every document but the first.
+
 `random_edits_keep_text_and_state_exact` (in `buffer.rs`) guards all of this: after
 each of 1,500 random edits, the text and everything derived from it (markers, styles,
 line ranges, code highlights) must equal a freshly opened document's. Run it after any

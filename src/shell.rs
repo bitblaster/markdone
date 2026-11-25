@@ -1058,6 +1058,10 @@ struct App {
     /// Set by async completions (validation/image); the next redraw does a single
     /// rebuild, coalescing many same-frame completions into one relayout.
     pending_rebuild: bool,
+    /// A document was opened or closed: after the next frame (once the layout caches
+    /// hold only the lines shown), hand the memory freed meanwhile back to the system:
+    /// what a closed document took, and what parsing an opened one only borrowed.
+    trim_memory: bool,
     frame_retry: FrameRetry,
     reloads: ReloadState,
     /// System clipboard for copy/cut/paste. Held for the app's lifetime (on Wayland the
@@ -1263,6 +1267,8 @@ impl App {
             autotabs_round: 1,
             last_drag_tick: None,
             pending_rebuild: false,
+            // The documents opened at startup.
+            trim_memory: true,
             frame_retry: FrameRetry::default(),
             reloads: ReloadState::default(),
             clipboard: arboard::Clipboard::new().ok(),
@@ -1440,6 +1446,7 @@ impl App {
         let active_id = self.tabs[self.active_tab].id;
         self.tabs.retain(|t| !closing(t));
         self.active_tab = self.tab_index(active_id).expect("active tab survives");
+        self.trim_memory = true;
         self.redraw();
     }
 
@@ -1782,6 +1789,7 @@ impl App {
         {
             self.remove_tabs(&[blank]);
         }
+        self.trim_memory = true;
         self.redraw();
     }
 
@@ -3205,6 +3213,32 @@ fn configure_allocator() {
         unsafe {
             mallopt(M_MMAP_THRESHOLD, 256 * 1024);
             mallopt(M_TRIM_THRESHOLD, 1024 * 1024);
+        }
+    }
+}
+
+/// Hand the allocator's free memory back to the system. glibc keeps what a closed
+/// document freed to reuse it, so the process stays as large as with the document open
+/// (measured: 25 MB freed, 1 MB of it given back); `malloc_trim` releases the free pages
+/// of every arena. The other platforms' allocators give back on their own.
+fn release_free_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        let before = profile::enabled().then(|| (self_pss(), Instant::now()));
+        // SAFETY: malloc_trim only returns free pages to the system.
+        unsafe {
+            malloc_trim(0);
+        }
+        if let Some((pss, t0)) = before {
+            eprintln!(
+                "[markdone-mem] trimmed in {:.1} ms: PSS {pss} -> {} | {}",
+                t0.elapsed().as_secs_f64() * 1e3,
+                self_pss(),
+                allocator_stats()
+            );
         }
     }
 }
@@ -6360,6 +6394,9 @@ impl ApplicationHandler<WritEvent> for App {
                 state.window.pre_present_notify();
                 surface_texture.present();
                 self.frame_retry = FrameRetry::default();
+                if std::mem::take(&mut self.trim_memory) {
+                    release_free_memory();
+                }
                 self.prefs_open = prefs_open;
                 if let Some(r) = toc_response {
                     if let Some(i) = r.clicked {
@@ -6466,6 +6503,7 @@ impl ApplicationHandler<WritEvent> for App {
                 self_pss(),
                 allocator_stats()
             );
+            release_free_memory();
         }
         if let Some(i) = self.pending_tab_switch.take() {
             self.switch_tab(i);
