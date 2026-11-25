@@ -4323,6 +4323,15 @@ fn paint_document(
             scene, engine, theme, editor, doc, editor_h, font_size, scale,
         );
     }
+    // Git change bar, in the gap between the fold chevrons and the text.
+    let bar_x1 = doc.body_left() - 6.0 * scale;
+    doc.draw_diff_bars(
+        scene,
+        editor_h,
+        bar_x1 - 3.0 * scale,
+        bar_x1,
+        peniko_color(theme.foreground),
+    );
     scene.pop_layer();
 
     // Chrome (bottom, above the OS-native title bar): the find bar sits in the gap

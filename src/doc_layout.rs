@@ -328,8 +328,13 @@ impl TableLayout {
     /// Left edge (device px, from the line origin) of the glyphs of cell `col` laid out
     /// as `slot`: past the cell padding, shifted by the column's alignment.
     fn text_x(&self, col: usize, slot: &CellSlot, cell_pad_x: f32) -> f32 {
+        self.text_x_for(col, slot.layout.width(), cell_pad_x)
+    }
+
+    /// [`Self::text_x`] for any layout `width` wide in column `col`.
+    fn text_x_for(&self, col: usize, width: f32, cell_pad_x: f32) -> f32 {
         let align = self.aligns.get(col).copied().unwrap_or(Align::Left);
-        let extra = (self.col_w[col] - slot.layout.width()).max(0.0);
+        let extra = (self.col_w[col] - width).max(0.0);
         let shift = match align {
             Align::Left => 0.0,
             Align::Right => extra,
@@ -578,11 +583,8 @@ fn build_table_layout(
                         mark_ranges,
                         misspelled,
                     } = build_cell_render(snapshot, theme, range, styles, reveal);
-                    if is_header && !text.is_empty() {
-                        // Bold the whole header cell; content color runs still win their spans.
-                        let mut base = StyleRun::new(0..text.len(), fg);
-                        base.bold = true;
-                        runs.insert(0, base);
+                    if is_header {
+                        bold_header_cell(&text, &mut runs, fg);
                     }
                     let w = engine
                         .build_line(&text, scale, base_font_size, line_height, fg, None, &runs)
@@ -876,14 +878,42 @@ struct LineDiff {
     is_addition: bool,
     /// Display byte ranges of word-level additions within the line.
     inline: Vec<Range<usize>>,
+    /// Grid table row: the word-level additions per column, as display byte ranges
+    /// within each cell's layout (the line's own text is hidden, so `inline` is unused).
+    cells: Vec<Vec<Range<usize>>>,
 }
 
 /// A deleted (ghost) line, rendered from the HEAD snapshot above the buffer line
 /// it was removed before. Inert: not in the hit-test/cursor index.
 struct Ghost {
-    layout: parley::Layout<Brush>,
     height: f32,
-    /// Display byte ranges of word-level deletions within the ghost line.
+    body: GhostBody,
+}
+
+enum GhostBody {
+    /// The line's text, with the display byte ranges of its word-level deletions.
+    Text {
+        layout: Box<parley::Layout<Brush>>,
+        inline: Vec<Range<usize>>,
+    },
+    /// A deleted row of a grid table, drawn as cells instead of raw pipe text.
+    Row(GhostRow),
+}
+
+/// A deleted table row: its cells laid out on a grid table's columns, so it lines up
+/// with the rows around it.
+struct GhostRow {
+    /// Whose columns the cells sit in (`col_x`, `col_w`, `aligns`): the current table,
+    /// or the HEAD one when the column count changed.
+    grid: Rc<TableLayout>,
+    header: bool,
+    /// One cell per column of `grid` (`None` for a ragged/missing cell).
+    cells: Vec<Option<GhostCell>>,
+}
+
+struct GhostCell {
+    layout: parley::Layout<Brush>,
+    /// Display byte ranges of word-level deletions within the cell.
     inline: Vec<Range<usize>>,
 }
 
@@ -934,9 +964,35 @@ fn estimate_ghost_height(diff: Option<&DiffState>, new_line: usize, min_row: f32
         .unwrap_or(0.0)
 }
 
+/// Whether the block spanning buffer bytes `block` (a mermaid/math block shown rendered)
+/// has a git change in its source: one of its lines added or modified, or deleted lines
+/// hanging above one of them. Its ghosts and added-line tints aren't drawn while it is
+/// rendered, so the change bar is all that shows it.
+#[cfg_attr(not(any(feature = "mermaid", feature = "math")), allow(dead_code))]
+fn block_has_changes(
+    diff: Option<&DiffState>,
+    snapshot: &RenderSnapshot,
+    block: &Range<usize>,
+) -> bool {
+    let Some(d) = diff else {
+        return false;
+    };
+    if block.is_empty() {
+        return false;
+    }
+    let first = snapshot.rope.byte_to_line(block.start);
+    let last = snapshot.rope.byte_to_line(block.end - 1);
+    (first..=last).any(|l| d.is_addition(l) || d.ghost_lines_before(l).is_some())
+}
+
 /// Build the ghost (deleted) lines that render above buffer line `new_line`. Returns the
 /// shaped ghosts (bottom-aligned to the real line by the draw pass) and the block's TOTAL
 /// height — shaped rows plus the estimated height of any lines beyond `GHOST_SHAPE_CAP`.
+///
+/// A deleted row of a grid table is laid out as cells on `grid`'s columns — the grid
+/// table the hunk sits in (or ends just after) in the buffer — so it lines up with the
+/// rows around it; see [`build_ghost_table_row`].
+#[allow(clippy::too_many_arguments)]
 fn build_ghosts_before(
     engine: &mut TextEngine,
     diff: Option<&DiffState>,
@@ -945,6 +1001,8 @@ fn build_ghosts_before(
     params: &LayoutParams,
     max_advance: f32,
     min_row: f32,
+    grid: Option<&Rc<TableLayout>>,
+    table_cache: &mut TableCache,
 ) -> (Vec<Ghost>, f32) {
     let LayoutParams {
         scale,
@@ -969,6 +1027,20 @@ fn build_ghosts_before(
     for old_line in shape_from..old_range.end {
         if old_line >= old.line_count() {
             break;
+        }
+        if let Some(ghost) = build_ghost_table_row(
+            engine,
+            d,
+            old_line,
+            theme,
+            params,
+            max_advance,
+            grid,
+            table_cache,
+        ) {
+            block_height += ghost.height;
+            out.push(ghost);
+            continue;
         }
         // Only the few visible ghost lines need styling, so compute per line instead
         // of bucketing the entire HEAD snapshot on every rebuild.
@@ -1005,11 +1077,157 @@ fn build_ghosts_before(
         block_height += layout.height();
         out.push(Ghost {
             height: layout.height(),
-            layout,
-            inline,
+            body: GhostBody::Text {
+                layout: Box::new(layout),
+                inline,
+            },
         });
     }
     (out, block_height)
+}
+
+/// A deleted line that was a header or body row of a grid table in HEAD, laid out as a
+/// table row: each cell shaped (styled as in the table, the header bold) and wrapped to
+/// its column of `grid`, the word-level deletions mapped into each cell. When `grid` is
+/// missing or has a different column count (a column was added or removed), the HEAD
+/// table's own columns are used instead. `None` for any other line — including the
+/// delimiter row, which has no height in the grid: its raw text stays visible so an
+/// alignment change still shows.
+#[allow(clippy::too_many_arguments)]
+fn build_ghost_table_row(
+    engine: &mut TextEngine,
+    d: &DiffState,
+    old_line: usize,
+    theme: &EditorTheme,
+    params: &LayoutParams,
+    max_advance: f32,
+    grid: Option<&Rc<TableLayout>>,
+    table_cache: &mut TableCache,
+) -> Option<Ghost> {
+    let LayoutParams {
+        scale,
+        base_font_size,
+        line_height,
+        fg,
+        ..
+    } = *params;
+    let old = &d.old_snapshot;
+    let (table, kind) = old
+        .table_row_at_line(old_line)
+        .filter(|(t, _)| table_grid_ok(t))?;
+    let row = match kind {
+        RowKind::Header => &table.header,
+        RowKind::Body(r) => table.body.get(r)?,
+        RowKind::Delimiter => return None,
+    };
+    let ncols = table.ncols.max(1);
+    let grid = match grid.filter(|g| g.col_x.len() == ncols) {
+        Some(g) => g.clone(),
+        None => {
+            let key = table_key(
+                table_content_hash(old, &table.block),
+                table.block.start,
+                scale,
+                base_font_size,
+                max_advance,
+                None,
+            );
+            table_cache.get_or_build(key, || {
+                // Styles only for the table's own lines: the rest of HEAD isn't needed.
+                let mut styles = vec![Vec::new(); old.line_count()];
+                for r in std::iter::once(&table.header).chain(&table.body) {
+                    let l = old.rope.byte_to_line(r.line.start);
+                    if let Some(s) = styles.get_mut(l) {
+                        *s = old.tree_styles_for_line(l);
+                    }
+                }
+                Rc::new(build_table_layout(
+                    engine,
+                    old,
+                    theme,
+                    table,
+                    &styles,
+                    params,
+                    max_advance,
+                    None,
+                ))
+            })
+        }
+    };
+    let header = matches!(kind, RowKind::Header);
+    let styles = old.tree_styles_for_line(old_line);
+    let line_start = old.line_byte_range(old_line).start;
+    let changes = d.old_inline_changes(old_line).unwrap_or(&[]);
+    let mut cells = Vec::with_capacity(grid.col_w.len());
+    let mut max_h = 0f32;
+    for (c, &col_w) in grid.col_w.iter().enumerate() {
+        let Some(cell) = row.cells.get(c) else {
+            cells.push(None);
+            continue;
+        };
+        let CellRender {
+            text,
+            mut runs,
+            map,
+            ..
+        } = build_cell_render(old, theme, cell.content.clone(), &styles, false);
+        if header {
+            bold_header_cell(&text, &mut runs, fg);
+        }
+        let layout = engine.build_line(
+            &text,
+            scale,
+            base_font_size,
+            line_height,
+            fg,
+            Some(col_w.max(1.0)),
+            &runs,
+        );
+        max_h = max_h.max(layout.height());
+        let inline = cell_changes_to_display(&map, &cell.content, line_start, changes);
+        cells.push(Some(GhostCell { layout, inline }));
+    }
+    if max_h <= 0.0 {
+        max_h = base_font_size * line_height * scale;
+    }
+    Some(Ghost {
+        height: max_h + 2.0 * TABLE_CELL_PAD_Y * scale,
+        body: GhostBody::Row(GhostRow {
+            grid,
+            header,
+            cells,
+        }),
+    })
+}
+
+/// Bold a whole header cell under its content's own runs (which still win their spans).
+fn bold_header_cell(text: &str, runs: &mut Vec<StyleRun>, fg: Color) {
+    if !text.is_empty() {
+        let mut base = StyleRun::new(0..text.len(), fg);
+        base.bold = true;
+        runs.insert(0, base);
+    }
+}
+
+/// The part of a line's word-level changes that falls in one table cell, as non-empty
+/// display ranges of the cell. `changes` are relative to `line_start`; `content` is the
+/// cell's buffer range and `map` its segment map. A change running across a pipe is
+/// clipped to the cell.
+fn cell_changes_to_display(
+    map: &SegmentMap,
+    content: &Range<usize>,
+    line_start: usize,
+    changes: &[InlineChange],
+) -> Vec<Range<usize>> {
+    changes
+        .iter()
+        .filter_map(|ch| {
+            let s = (line_start + ch.range.start).max(content.start);
+            let e = (line_start + ch.range.end).min(content.end);
+            let dr = (s < e).then(|| map.buffer_range_to_display(s..e))?;
+            (!dr.is_empty()).then_some(dr)
+        })
+        .collect()
 }
 
 /// Map line-relative inline-change byte ranges through a line's segment map into
@@ -1450,6 +1668,9 @@ pub struct DocLayout {
     /// real line; without this, trailing deletions (esp. with no final newline) vanish.
     trailing_ghosts: Vec<Ghost>,
     trailing_ghost_height: f32,
+    /// Anchor lines (ascending) of the rendered mermaid/math blocks with a git change in
+    /// their source: the change bar runs the full height of the rendered block.
+    changed_blocks: Vec<usize>,
     /// Top y of each line's *ghost block*; the real line begins at
     /// `tops[i] + ghost_height[i]`. Length `layouts.len() + 1`. Device px.
     tops: Vec<f32>,
@@ -1643,6 +1864,7 @@ impl DocLayout {
         }
         let mut bands = Bands::new(n, empty_layout.clone(), empty_render.clone());
         let mut image_urls: Vec<String> = Vec::new();
+        let mut changed_blocks: Vec<usize> = Vec::new();
         #[cfg(feature = "mermaid")]
         let mut mermaid_sources: Vec<(String, mermaid::MermaidJob)> = Vec::new();
         #[cfg(feature = "math")]
@@ -1770,6 +1992,9 @@ impl DocLayout {
                     alt: "mermaid diagram".to_string(),
                 };
                 let (block, block_h) = build_image_block(images, &img, content_w, scale, img_vpad);
+                if block_has_changes(diff, snapshot, &m.block) {
+                    changed_blocks.push(i);
+                }
                 let range = snapshot.line_byte_range(i);
                 height_cache.set(render_key(version, i, cursor_component(i, &range)), block_h);
                 if !estimate && i > anchor_line {
@@ -1849,6 +2074,9 @@ impl DocLayout {
                     alt: "math".to_string(),
                 };
                 let (block, block_h) = build_image_block(images, &img, content_w, scale, img_vpad);
+                if block_has_changes(diff, snapshot, &m.block) {
+                    changed_blocks.push(i);
+                }
                 let range = snapshot.line_byte_range(i);
                 height_cache.set(render_key(version, i, cursor_component(i, &range)), block_h);
                 if i > anchor_line {
@@ -1861,11 +2089,6 @@ impl DocLayout {
                 bands.push_placeholder(block_h, range, Some(block));
                 continue;
             }
-            // Ghost (deleted) lines rendered before this line, from the HEAD snapshot.
-            // `gh` is the full block height (shaped rows + estimated overflow beyond the cap).
-            let (line_ghosts, gh) =
-                build_ghosts_before(engine, diff, i, theme, params, max_advance, min_row);
-
             // Line byte range + render key, computed once and shared by the render cache,
             // the height cache, and the diff mapping below. (`line_markers(i).range` is
             // byte-identical but far pricier — it runs full marker extraction per line.)
@@ -2066,6 +2289,7 @@ impl DocLayout {
                     LineDiff {
                         is_addition: true,
                         inline,
+                        cells: Vec::new(),
                     }
                 }
                 _ => LineDiff::default(),
@@ -2119,6 +2343,51 @@ impl DocLayout {
             };
             // Standalone image: the block (image or placeholder) sets the line height in
             // place of the (empty) text layout, and the URL is collected for loading.
+            // Grid table row: the added words per cell (the row's own text is hidden).
+            let mut line_diff = line_diff;
+            if line_diff.is_addition
+                && let Some((tl, kind)) = &table_line
+                && let Some(changes) = diff.and_then(|d| d.new_inline_changes(i))
+                && let Some(((t, _), r)) = snapshot
+                    .table_row_at_line(i)
+                    .zip(TableLayout::row_index(*kind))
+                && let Some(slots) = tl.row_layouts.get(r)
+            {
+                let row = if r == 0 {
+                    Some(&t.header)
+                } else {
+                    t.body.get(r - 1)
+                };
+                line_diff.cells = slots
+                    .iter()
+                    .zip(row.map_or(&[][..], |row| row.cells.as_slice()))
+                    .map(|(slot, cell)| match slot {
+                        Some(slot) => {
+                            cell_changes_to_display(&slot.map, &cell.content, range.start, changes)
+                        }
+                        None => Vec::new(),
+                    })
+                    .collect();
+            }
+            // Ghost (deleted) lines rendered before this line, from the HEAD snapshot.
+            // `gh` is the full block height (shaped rows + estimated overflow beyond the cap).
+            // Deleted table rows take their columns from this line's table, or from the
+            // line above's when the hunk ends just after a table.
+            let ghost_grid = table_line
+                .as_ref()
+                .or_else(|| bands.table_lines.last().and_then(|t| t.as_ref()))
+                .map(|(tl, _)| tl);
+            let (line_ghosts, gh) = build_ghosts_before(
+                engine,
+                diff,
+                i,
+                theme,
+                params,
+                max_advance,
+                min_row,
+                ghost_grid,
+                table_cache,
+            );
             let (image_block, line_h) = if let Some((tl, kind)) = &table_line {
                 (None, tl.height(*kind))
             } else {
@@ -2161,14 +2430,28 @@ impl DocLayout {
             bands.inline_draws.push(line_inline_draws);
             bands.table_lines.push(table_line);
         }
+        // Trailing deletions: a hunk anchored at `n` (past the last line) has no host line
+        // to hang above; build it here and draw it below the last real line.
+        let (trailing_ghosts, trailing_ghost_height) = build_ghosts_before(
+            engine,
+            diff,
+            n,
+            theme,
+            params,
+            max_advance,
+            min_row,
+            bands
+                .table_lines
+                .last()
+                .and_then(|t| t.as_ref())
+                .map(|(tl, _)| tl),
+            table_cache,
+        );
+        // Sweep after the trailing ghosts, which may use a HEAD table's grid.
         cache.sweep();
         render_cache.sweep();
         height_cache.sweep();
         table_cache.sweep();
-        // Trailing deletions: a hunk anchored at `n` (past the last line) has no host line
-        // to hang above; build it here and draw it below the last real line.
-        let (trailing_ghosts, trailing_ghost_height) =
-            build_ghosts_before(engine, diff, n, theme, params, max_advance, min_row);
         // Row tint ~0.15 and word tint ~0.40 alpha, matching GitHub's dark-mode diff
         // line/word background strengths (the row was previously a near-invisible 0.05).
         let diff_colors = DiffColors {
@@ -2200,6 +2483,7 @@ impl DocLayout {
             ghost_height,
             trailing_ghosts,
             trailing_ghost_height,
+            changed_blocks,
             quote_bars,
             image_blocks,
             inline_draws,
@@ -2875,14 +3159,70 @@ impl DocLayout {
                 bottom,
             ),
         );
-        self.fill_word_ranges(
-            scene,
-            &ghost.layout,
-            &ghost.inline,
-            top,
-            self.diff_colors.deleted_inline,
-        );
-        engine.draw_line(scene, &ghost.layout, (self.pad_x, gy));
+        match &ghost.body {
+            GhostBody::Text { layout, inline } => {
+                self.fill_word_ranges(scene, layout, inline, top, self.diff_colors.deleted_inline);
+                engine.draw_line(scene, layout, (self.pad_x, gy));
+            }
+            GhostBody::Row(row) => self.draw_ghost_row(engine, scene, row, top, bottom),
+        }
+    }
+
+    /// Paint a deleted table row between `top` and `bottom` (over its red row band): the
+    /// cell boxes as `draw_tables` paints them, the word-level deletion tint, the text.
+    fn draw_ghost_row(
+        &self,
+        engine: &TextEngine,
+        scene: &mut Scene,
+        row: &GhostRow,
+        top: f64,
+        bottom: f64,
+    ) {
+        let grid = &row.grid;
+        let pad_x = self.pad_x;
+        let cell_pad_x = self.table_cell_pad_x;
+        let bg = if row.header {
+            self.table_header_bg
+        } else {
+            self.table_bg
+        };
+        for c in 0..grid.col_x.len() {
+            let cx = (pad_x + grid.col_x[c]) as f64;
+            let box_w = (grid.col_w[c] + 2.0 * cell_pad_x) as f64;
+            let rect = Rect::new(cx, top, cx + box_w, bottom);
+            scene.fill(Fill::NonZero, Affine::IDENTITY, bg, None, &rect);
+            // The header's fill is opaque and would hide the row's red band.
+            if row.header {
+                scene.fill(
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    self.diff_colors.deleted_bg,
+                    None,
+                    &rect,
+                );
+            }
+            scene.stroke(
+                &Stroke::new(self.table_border as f64),
+                Affine::IDENTITY,
+                self.table_border_color,
+                None,
+                &rect,
+            );
+        }
+        let gy = top as f32 + self.table_cell_pad_y;
+        for (c, cell) in row.cells.iter().enumerate() {
+            let Some(cell) = cell else { continue };
+            let gx = pad_x + grid.text_x_for(c, cell.layout.width(), cell_pad_x);
+            self.fill_display_ranges(
+                scene,
+                &cell.layout,
+                &cell.inline,
+                gx as f64,
+                gy as f64,
+                self.diff_colors.deleted_inline,
+            );
+            engine.draw_line(scene, &cell.layout, (gx, gy));
+        }
     }
 
     /// Paint blockquote gutter rules: one continuous vertical rect per nesting level,
@@ -2952,16 +3292,28 @@ impl DocLayout {
             };
             let top = (self.real_top(i) - self.scroll_y) as f64;
             let bottom = (self.tops[i + 1] - self.scroll_y) as f64;
-            let bg = if matches!(kind, RowKind::Header) {
+            let header = matches!(kind, RowKind::Header);
+            let bg = if header {
                 self.table_header_bg
             } else {
                 self.table_bg
             };
+            let diff = &self.line_diffs[i];
             for c in 0..tl.col_x.len() {
                 let cx = pad_x + tl.col_x[c] as f64;
                 let box_w = (tl.col_w[c] + 2.0 * cell_pad_x) as f64;
                 let rect = Rect::new(cx, top, cx + box_w, bottom);
                 scene.fill(Fill::NonZero, Affine::IDENTITY, bg, None, &rect);
+                // The header's fill is opaque and would hide the added-row tint under it.
+                if header && diff.is_addition {
+                    scene.fill(
+                        Fill::NonZero,
+                        Affine::IDENTITY,
+                        self.diff_colors.added_bg,
+                        None,
+                        &rect,
+                    );
+                }
                 scene.stroke(
                     &Stroke::new(border),
                     Affine::IDENTITY,
@@ -2976,6 +3328,24 @@ impl DocLayout {
                     })
                 {
                     outline = Some(rect);
+                }
+            }
+            // Added words in the cells (the row's own text is hidden), over the cell fills.
+            if diff.is_addition
+                && let Some(slots) = tl.row_layouts.get(row_idx)
+            {
+                let gy = top + self.table_cell_pad_y as f64;
+                for (c, (slot, ranges)) in slots.iter().zip(&diff.cells).enumerate() {
+                    let Some(slot) = slot else { continue };
+                    let gx = self.pad_x + tl.text_x(c, slot, cell_pad_x);
+                    self.fill_display_ranges(
+                        scene,
+                        &slot.layout,
+                        ranges,
+                        gx as f64,
+                        gy,
+                        self.diff_colors.added_inline,
+                    );
                 }
             }
         }
@@ -3173,6 +3543,73 @@ impl DocLayout {
         }
     }
 
+    /// Paint the git change bar: a vertical rule in `[x0, x1]` (device px) beside every
+    /// changed stretch of the document — deleted (ghost) rows, added/modified lines, and
+    /// rendered mermaid/math blocks with a change in their source (full block height).
+    /// Adjacent changed rows merge into one bar, so a modified line's old and new versions
+    /// share it; lines with no height (folded, collapsed into a rendered block) neither
+    /// extend nor break a bar.
+    pub fn draw_diff_bars(
+        &self,
+        scene: &mut Scene,
+        viewport_h: f32,
+        x0: f32,
+        x1: f32,
+        color: Color,
+    ) {
+        for (y0, y1) in self.diff_bar_spans(viewport_h) {
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                color,
+                None,
+                &Rect::new(
+                    x0 as f64,
+                    (y0 - self.scroll_y) as f64,
+                    x1 as f64,
+                    (y1 - self.scroll_y) as f64,
+                ),
+            );
+        }
+    }
+
+    /// The vertical extents `(top, bottom)` (device px, before scroll) of the change bars
+    /// over the visible lines; see [`Self::draw_diff_bars`].
+    fn diff_bar_spans(&self, viewport_h: f32) -> Vec<(f32, f32)> {
+        let (first, last) = self.visible_range(viewport_h);
+        let n = self.layouts.len();
+        // `(top, bottom, changed)` stretches in document order.
+        let mut stretches = Vec::with_capacity(2 * (last - first) + 1);
+        for i in first..last {
+            let real = self.real_top(i);
+            stretches.push((self.tops[i], real, true)); // the ghost block (may be empty)
+            let changed =
+                self.line_diffs[i].is_addition || self.changed_blocks.binary_search(&i).is_ok();
+            stretches.push((real, self.tops[i + 1], changed));
+        }
+        if last == n {
+            let top = self.tops[n];
+            stretches.push((top, top + self.trailing_ghost_height, true));
+        }
+        let mut spans = Vec::new();
+        let mut bar: Option<(f32, f32)> = None;
+        for (top, bottom, changed) in stretches {
+            if bottom <= top {
+                continue;
+            }
+            if changed {
+                bar = Some(match bar {
+                    Some((b0, _)) => (b0, bottom),
+                    None => (top, bottom),
+                });
+            } else if let Some(b) = bar.take() {
+                spans.push(b);
+            }
+        }
+        spans.extend(bar);
+        spans
+    }
+
     pub fn draw_added_backgrounds(&self, scene: &mut Scene, viewport_h: f32) {
         let (first, last) = self.visible_range(viewport_h);
         for i in first..last {
@@ -3194,6 +3631,11 @@ impl DocLayout {
                     bottom,
                 ),
             );
+            // Grid row: its added words sit in the cells (the line's own text is hidden)
+            // and are painted by `draw_tables`, over the cell fills.
+            if self.table_lines[i].is_some() {
+                continue;
+            }
             self.fill_word_ranges(
                 scene,
                 &self.layouts[i],
@@ -3392,6 +3834,7 @@ mod tests {
             ghost_height: heights.iter().map(|_| 0.0).collect(),
             trailing_ghosts: Vec::new(),
             trailing_ghost_height: 0.0,
+            changed_blocks: Vec::new(),
             quote_bars: heights.iter().map(|_| Vec::new()).collect(),
             image_blocks: heights.iter().map(|_| None).collect(),
             inline_draws: heights.iter().map(|_| Vec::new()).collect(),
@@ -3743,6 +4186,112 @@ mod tests {
         // A click in the ghost block is inert → maps to the real line start (offset 0).
         let ghost_mid = doc.tops[0] + doc.ghost_height[0] * 0.5;
         assert_eq!(doc.hit_test(50.0, ghost_mid), Some(0));
+    }
+
+    /// Build a diff-view layout of `new_text` against HEAD `old_text`, everything laid out.
+    fn diff_doc(engine: &mut TextEngine, old_text: &str, new_text: &str) -> DocLayout {
+        use crate::buffer::Buffer;
+        use crate::diff::DiffState;
+        let theme = EditorTheme::dracula();
+        let mut base: Buffer = old_text.parse().unwrap();
+        let diff = DiffState::compute(base.render_snapshot(), old_text, new_text);
+        let mut buf: Buffer = new_text.parse().unwrap();
+        let snapshot = buf.render_snapshot();
+        let params = test_params(&theme, 1200.0);
+        DocLayout::build(
+            engine,
+            &mut LineCache::new(),
+            &mut RenderCache::new(),
+            &mut HeightCache::new(),
+            &mut TableCache::new(),
+            0,
+            &snapshot,
+            &theme,
+            Some(&diff),
+            None,
+            &ImageCache::new(),
+            usize::MAX,
+            &params,
+            None,
+            0,
+            f32::INFINITY,
+            &[],
+            &(0..0),
+            &std::collections::HashMap::new(),
+        )
+    }
+
+    /// A deleted row of a grid table is laid out as cells on the current table's columns
+    /// (not as raw pipe text), with the deleted words marked in their own cell; the added
+    /// row marks its words per cell too.
+    #[test]
+    fn deleted_table_row_renders_as_cells() {
+        let mut engine = TextEngine::new();
+        let old = "| Key | Value |\n|-----|-------|\n| one | old text |\n";
+        let new = "| Key | Value |\n|-----|-------|\n| one | new text |\n";
+        let doc = diff_doc(&mut engine, old, new);
+        let (tl, _) = doc.table_lines[2].as_ref().expect("line 2 is a grid row");
+        let [ghost] = doc.ghosts[2].as_slice() else {
+            panic!("expected one ghost above line 2");
+        };
+        let GhostBody::Row(row) = &ghost.body else {
+            panic!("the deleted table row should render as cells");
+        };
+        assert!(
+            Rc::ptr_eq(&row.grid, tl),
+            "uses the current table's columns"
+        );
+        assert!(!row.header);
+        assert_eq!(row.cells.len(), 2);
+        let cell = |c: usize| row.cells[c].as_ref().unwrap();
+        assert!(cell(0).inline.is_empty(), "unchanged cell has no marks");
+        assert!(
+            !cell(1).inline.is_empty(),
+            "the deleted word is marked in its cell"
+        );
+        assert!(doc.line_diffs[2].is_addition);
+        assert!(doc.line_diffs[2].cells[0].is_empty());
+        assert!(!doc.line_diffs[2].cells[1].is_empty());
+    }
+
+    /// A changed header row's ghost is a bold header row; a changed column count falls
+    /// back to the HEAD table's own columns.
+    #[test]
+    fn deleted_header_row_and_column_change() {
+        let mut engine = TextEngine::new();
+        let old = "| A | B |\n|---|---|\n| 1 | 2 |\n";
+        let new = "| A | Bee |\n|---|---|\n| 1 | 2 |\n";
+        let doc = diff_doc(&mut engine, old, new);
+        let GhostBody::Row(row) = &doc.ghosts[0][0].body else {
+            panic!("the deleted header should render as cells");
+        };
+        assert!(row.header);
+
+        let old = "| A | B |\n|---|---|\n| 1 | 2 |\n";
+        let new = "| A | B | C |\n|---|---|---|\n| 1 | 2 | 3 |\n";
+        let doc = diff_doc(&mut engine, old, new);
+        let GhostBody::Row(row) = &doc.ghosts[0][0].body else {
+            panic!("the deleted header should render as cells");
+        };
+        assert_eq!(row.grid.col_x.len(), 2, "HEAD table's own two columns");
+        assert_eq!(row.cells.len(), 2);
+    }
+
+    /// The change bar spans a modified line's ghost and its new version as one bar, a
+    /// pure deletion's ghost alone, and nothing over unchanged lines.
+    #[test]
+    fn diff_bars_group_old_and_new_versions() {
+        let mut engine = TextEngine::new();
+        let old = "same\nold line\nsame\ngone\nsame\n";
+        let new = "same\nnew line\nsame\nsame\n";
+        let doc = diff_doc(&mut engine, old, new);
+        let spans = doc.diff_bar_spans(f32::INFINITY);
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        // Line 1: from the top of its ghost to the bottom of the new line.
+        assert_eq!(spans[0], (doc.tops[1], doc.tops[2]));
+        // The deletion hangs above line 3, which itself is unchanged.
+        assert_eq!(spans[1], (doc.tops[3], doc.real_top(3)));
+        assert!(doc.ghost_height[3] > 0.0);
     }
 
     /// Trailing deletions (a hunk anchored past the last line, with no final newline) must

@@ -212,8 +212,11 @@ $10" stays literal). The source comes back when the cursor enters it.
 
 In a git repository, Markdone shows the changes since the last commit inline: added lines
 and words tinted green, deleted lines as faded ghost rows above their position, all
-rendered as Markdown. The diff follows edits, external changes and commits or branch
-switches live. *View → Git Differences* turns it off.
+rendered as Markdown (a table row keeps its cells, with the changed words marked in each).
+A bar in the left margin groups each change, old and new versions together, and also
+marks a rendered Mermaid diagram or formula whose source changed. The diff follows edits,
+external changes and commits or branch switches live. *View → Git Differences* turns it
+off.
 
 ![Inline git diff: deleted lines as red rows, added lines and words in green](assets/diff.png)
 
