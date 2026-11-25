@@ -647,6 +647,8 @@ enum PendingModal {
     },
     /// An image is being pasted into a document never saved (`paste_after_save`).
     SaveBeforePaste,
+    /// Help → About.
+    About,
 }
 
 /// A misspelled word right-clicked: its buffer range, and the suggestions offered.
@@ -2564,6 +2566,7 @@ impl App {
                 name: name(*id).unwrap_or_default(),
             },
             PendingModal::SaveBeforePaste => DialogView::SaveBeforePaste,
+            PendingModal::About => DialogView::About,
             PendingModal::Exported { path } => DialogView::Exported {
                 name: path.file_name().map_or_else(
                     || path.display().to_string(),
@@ -2603,6 +2606,15 @@ impl App {
                 _ => {}
             },
             PendingModal::Message { .. } => {}
+            PendingModal::About => {
+                if answer == Answer::OpenWebsite {
+                    if let Err(e) = open::that_detached(crate::ui::dialogs::WEBSITE) {
+                        eprintln!("[markdone] failed to open the website: {e}");
+                    }
+                    // The dialog stays up.
+                    self.modal = Some(PendingModal::About);
+                }
+            }
             PendingModal::ConfirmReload { id } => {
                 if answer == Answer::Reload {
                     self.reload_tab(id);
@@ -2709,6 +2721,7 @@ impl App {
         };
         match cmd {
             Command::New => self.open_blank_tab(),
+            Command::About => self.modal = Some(PendingModal::About),
             Command::Preferences => {
                 if self.font_families.is_none() {
                     self.font_families = Some(self.doc_engine.text_engine.font_families());

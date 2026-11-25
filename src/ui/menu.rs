@@ -38,7 +38,7 @@ pub fn menu_bar(ui: &mut egui::Ui, state: &MenuState) -> Option<Command> {
                 .style(super::menu_entry_style)
                 .config(config)
                 .ui(ui, |ui| {
-                    let mut titles: Vec<egui::Response> = Vec::with_capacity(4);
+                    let mut titles: Vec<egui::Response> = Vec::with_capacity(5);
                     titles.push(
                         ui.menu_button("File", |ui| {
                             item(ui, "New", Command::New, true, &mut picked);
@@ -126,6 +126,12 @@ pub fn menu_bar(ui: &mut egui::Ui, state: &MenuState) -> Option<Command> {
                             let multi = state.tab_count > 1;
                             item(ui, "Next Tab", Command::NextTab, multi, &mut picked);
                             item(ui, "Previous Tab", Command::PrevTab, multi, &mut picked);
+                        })
+                        .response,
+                    );
+                    titles.push(
+                        ui.menu_button("Help", |ui| {
+                            item(ui, "About Markdone", Command::About, true, &mut picked);
                         })
                         .response,
                     );

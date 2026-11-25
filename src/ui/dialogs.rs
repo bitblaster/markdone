@@ -1,5 +1,5 @@
 //! Modal dialogs: unsaved changes on close, a file changed on disk under unsaved edits,
-//! pasting an image, and plain messages (errors, notices).
+//! pasting an image, plain messages (errors, notices), and Help → About.
 //!
 //! These functions only draw and report the user's choice. The shell owns the state
 //! behind a dialog (which tabs are closing, the disk content waiting to be applied) and
@@ -26,6 +26,8 @@ pub enum DialogView {
     },
     /// An image is being pasted into a document that was never saved.
     SaveBeforePaste,
+    /// Help → About.
+    About,
 }
 
 /// The user's choice.
@@ -47,15 +49,123 @@ pub enum Answer {
     OpenFile,
     /// Show the exported file in the file manager.
     Reveal,
+    /// Open the project's website (About).
+    OpenWebsite,
 }
 
 const WIDTH: f32 = 420.0;
+/// The About dialog is wider: its components table has three columns.
+const ABOUT_WIDTH: f32 = 520.0;
+
+/// The project's home page, linked from About.
+pub const WEBSITE: &str = "https://github.com/bitblaster/markdone";
+
+/// The main components About lists: the name shown, the crate whose version is shown
+/// (from `Cargo.lock`, see `build.rs`), and what it does here.
+const COMPONENTS: &[(&str, &str, &str)] = &[
+    ("egui", "egui", "Menus, dialogs and panels"),
+    ("Vello", "vello", "Drawing the document on the GPU"),
+    ("wgpu", "wgpu", "Graphics (Vulkan, Metal, DirectX 12)"),
+    ("Parley", "parley", "Text layout and line breaking"),
+    ("winit", "winit", "Windows and input"),
+    (
+        "tree-sitter",
+        "tree-sitter",
+        "Markdown parsing, code highlighting",
+    ),
+    ("Ropey", "ropey", "The text being edited"),
+    ("pulldown-cmark", "pulldown-cmark", "HTML and PDF export"),
+    ("merman", "merman", "Mermaid diagrams"),
+    ("RaTeX", "ratex-render", "Math formulas"),
+    (
+        "Spellbook",
+        "spellbook",
+        "Spell checking (Hunspell dictionaries)",
+    ),
+    ("resvg", "resvg", "SVG images"),
+    ("gitoxide", "gix", "Git differences"),
+];
+
+/// The version `build.rs` found locked for `krate`.
+fn component_version(krate: &str) -> Option<&'static str> {
+    env!("MARKDONE_COMPONENT_VERSIONS")
+        .split(',')
+        .filter_map(|pair| pair.split_once(' '))
+        .find(|(name, _)| *name == krate)
+        .map(|(_, version)| version)
+}
+
+/// The application icon as a texture, decoded once and kept in egui's memory.
+fn app_icon(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new("about-app-icon");
+    if let Some(icon) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return Some(icon);
+    }
+    let png = include_bytes!("../../packaging/icons/markdone-128.png");
+    let rgba = image::load_from_memory(png).ok()?.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let pixels = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+    let icon = ctx.load_texture("markdone-icon", pixels, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(id, icon.clone()));
+    Some(icon)
+}
+
+/// Help → About: name, version, what Markdone is, its license and its main components.
+fn about(ui: &mut egui::Ui) -> Option<Answer> {
+    let mut answer = None;
+    ui.horizontal(|ui| {
+        if let Some(icon) = app_icon(ui.ctx()) {
+            let size = egui::vec2(64.0, 64.0);
+            ui.add(egui::Image::from_texture(egui::load::SizedTexture::new(
+                icon.id(),
+                size,
+            )));
+        }
+        ui.vertical(|ui| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Markdone").heading().strong());
+            ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+        });
+    });
+    ui.label(
+        "A fast, lightweight Markdown editor. Documents render as you type: headings, \
+         lists and tasks, tables edited as a grid, links and images, code with syntax \
+         highlighting, math, Mermaid diagrams, footnotes and callouts. The file stays \
+         plain Markdown.",
+    );
+    ui.label(
+        "Free software, released under the MIT License. Markdone is a fork of writ, by \
+         Wilfred Denton.",
+    );
+    if ui.link(WEBSITE.trim_start_matches("https://")).clicked() {
+        answer = Some(Answer::OpenWebsite);
+    }
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Built with").strong());
+    egui::Grid::new("about-components")
+        .num_columns(3)
+        .spacing([16.0, 4.0])
+        .show(ui, |ui| {
+            for &(name, krate, role) in COMPONENTS {
+                ui.label(name);
+                ui.weak(component_version(krate).unwrap_or(""));
+                ui.label(role);
+                ui.end_row();
+            }
+        });
+    ui.weak("Each component is distributed under its own license.");
+    answer.or(buttons(ui, &[], &[("Close", Answer::Ok)]))
+}
 
 /// Draw the dialog; returns the answer once the user picks one.
 pub fn show(ctx: &egui::Context, view: &DialogView) -> Option<Answer> {
     let mut answer = None;
     let response = egui::Modal::new(egui::Id::new("writ-dialog")).show(ctx, |ui| {
-        ui.set_width(WIDTH);
+        ui.set_width(if matches!(view, DialogView::About) {
+            ABOUT_WIDTH
+        } else {
+            WIDTH
+        });
         ui.spacing_mut().item_spacing.y = 10.0;
         match view {
             DialogView::Unsaved { names, quitting } => {
@@ -120,6 +230,7 @@ pub fn show(ctx: &egui::Context, view: &DialogView) -> Option<Answer> {
                     &[("Cancel", Answer::Cancel), ("Save As…", Answer::Save)],
                 );
             }
+            DialogView::About => answer = about(ui),
             DialogView::Exported { name } => {
                 heading(ui, "PDF exported");
                 ui.label(format!("“{name}” is ready."));
@@ -141,7 +252,9 @@ pub fn show(ctx: &egui::Context, view: &DialogView) -> Option<Answer> {
             DialogView::Unsaved { .. }
             | DialogView::ConfirmReload { .. }
             | DialogView::SaveBeforePaste => Answer::Cancel,
-            DialogView::Message { .. } | DialogView::Exported { .. } => Answer::Ok,
+            DialogView::Message { .. } | DialogView::Exported { .. } | DialogView::About => {
+                Answer::Ok
+            }
         });
     }
     answer

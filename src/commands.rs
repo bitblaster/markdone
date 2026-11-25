@@ -46,6 +46,8 @@ pub enum Command {
     /// A structural edit of the table at the caret (context menu → Table).
     Table(TableOp),
     Preferences,
+    /// Help → About: the program's name, version, license and components.
+    About,
     Find,
     Replace,
     ToggleOutline,
