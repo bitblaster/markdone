@@ -20,6 +20,13 @@ AppId={{2967A7B3-51DF-4696-8644-1230F69DE0C6}
 AppName=Markdone
 AppVersion={#AppVersion}
 AppVerName=Markdone {#AppVersion}
+; The installer's own version information (code signing enforces the product name and
+; version, see .signpath/).
+VersionInfoVersion={#AppVersion}
+VersionInfoProductName=Markdone
+VersionInfoProductVersion={#AppVersion}
+VersionInfoProductTextVersion={#AppVersion}
+VersionInfoDescription=Markdone Setup
 AppPublisher=The Markdone contributors
 AppPublisherURL=https://github.com/bitblaster/markdone
 AppSupportURL=https://github.com/bitblaster/markdone/issues

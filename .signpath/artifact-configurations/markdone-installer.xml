@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration for the Windows installer (code signing, step 2).
+  The installer (Inno Setup, packaging/windows/markdone.iss) is built around the already
+  signed markdone.exe and uploaded alone as a GitHub artifact: a zip holding
+  markdone-v<version>-x86_64-pc-windows-msvc-setup.exe. Its product name and version
+  come from the VersionInfo* settings of markdone.iss.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <pe-file path="markdone-v${version}-x86_64-pc-windows-msvc-setup.exe" product-name="Markdone" product-version="${version}">
+      <authenticode-sign hash-algorithm="sha256" description="Markdone Setup" description-url="https://github.com/bitblaster/markdone" />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

@@ -3,6 +3,14 @@ name: Release
 # A `v*` tag (matching the version in Cargo.toml) builds every platform and attaches the
 # archives to a *draft* GitHub Release, to review and publish by hand. Run it manually
 # (Actions → Release → Run workflow) to build the archives as artifacts only, no release.
+#
+# Windows code signing (SignPath Foundation, see docs/code-signing.md): off until the
+# repository variable SIGNPATH_ENABLED is `true`. Then, for a tag pushed to this
+# repository, markdone.exe is signed first (so the portable zip and the installer carry
+# the signed program), then the installer; the checksums are computed afterwards, from
+# the signed files. The IDs are repository variables (SIGNPATH_ORGANIZATION_ID,
+# SIGNPATH_PROJECT_SLUG, SIGNPATH_SIGNING_POLICY_SLUG, SIGNPATH_EXE_CONFIGURATION_SLUG,
+# SIGNPATH_INSTALLER_CONFIGURATION_SLUG), the token the secret SIGNPATH_API_TOKEN.
 on:
   push:
     tags: ["v*"]
@@ -10,6 +18,8 @@ on:
 
 permissions:
   contents: write
+  # SignPath fetches the uploaded artifacts with the workflow's token.
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,6 +40,10 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
+    env:
+      # Sign the Windows build: only when enabled, for a tag pushed to this repository
+      # (never a manual run, a fork or a pull request), on GitHub's own runners.
+      SIGN_WINDOWS: ${{ matrix.os == 'windows-latest' && vars.SIGNPATH_ENABLED == 'true' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'bitblaster/markdone' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -59,10 +73,73 @@ jobs:
             exit 1
           fi
 
+      - name: Read the version
+        id: meta
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check the signing setup
+        if: env.SIGN_WINDOWS == 'true'
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          ORG: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          PROJECT: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          POLICY: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          EXE_CONFIG: ${{ vars.SIGNPATH_EXE_CONFIGURATION_SLUG }}
+          INSTALLER_CONFIG: ${{ vars.SIGNPATH_INSTALLER_CONFIGURATION_SLUG }}
+        run: |
+          # Signing is on: a missing setting fails the build rather than publishing
+          # unsigned files by mistake.
+          missing=""
+          for v in TOKEN ORG PROJECT POLICY EXE_CONFIG INSTALLER_CONFIG; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::SIGNPATH_ENABLED is true but these are not set:$missing"
+            exit 1
+          fi
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      # --- Windows signing, step 1: the program itself. ---
+      - name: Upload the executable for signing
+        if: env.SIGN_WINDOWS == 'true'
+        id: unsigned-exe
+        uses: actions/upload-artifact@v7
+        with:
+          name: signing-request-exe
+          path: target/${{ matrix.target }}/release/markdone.exe
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Sign the executable (SignPath)
+        if: env.SIGN_WINDOWS == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_EXE_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.unsigned-exe.outputs.artifact-id }}
+          parameters: |
+            version: "${{ steps.meta.outputs.version }}"
+          wait-for-completion: true
+          # Every request is approved by hand in SignPath: leave time for it.
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed/exe
+
+      - name: Use the signed executable
+        if: env.SIGN_WINDOWS == 'true'
+        shell: bash
+        run: cp -f signed/exe/markdone.exe "target/${{ matrix.target }}/release/markdone.exe"
+
       - name: Package
+        id: package
         shell: bash
         run: |
           # The archive names carry the tag (or the commit, for a manual run); the app
@@ -73,14 +150,15 @@ jobs:
             label="$(git rev-parse --short HEAD)"
           fi
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          # The packaged README: the archives don't carry the images or the example
-          # config, so point those at GitHub, pinned to this tag/commit (LICENSE is
+          # The packaged README: the archives don't carry the images, the example config
+          # or the docs, so point those at GitHub, pinned to this tag/commit (LICENSE is
           # packaged and stays relative). Rewritten in the runner's checkout only.
           ref="$GITHUB_SHA"
           [[ "$GITHUB_REF" == refs/tags/* ]] && ref="$GITHUB_REF_NAME"
           sed -E \
             -e "s#\]\((assets/[^)]+)\)#](https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$ref/\1)#g" \
             -e "s#\]\((config\.example\.toml)\)#](https://github.com/$GITHUB_REPOSITORY/blob/$ref/\1)#g" \
+            -e "s#\]\((docs/[^)]+)\)#](https://github.com/$GITHUB_REPOSITORY/blob/$ref/\1)#g" \
             README.md > README.packaged.md
           mv README.packaged.md README.md
           name="markdone-$label-${{ matrix.target }}"
@@ -106,6 +184,7 @@ jobs:
                 "-O$(cygpath -w "$PWD/dist")" \
                 "-F$name-setup" \
                 packaging/windows/markdone.iss
+              echo "installer=dist/$name-setup.exe" >> "$GITHUB_OUTPUT"
               ;;
             macOS)
               # A Markdone.app bundle (zipped with ditto, which keeps bundle metadata).
@@ -118,6 +197,46 @@ jobs:
               (cd dist && ditto -c -k --keepParent "$name" "$name.zip" && rm -rf "$name")
               ;;
           esac
+
+      # --- Windows signing, step 2: the installer (built around the signed program). ---
+      - name: Upload the installer for signing
+        if: env.SIGN_WINDOWS == 'true'
+        id: unsigned-installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: signing-request-installer
+          path: ${{ steps.package.outputs.installer }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Sign the installer (SignPath)
+        if: env.SIGN_WINDOWS == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_INSTALLER_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.unsigned-installer.outputs.artifact-id }}
+          parameters: |
+            version: "${{ steps.meta.outputs.version }}"
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed/installer
+
+      - name: Use the signed installer
+        if: env.SIGN_WINDOWS == 'true'
+        shell: bash
+        run: |
+          installer="${{ steps.package.outputs.installer }}"
+          cp -f "signed/installer/$(basename "$installer")" "$installer"
+
+      # Last, from the final (signed) files: the self-updater checks the archive it
+      # downloads against its .sha256.
+      - name: Checksums
+        shell: bash
+        run: |
           cd dist
           for f in *; do
             if [ "$RUNNER_OS" = "macOS" ]; then
@@ -142,6 +261,8 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           path: dist
+          # The release files only, not the files uploaded for signing.
+          pattern: markdone-*
           merge-multiple: true
 
       - name: Create the draft release

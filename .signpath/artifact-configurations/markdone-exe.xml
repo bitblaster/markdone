@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration for markdone.exe (Windows code signing, step 1).
+  The release workflow uploads the executable alone as a GitHub artifact, which reaches
+  SignPath as a zip with markdone.exe at its root. The product name and version must
+  match the executable's version resource (set by build.rs from Cargo.toml); the
+  workflow passes the version as the `version` parameter.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <pe-file path="markdone.exe" product-name="Markdone" product-version="${version}">
+      <authenticode-sign hash-algorithm="sha256" description="Markdone" description-url="https://github.com/bitblaster/markdone" />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

@@ -15,7 +15,8 @@ themes, PDF export, diagrams and more.
 
 Download the archive for your system from the
 [Releases](https://github.com/bitblaster/markdone/releases) page. The builds are not
-signed yet, so Windows and macOS warn about them on the first launch (see below).
+signed yet, so Windows and macOS warn about them on the first launch (see below). Signing
+of the Windows builds is being set up: see the [Code Signing Policy](#code-signing-policy).
 
 ### Windows
 
@@ -26,8 +27,10 @@ signed yet, so Windows and macOS warn about them on the first launch (see below)
 - **Portable** (`markdone-…-x86_64-pc-windows-msvc.zip`): unzip anywhere and run
   `markdone.exe`.
 
-On the first launch SmartScreen may say that it protected your PC: choose *More info →
-Run anyway*.
+Once code signing is enabled, both the installer and `markdone.exe` (also in the portable
+zip) are signed by SignPath Foundation (see the [Code Signing Policy](#code-signing-policy)).
+Until then the builds are unsigned, and on the first launch SmartScreen may say that it
+protected your PC: choose *More info → Run anyway*.
 
 ### macOS (Apple Silicon)
 
@@ -388,6 +391,21 @@ SVG by merman and recorded once into a Vello scene fragment, drawn as vectors.
   `===` or `---`) render as plain text.
 - macOS: opening a document from Finder (double-click, *Open With*) does not pass it to
   Markdone yet; use *File → Open*, drag it on the window, or the command line.
+
+## Code Signing Policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by
+[SignPath Foundation](https://signpath.org) (being set up: until it is enabled, the
+Windows builds are unsigned).
+
+The Windows program and installer built by this repository's release workflow from a
+tagged commit are signed, after a manual approval of each signing request. Committer,
+reviewer and approver: [Roberto Mozzicato (bitblaster)](https://github.com/bitblaster);
+multi-factor authentication is required on GitHub and SignPath. Markdone collects no data;
+the few connections it makes (the update check, dictionary downloads, the optional GitHub
+references, web images in documents) are listed with what they send in the policy.
+
+The full policy, with the privacy statement: [docs/code-signing.md](docs/code-signing.md).
 
 ## License
 
