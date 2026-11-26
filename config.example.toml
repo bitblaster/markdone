@@ -47,6 +47,9 @@ github = false
 # GitHub API token for those lookups (validation, hover cards, autocomplete). Stored in
 # plain text; --github-token or the GITHUB_TOKEN variable take precedence.
 # github_token = "ghp_..."
+# At startup, check GitHub for a newer Markdone and offer to install it (where the
+# program's folder is writable; otherwise the download page is offered).
+check_updates = true
 
 [theme]
 # One theme for dark mode and one for light mode: a built-in preset, or the name of a

@@ -1,6 +1,6 @@
 //! Markdown formatting commands as pure text edits: toggle inline styles (bold,
 //! italic, …), set a paragraph style on the selected lines (heading, list, quote),
-//! insert links, images and code blocks.
+//! insert links, images, code blocks and tables.
 //!
 //! Each function takes the document text and the selection and returns one
 //! [`TextEdit`]: a byte range to replace, its replacement, and the selection afterwards.
@@ -306,6 +306,47 @@ pub fn insert_code_block(text: &str, selection: Range<usize>) -> TextEdit {
     }
 }
 
+/// The table Edit → Insert → Table adds: a header row and a body row of two empty cells.
+const NEW_TABLE: &str = "|     |     |\n| --- | --- |\n|     |     |";
+
+/// Insert an empty table (two columns, header and one row) as a block of its own: on the
+/// caret's line if that is blank, after it otherwise, with blank lines around it. The
+/// caret goes to the first header cell.
+pub fn insert_table(text: &str, selection: Range<usize>) -> TextEdit {
+    let is_blank = |line: &str| line.trim().is_empty();
+    let pos = selection.end;
+    let line_start = text[..pos].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = text[pos..].find('\n').map_or(text.len(), |i| pos + i);
+    let (range, lead) = if is_blank(&text[line_start..line_end]) {
+        // The line before must be blank too (or absent), or the table would join it.
+        let prev = text[..line_start.saturating_sub(1)]
+            .rsplit('\n')
+            .next()
+            .unwrap_or("");
+        let lead = if line_start == 0 || is_blank(prev) {
+            ""
+        } else {
+            "\n"
+        };
+        (line_start..line_end, lead)
+    } else {
+        (line_end..line_end, "\n\n")
+    };
+    // After the table: the line break ending its last row, and a blank line before
+    // whatever text follows.
+    let trail = match text[range.end..].strip_prefix('\n') {
+        None => "\n",
+        Some(rest) if rest.split('\n').next().is_some_and(|next| !is_blank(next)) => "\n",
+        Some(_) => "",
+    };
+    let caret = range.start + lead.len() + 2;
+    TextEdit {
+        range,
+        text: format!("{lead}{NEW_TABLE}{trail}"),
+        selection: caret..caret,
+    }
+}
+
 /// `![name](path)` for an image file, the path relative to the document's folder when
 /// possible (absolute otherwise); angle brackets keep spaces and parentheses valid.
 pub fn image_markdown(target: &Path, doc_dir: Option<&Path>) -> String {
@@ -445,6 +486,21 @@ mod tests {
         let e = insert_code_block("text", 4..4);
         assert_eq!(apply("text", &e), "text\n```\n\n```\n");
         assert_eq!(e.selection, 9..9);
+
+        // A table after a paragraph line, between blank lines, at the end of the text.
+        const TABLE: &str = "|     |     |\n| --- | --- |\n|     |     |";
+        let e = insert_table("ab\ncd", 1..1);
+        assert_eq!(apply("ab\ncd", &e), format!("ab\n\n{TABLE}\n\ncd"));
+        assert_eq!(e.selection, 6..6);
+        let e = insert_table("ab\n\n\ncd", 4..4);
+        assert_eq!(apply("ab\n\n\ncd", &e), format!("ab\n\n{TABLE}\n\ncd"));
+        let e = insert_table("ab\n\ncd", 3..3);
+        assert_eq!(apply("ab\n\ncd", &e), format!("ab\n\n{TABLE}\n\ncd"));
+        let e = insert_table("ab", 2..2);
+        assert_eq!(apply("ab", &e), format!("ab\n\n{TABLE}\n"));
+        let e = insert_table("", 0..0);
+        assert_eq!(apply("", &e), format!("{TABLE}\n"));
+        assert_eq!(e.selection, 2..2);
 
         // An absolute folder on this platform (`/docs` is relative on Windows: no drive).
         let docs = Path::new(if cfg!(windows) { r"C:\docs" } else { "/docs" });

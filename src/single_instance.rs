@@ -9,17 +9,35 @@
 //!
 //! Protocol: the client sends each path followed by a NUL byte, then an empty record (a
 //! lone NUL) as the end; the server answers `ok\n` once it has queued the files. No
-//! files means "just bring the window up".
+//! files means "just bring the window up". An instance restarting after an update
+//! answers `retiring\n` instead: the launch then waits for it to exit and takes over.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{ListenerOptions, Name, Stream};
 
 /// How long a launch waits for the running instance to acknowledge its files.
 const ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The answer of an instance about to exit (it restarts after an update): the launch
+/// waits for it to be gone, then becomes the instance.
+const RETIRING: &str = "retiring";
+
+/// How long a launch waits for a retiring instance to exit.
+const RETIRE_WAIT: Duration = Duration::from_secs(15);
+
+/// Set by [`retire`].
+static RETIRED: AtomicBool = AtomicBool::new(false);
+
+/// Stop serving other launches: from now on they wait for this process to exit and take
+/// over (used before starting the updated program).
+pub fn retire() {
+    RETIRED.store(true, Ordering::SeqCst);
+}
 
 /// Outcome of [`claim`].
 pub enum Instance {
@@ -64,16 +82,24 @@ pub fn claim(paths: &[PathBuf]) -> Instance {
             return Instance::Standalone;
         }
     };
-    if let Ok(stream) = Stream::connect(name.clone()) {
-        return match forward(stream, paths) {
-            Ok(()) => Instance::Forwarded,
+    let start = Instant::now();
+    while let Ok(stream) = Stream::connect(name.clone()) {
+        match forward(stream, paths) {
+            Ok(Answer::Taken) => return Instance::Forwarded,
+            Ok(Answer::Retiring) if start.elapsed() < RETIRE_WAIT => {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Ok(Answer::Retiring) => {
+                eprintln!("[markdone] the running instance does not exit; starting a new one");
+                return Instance::Standalone;
+            }
             Err(e) => {
                 eprintln!(
                     "[markdone] the running instance did not answer ({e}); starting a new one"
                 );
-                Instance::Standalone
+                return Instance::Standalone;
             }
-        };
+        }
     }
     // Nobody listening: take the name over (a stale socket file is replaced).
     match ListenerOptions::new()
@@ -89,7 +115,15 @@ pub fn claim(paths: &[PathBuf]) -> Instance {
     }
 }
 
-fn forward(mut stream: Stream, paths: &[PathBuf]) -> io::Result<()> {
+/// How the running instance answered a launch.
+enum Answer {
+    /// It opens the files.
+    Taken,
+    /// It is exiting: try again.
+    Retiring,
+}
+
+fn forward(mut stream: Stream, paths: &[PathBuf]) -> io::Result<Answer> {
     stream.write_all(&encode(paths))?;
     stream.flush()?;
     // Wait for the acknowledgement on a helper thread (sync streams have no timeout).
@@ -102,7 +136,8 @@ fn forward(mut stream: Stream, paths: &[PathBuf]) -> io::Result<()> {
         let _ = tx.send(result);
     });
     match rx.recv_timeout(ACK_TIMEOUT) {
-        Ok(Ok(answer)) if answer.trim_end() == "ok" => Ok(()),
+        Ok(Ok(answer)) if answer.trim_end() == "ok" => Ok(Answer::Taken),
+        Ok(Ok(answer)) if answer.trim_end() == RETIRING => Ok(Answer::Retiring),
         Ok(Ok(answer)) => Err(io::Error::other(format!("unexpected answer {answer:?}"))),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "no answer")),
@@ -119,6 +154,11 @@ pub fn serve(listener: LocalSocketListener, on_open: impl Fn(Vec<PathBuf>) + Sen
                 let Ok(conn) = conn else { continue };
                 let mut reader = BufReader::new(conn);
                 match read_paths(&mut reader) {
+                    Ok(_) if RETIRED.load(Ordering::SeqCst) => {
+                        let _ = reader
+                            .get_mut()
+                            .write_all(format!("{RETIRING}\n").as_bytes());
+                    }
                     Ok(paths) => {
                         on_open(paths);
                         let _ = reader.get_mut().write_all(b"ok\n");

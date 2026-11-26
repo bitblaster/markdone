@@ -1,5 +1,5 @@
 //! Modal dialogs: unsaved changes on close, a file changed on disk under unsaved edits,
-//! pasting an image, plain messages (errors, notices), and Help → About.
+//! pasting an image, plain messages (errors, notices), updates, and Help → About.
 //!
 //! These functions only draw and report the user's choice. The shell owns the state
 //! behind a dialog (which tabs are closing, the disk content waiting to be applied) and
@@ -28,6 +28,20 @@ pub enum DialogView {
     SaveBeforePaste,
     /// Help → About.
     About,
+    /// A newer release is published. `problem`: why it can't be installed here (the
+    /// download page is offered instead), or why installing it failed.
+    UpdateAvailable {
+        version: String,
+        problem: Option<String>,
+    },
+    /// The update is downloading and being installed.
+    UpdateInstalling {
+        version: String,
+    },
+    /// The update is installed: restart now?
+    UpdateInstalled {
+        version: String,
+    },
 }
 
 /// The user's choice.
@@ -51,6 +65,12 @@ pub enum Answer {
     Reveal,
     /// Open the project's website (About).
     OpenWebsite,
+    /// Open the release's page (notes, downloads).
+    OpenReleasePage,
+    /// Download and install the update.
+    Install,
+    /// Restart into the installed update.
+    Restart,
 }
 
 const WIDTH: f32 = 420.0;
@@ -128,13 +148,13 @@ fn about(ui: &mut egui::Ui) -> Option<Answer> {
         });
     });
     ui.label(
-        "A fast, lightweight Markdown editor. Documents render as you type: headings, \
+        "A fast, lightweight Markdown editor by Roberto Mozzicato (bitblaster).\nDocuments render as you type: headings, \
          lists and tasks, tables edited as a grid, links and images, code with syntax \
          highlighting, math, Mermaid diagrams, footnotes and callouts. The file stays \
          plain Markdown.",
     );
     ui.label(
-        "Free software, released under the MIT License. Markdone is a fork of writ, by \
+        "Free software, released under the MIT License.\nMarkdone is a fork of writ, by \
          Wilfred Denton.",
     );
     if ui.link(WEBSITE.trim_start_matches("https://")).clicked() {
@@ -231,6 +251,48 @@ pub fn show(ctx: &egui::Context, view: &DialogView) -> Option<Answer> {
                 );
             }
             DialogView::About => answer = about(ui),
+            DialogView::UpdateAvailable { version, problem } => {
+                heading(ui, &format!("Markdone {version} is available"));
+                ui.label(format!("You have version {}.", crate::update::CURRENT));
+                answer = match problem {
+                    Some(problem) => {
+                        ui.label(problem.as_str());
+                        ui.label("You can download the new version from its release page.");
+                        buttons(
+                            ui,
+                            &[],
+                            &[
+                                ("Later", Answer::Cancel),
+                                ("Open Download Page", Answer::OpenReleasePage),
+                            ],
+                        )
+                    }
+                    None => {
+                        ui.label("Download and install it now? Markdone can then restart into it.");
+                        buttons(
+                            ui,
+                            &[("What's New", Answer::OpenReleasePage)],
+                            &[("Later", Answer::Cancel), ("Install", Answer::Install)],
+                        )
+                    }
+                };
+            }
+            DialogView::UpdateInstalling { version } => {
+                heading(ui, &format!("Installing Markdone {version}"));
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new());
+                    ui.label("Downloading…");
+                });
+            }
+            DialogView::UpdateInstalled { version } => {
+                heading(ui, &format!("Markdone {version} is installed"));
+                ui.label("Restart Markdone to use it? Your open documents are reopened.");
+                answer = buttons(
+                    ui,
+                    &[],
+                    &[("Later", Answer::Cancel), ("Restart Now", Answer::Restart)],
+                );
+            }
             DialogView::Exported { name } => {
                 heading(ui, "PDF exported");
                 ui.label(format!("“{name}” is ready."));
@@ -248,14 +310,18 @@ pub fn show(ctx: &egui::Context, view: &DialogView) -> Option<Answer> {
         && response.is_top_modal
         && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
     {
-        answer = Some(match view {
+        answer = match view {
             DialogView::Unsaved { .. }
             | DialogView::ConfirmReload { .. }
-            | DialogView::SaveBeforePaste => Answer::Cancel,
+            | DialogView::SaveBeforePaste
+            | DialogView::UpdateAvailable { .. }
+            | DialogView::UpdateInstalled { .. } => Some(Answer::Cancel),
             DialogView::Message { .. } | DialogView::Exported { .. } | DialogView::About => {
-                Answer::Ok
+                Some(Answer::Ok)
             }
-        });
+            // The download goes on; the dialog closes by itself.
+            DialogView::UpdateInstalling { .. } => None,
+        };
     }
     answer
 }

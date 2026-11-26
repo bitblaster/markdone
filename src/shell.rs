@@ -617,6 +617,17 @@ pub(crate) enum WritEvent {
     },
     /// A PDF export finished: the file, or an error for the user.
     ExportDone(Result<PathBuf, String>),
+    /// The update check answered: a newer release, if any. `manual`: asked from the Help
+    /// menu (then "up to date" and errors are shown too).
+    UpdateChecked {
+        manual: bool,
+        result: Result<Option<crate::update::Release>, String>,
+    },
+    /// Installing `release` finished.
+    UpdateInstalled {
+        release: crate::update::Release,
+        result: Result<(), String>,
+    },
 }
 
 /// Tabs to close (by id), and whether the application quits once they are closed.
@@ -649,6 +660,19 @@ enum PendingModal {
     SaveBeforePaste,
     /// Help → About.
     About,
+    /// A newer release can be installed (`problem`: why not, see `DialogView`).
+    UpdateAvailable {
+        release: crate::update::Release,
+        problem: Option<String>,
+    },
+    /// The update is being downloaded and installed.
+    UpdateInstalling {
+        version: String,
+    },
+    /// The update is installed.
+    UpdateInstalled {
+        version: String,
+    },
 }
 
 /// A misspelled word right-clicked: its buffer range, and the suggestions offered.
@@ -978,6 +1002,8 @@ struct App {
     next_tab_id: u64,
     /// The dialog being shown, if any. While set, the document gets no input.
     modal: Option<PendingModal>,
+    /// Quitting to restart into an installed update (see `update::restart`).
+    restart: bool,
     /// A native Open / Save As dialog is open (at most one at a time).
     file_dialog_open: bool,
     /// A PDF export is running: the output file name (shown with a spinner).
@@ -1198,6 +1224,10 @@ impl App {
         };
         #[cfg(not(all(unix, not(target_os = "macos"))))]
         let system_theme: Option<ThemeMode> = None;
+        // Is a newer Markdone published? (Not for `--demo`, which keeps no session.)
+        if config.prefs.check_updates && session_path.is_some() {
+            spawn_update_check(&runtime, &proxy, false);
+        }
         let applied_theme = config
             .prefs
             .theme_for(config.prefs.effective_mode(system_theme))
@@ -1234,6 +1264,7 @@ impl App {
             session,
             session_path,
             session_saved: None,
+            restart: false,
             prefs: config.prefs.clone(),
             theme_names: config.theme_names.clone(),
             themes: config.themes.clone(),
@@ -1459,6 +1490,35 @@ impl App {
                 quit: false,
             };
             self.request_close(req, event_loop);
+        }
+    }
+
+    /// The update check answered: offer a newer release. A check made at startup stays
+    /// silent otherwise (and gives way to a dialog already shown); one asked from the Help
+    /// menu also reports "up to date" and errors.
+    fn update_checked(
+        &mut self,
+        manual: bool,
+        result: Result<Option<crate::update::Release>, String>,
+    ) {
+        if !manual && self.modal.is_some() {
+            return;
+        }
+        match result {
+            Ok(Some(release)) => {
+                let problem = crate::update::install_problem(&release);
+                self.modal = Some(PendingModal::UpdateAvailable { release, problem });
+                self.redraw();
+            }
+            Ok(None) if manual => self.show_message(
+                "Markdone is up to date",
+                format!("Version {} is the latest release.", crate::update::CURRENT),
+            ),
+            Err(e) if manual => {
+                self.show_message("Could not check for updates", format!("GitHub: {e}"));
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("[markdone] update check failed: {e}"),
         }
     }
 
@@ -2567,6 +2627,16 @@ impl App {
             },
             PendingModal::SaveBeforePaste => DialogView::SaveBeforePaste,
             PendingModal::About => DialogView::About,
+            PendingModal::UpdateAvailable { release, problem } => DialogView::UpdateAvailable {
+                version: release.version.clone(),
+                problem: problem.clone(),
+            },
+            PendingModal::UpdateInstalling { version } => DialogView::UpdateInstalling {
+                version: version.clone(),
+            },
+            PendingModal::UpdateInstalled { version } => DialogView::UpdateInstalled {
+                version: version.clone(),
+            },
             PendingModal::Exported { path } => DialogView::Exported {
                 name: path.file_name().map_or_else(
                     || path.display().to_string(),
@@ -2603,9 +2673,45 @@ impl App {
                     }
                 }
                 Answer::Discard => self.finish_close(req, event_loop),
-                _ => {}
+                // Cancelled: a restart that asked for this close is off too.
+                _ => self.restart = false,
             },
             PendingModal::Message { .. } => {}
+            PendingModal::UpdateAvailable { release, problem } => match answer {
+                Answer::Install => {
+                    self.modal = Some(PendingModal::UpdateInstalling {
+                        version: release.version.clone(),
+                    });
+                    let proxy = self.proxy.clone();
+                    self.runtime.spawn(async move {
+                        let result = crate::update::install(release.clone()).await;
+                        let _ = proxy.send_event(WritEvent::UpdateInstalled { release, result });
+                    });
+                }
+                Answer::OpenReleasePage => {
+                    let page = if problem.is_some() {
+                        crate::update::RELEASES_PAGE
+                    } else {
+                        release.page.as_str()
+                    };
+                    if let Err(e) = open::that_detached(page) {
+                        eprintln!("[markdone] failed to open the release page: {e}");
+                    }
+                    // "What's New" keeps the question up; the download page answers it.
+                    if problem.is_none() {
+                        self.modal = Some(PendingModal::UpdateAvailable { release, problem });
+                    }
+                }
+                _ => {}
+            },
+            // No buttons: it closes when the installation finishes.
+            modal @ PendingModal::UpdateInstalling { .. } => self.modal = Some(modal),
+            PendingModal::UpdateInstalled { .. } => {
+                if answer == Answer::Restart {
+                    self.restart = true;
+                    self.run_command(Command::Quit, event_loop);
+                }
+            }
             PendingModal::About => {
                 if answer == Answer::OpenWebsite {
                     if let Err(e) = open::that_detached(crate::ui::dialogs::WEBSITE) {
@@ -2722,6 +2828,7 @@ impl App {
         match cmd {
             Command::New => self.open_blank_tab(),
             Command::About => self.modal = Some(PendingModal::About),
+            Command::CheckForUpdates => spawn_update_check(&self.runtime, &self.proxy, true),
             Command::Preferences => {
                 if self.font_families.is_none() {
                     self.font_families = Some(self.doc_engine.text_engine.font_families());
@@ -2816,7 +2923,9 @@ impl App {
             }
             // A table cell holds inline text only: a paragraph style or a code block
             // there would rewrite the row's line and break the table.
-            Command::Block(_) | Command::InsertCodeBlock if self.doc_engine.editor.in_table() => {
+            Command::Block(_) | Command::InsertCodeBlock | Command::InsertTable
+                if self.doc_engine.editor.in_table() =>
+            {
                 return;
             }
             Command::Block(block) => {
@@ -2832,6 +2941,11 @@ impl App {
             Command::InsertCodeBlock => {
                 let (text, sel) = self.text_and_selection();
                 self.apply_format(crate::format::insert_code_block(&text, sel));
+                return;
+            }
+            Command::InsertTable => {
+                let (text, sel) = self.text_and_selection();
+                self.apply_format(crate::format::insert_table(&text, sel));
                 return;
             }
             Command::InsertImage => {
@@ -4574,6 +4688,23 @@ impl ApplicationHandler<WritEvent> for App {
             if let Some(path) = path {
                 self.run_export(id, path);
             }
+            return;
+        }
+        if let WritEvent::UpdateChecked { manual, result } = event {
+            self.update_checked(manual, result);
+            return;
+        }
+        if let WritEvent::UpdateInstalled { release, result } = event {
+            self.modal = Some(match result {
+                Ok(()) => PendingModal::UpdateInstalled {
+                    version: release.version,
+                },
+                Err(e) => PendingModal::UpdateAvailable {
+                    release,
+                    problem: Some(format!("Installing it failed: {e}.")),
+                },
+            });
+            self.redraw();
             return;
         }
         if let WritEvent::ExportDone(result) = event {
@@ -6633,6 +6764,19 @@ impl ApplicationHandler<WritEvent> for App {
     }
 }
 
+/// Ask GitHub for a newer release, off the loop (answered by `UpdateChecked`).
+fn spawn_update_check(
+    runtime: &tokio::runtime::Handle,
+    proxy: &EventLoopProxy<WritEvent>,
+    manual: bool,
+) {
+    let proxy = proxy.clone();
+    runtime.spawn(async move {
+        let result = crate::update::check().await;
+        let _ = proxy.send_event(WritEvent::UpdateChecked { manual, result });
+    });
+}
+
 /// Boot the shell: install the TLS provider, stand up a tokio runtime for HTTP/
 /// GitHub work (kept alive for the process), and run the winit event loop.
 pub fn run() -> Result<()> {
@@ -6665,6 +6809,9 @@ pub fn run() -> Result<()> {
         return snapshot(&path, w, h, scroll);
     }
 
+    // Before anything can replace the executable: remember its path, and delete what an
+    // earlier update left behind.
+    crate::update::cleanup();
     // A second launch hands its files to the running instance and exits here.
     let Some(startup) = startup_from_cli() else {
         return Ok(());
@@ -6673,6 +6820,13 @@ pub fn run() -> Result<()> {
     let proxy = event_loop.create_proxy();
     let mut app = App::new(startup, proxy, runtime.handle().clone());
     event_loop.run_app(&mut app)?;
+    // Restarting into an installed update: the session is saved (`exiting`), now start
+    // the new program.
+    let restart = app.restart;
+    drop(app);
+    if restart {
+        crate::update::restart();
+    }
     Ok(())
 }
 

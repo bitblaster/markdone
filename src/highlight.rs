@@ -124,7 +124,7 @@ fn tree_sitter(
         .map(|config| Backend::TreeSitter(Box::new(config)))
 }
 
-static LANGUAGES: [Language; 11] = [
+static LANGUAGES: [Language; 12] = [
     // Rust uses Zed's highlights.scm (broader coverage than the upstream query); Bash
     // uses its crate's bundled query.
     Language::new(&["rust", "rs"], || {
@@ -203,6 +203,31 @@ static LANGUAGES: [Language; 11] = [
             &format!("{JAVASCRIPT_HIGHLIGHT_QUERY}\n{TYPESCRIPT_HIGHLIGHTS_QUERY}"),
         )
     }),
+    // SQL (the generic dialect of DerekStride's grammar). Its query uses nvim-treesitter's
+    // capture names; the ones without a counterpart in HIGHLIGHT_NAMES are renamed (the
+    // others match by prefix, e.g. `function.call` → `function`).
+    Language::new(
+        &["sql", "mysql", "postgresql", "postgres", "sqlite", "plsql"],
+        || {
+            let query = [
+                // nvim-treesitter's spell-check marker: an extra capture on comments
+                // that would leave them uncolored.
+                (" @spell", ""),
+                ("@field", "@property"),
+                ("@float", "@number"),
+                ("@conditional", "@keyword"),
+                ("@storageclass", "@keyword"),
+                ("@type.qualifier", "@keyword"),
+                ("@parameter", "@variable.parameter"),
+            ]
+            .iter()
+            .fold(
+                tree_sitter_sequel::HIGHLIGHTS_QUERY.to_owned(),
+                |q, (from, to)| q.replace(from, to),
+            );
+            tree_sitter(tree_sitter_sequel::LANGUAGE.into(), "sql", &query)
+        },
+    ),
     // Tokenizer-backed languages (no publishable grammar crate): a ```mermaid / ```latex
     // code fence highlights through the normal code-block path, and revealed `$…$` math
     // styles via `highlight(content, "latex")`.
@@ -414,7 +439,7 @@ mod tests {
     #[test]
     fn added_languages_highlight() {
         let mut highlighter = Highlighter::new();
-        let cases: [(&[&str], &str, &str, &str); 7] = [
+        let cases: [(&[&str], &str, &str, &str); 8] = [
             (
                 &["java"],
                 "// c\npublic class A { int x = 1; }",
@@ -451,6 +476,12 @@ mod tests {
                 "// c\nconst f = () => 1;",
                 "const",
                 "// c",
+            ),
+            (
+                &["sql", "postgresql", "sqlite"],
+                "-- c\nSELECT id FROM t WHERE id > 1;",
+                "SELECT",
+                "-- c",
             ),
         ];
         for (aliases, code, keyword, comment) in cases {

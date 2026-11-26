@@ -140,6 +140,8 @@ pub mod text_input;
 pub mod tokenize;
 #[cfg(feature = "app")]
 pub mod ui;
+#[cfg(feature = "app")]
+pub mod update;
 pub mod validation;
 #[cfg(all(feature = "app", unix, not(target_os = "macos")))]
 pub mod wayland_dnd;

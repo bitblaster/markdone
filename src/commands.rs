@@ -37,6 +37,8 @@ pub enum Command {
     InsertLink,
     InsertImage,
     InsertCodeBlock,
+    /// An empty two-by-two table, as a block of its own.
+    InsertTable,
     /// A footnote: its reference at the caret, its definition at the document's end.
     InsertFootnote,
     /// Replace the misspelled word of the context menu with its suggestion `i`.
@@ -48,6 +50,8 @@ pub enum Command {
     Preferences,
     /// Help → About: the program's name, version, license and components.
     About,
+    /// Help → Check for Updates…: ask GitHub for a newer release now.
+    CheckForUpdates,
     Find,
     Replace,
     ToggleOutline,

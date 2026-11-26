@@ -80,6 +80,8 @@ pub fn menu_bar(ui: &mut egui::Ui, state: &MenuState) -> Option<Command> {
                             item(ui, "Paste", Command::Paste, true, &mut picked);
                             item(ui, "Select All", Command::SelectAll, true, &mut picked);
                             ui.separator();
+                            insert_items(ui, &mut picked, state.in_table);
+                            ui.separator();
                             item(ui, "Find…", Command::Find, true, &mut picked);
                             item(ui, "Replace…", Command::Replace, true, &mut picked);
                             ui.separator();
@@ -131,6 +133,14 @@ pub fn menu_bar(ui: &mut egui::Ui, state: &MenuState) -> Option<Command> {
                     );
                     titles.push(
                         ui.menu_button("Help", |ui| {
+                            item(
+                                ui,
+                                "Check for Updates…",
+                                Command::CheckForUpdates,
+                                true,
+                                &mut picked,
+                            );
+                            ui.separator();
                             item(ui, "About Markdone", Command::About, true, &mut picked);
                         })
                         .response,
@@ -168,9 +178,9 @@ fn item(ui: &mut egui::Ui, label: &str, cmd: Command, enabled: bool, picked: &mu
     }
 }
 
-/// The Text / Paragraph / Insert submenus (the Format menu and the context menu).
-/// `in_table`: the caret is in a table, whose cells hold inline text only, so the
-/// paragraph styles and the code block (which would break the row) are off.
+/// The Text / Paragraph submenus (the Format menu and the context menu). `in_table`:
+/// the caret is in a table, whose cells hold inline text only, so the paragraph styles
+/// (which would break the row) are off.
 pub fn format_items(ui: &mut egui::Ui, picked: &mut Option<Command>, in_table: bool) {
     let blocks = !in_table;
     ui.menu_button("Text", |ui| {
@@ -213,10 +223,17 @@ pub fn format_items(ui: &mut egui::Ui, picked: &mut Option<Command>, in_table: b
         );
         item(ui, "Quote", Command::Block(Block::Quote), blocks, picked);
     });
+}
+
+/// The Insert submenu (the Edit menu and the context menu). `in_table`: the caret is in
+/// a table, where the block inserts (code block, table) are off.
+pub fn insert_items(ui: &mut egui::Ui, picked: &mut Option<Command>, in_table: bool) {
+    let blocks = !in_table;
     ui.menu_button("Insert", |ui| {
         item(ui, "Link", Command::InsertLink, true, picked);
         item(ui, "Image…", Command::InsertImage, true, picked);
         item(ui, "Code Block", Command::InsertCodeBlock, blocks, picked);
+        item(ui, "Table", Command::InsertTable, blocks, picked);
         item(ui, "Footnote", Command::InsertFootnote, true, picked);
     });
 }
@@ -286,6 +303,7 @@ pub fn context_menu(
         );
         ui.separator();
         format_items(ui, &mut picked, in_table);
+        insert_items(ui, &mut picked, in_table);
         if in_table {
             ui.separator();
             table_items(ui, &mut picked);

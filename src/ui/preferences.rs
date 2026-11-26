@@ -369,6 +369,16 @@ fn privacy_page(ui: &mut egui::Ui, prefs: &mut Preferences) {
         );
     });
     ui.add_space(8.0);
+    ui.checkbox(
+        &mut prefs.check_updates,
+        "Check for a new version of Markdone at startup",
+    );
+    note(
+        ui,
+        "Asks api.github.com for the latest release; a newer one is offered for \
+         download. Help → Check for Updates… checks at any time.",
+    );
+    ui.add_space(8.0);
     ui.label(egui::RichText::new("Spelling dictionaries").strong());
     note(
         ui,

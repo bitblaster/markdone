@@ -4,7 +4,7 @@ A fast, lightweight Markdown editor with live inline rendering: a native alterna
 Electron editors such as Zettlr, at a fraction of the memory. It runs on Linux, Windows
 and macOS.
 
-Markdone is a fork of [writ](https://github.com/wilfreddenton/writ) by Wilfred Denton
+Markdone was created by Roberto Mozzicato (bitblaster) as a fork of [writ](https://github.com/wilfreddenton/writ) by Wilfred Denton
 (MIT license), whose GPU document renderer and editing engine it builds on. It adds a
 desktop application around them: menus, tabs, dialogs, preferences, a table of contents,
 themes, PDF export, diagrams and more.
@@ -54,6 +54,17 @@ extracted folder. It installs for the current user (no root needed): the binary 
 
 The binary needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later). It
 can also be run directly from the extracted folder, without installing.
+
+### Updates
+
+At startup Markdone asks GitHub whether a newer release is published (*Preferences →
+Privacy* turns this off; *Help → Check for Updates…* checks at any time). It then offers
+to download and install it: the package for your system is downloaded, checked against
+its published SHA-256 and put in place of the program, and Markdone offers to restart
+into it, reopening your documents. On Windows the running `markdone.exe` can't be
+replaced, so it is renamed aside and deleted at the next start. Where Markdone can't
+write to its own folder (an installation for all users, a system package) it only
+announces the new version, with a link to its download page.
 
 ### From source
 
@@ -118,8 +129,9 @@ to jump to it; the current section is highlighted. Drag the panel edge to resize
 ### Formatting and editing
 
 The *Format* menu, the context menu and the shortcuts apply bold, italic,
-strikethrough, highlight and code, turn lines into headings, lists or quotes, and insert
-links, images and code blocks. Pasting rich text (from a web page or an office suite)
+strikethrough, highlight and code and turn lines into headings, lists or quotes; *Edit →
+Insert* (also in the context menu) inserts links, images, code blocks, tables and
+footnotes. Pasting rich text (from a web page or an office suite)
 converts it to Markdown; *Paste without Style* keeps the plain text, and *Copy as HTML*
 copies the rendered selection.
 
@@ -163,14 +175,14 @@ the type, and `+`/`-` after it (`> [!tip]-`) makes the callout foldable.
 Footnote references (`text[^1]`) show as superscript numbers (other labels in brackets),
 and the definitions (`[^1]: the note`) as the number and the note. Hovering a reference
 shows its note; Ctrl+click jumps from a reference to its note and from a note back to
-where it is referenced. *Format → Insert → Footnote* adds the next number at the cursor
+where it is referenced. *Edit → Insert → Footnote* adds the next number at the cursor
 and its definition at the end of the document, with the cursor there to write it.
 
 ### Code blocks
 
 Fenced code blocks are shown as panels with their language in the corner; the fences come
 back when the cursor enters the block. Syntax highlighting covers Rust, Python, Java,
-JavaScript, TypeScript, C, C++, PHP and shell (`bash`/`sh`), plus Mermaid and LaTeX
+JavaScript, TypeScript, C, C++, PHP, SQL and shell (`bash`/`sh`), plus Mermaid and LaTeX
 sources. In a code block Tab indents.
 
 ### Tables
@@ -183,10 +195,12 @@ to the cell below (adding a row after the last one). Enter starts a new line ins
 cell: a table row is a single line of Markdown, so the break is written as `<br>`, shown
 as a line break and stepped over or deleted as one character. A `|` typed in a cell is
 escaped, so it can't split the table. A cell holds inline text only, so the paragraph
-styles (headings, lists, quotes) and code blocks are off there. Columns keep their header
+styles (headings, lists, quotes), code blocks and tables are off there. Columns keep their header
 on one line whenever the table fits. The context menu's *Table* submenu clears or deletes
 the table, inserts and deletes rows and columns, and aligns a column; it rewrites the
-table with its columns lined up in the source. Type a header row such as `| Name | Age |`
+table with its columns lined up in the source. *Edit → Insert → Table* adds an empty
+table of two columns (header and one row) with the cursor in its first cell; or type a
+header row such as `| Name | Age |`
 and press Enter to add the delimiter and a body row.
 
 ### Mermaid diagrams

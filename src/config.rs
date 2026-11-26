@@ -155,6 +155,8 @@ pub struct Preferences {
     /// GitHub API token for those lookups (validation, hover cards, autocomplete); stored
     /// in plain text in the config file. `--github-token` / `GITHUB_TOKEN` take precedence.
     pub github_token: Option<String>,
+    /// At startup, ask GitHub whether a newer Markdone is published (and offer it).
+    pub check_updates: bool,
 }
 
 #[cfg(feature = "app")]
@@ -179,6 +181,7 @@ impl Default for Preferences {
             spell_languages: Vec::new(),
             github: false,
             github_token: None,
+            check_updates: true,
         }
     }
 }
@@ -328,6 +331,7 @@ struct NetworkSpec {
     github: Option<bool>,
     /// GitHub API token for the reference lookups (stored in plain text).
     github_token: Option<String>,
+    check_updates: Option<bool>,
 }
 
 #[cfg(feature = "app")]
@@ -576,6 +580,9 @@ fn resolve(file: FileConfig) -> ResolvedConfig {
         if let Some(github) = network.github {
             cfg.prefs.github = github;
         }
+        if let Some(check) = network.check_updates {
+            cfg.prefs.check_updates = check;
+        }
         cfg.prefs.github_token = network
             .github_token
             .as_deref()
@@ -645,6 +652,7 @@ pub fn save_preferences(path: &Path, prefs: &Preferences) -> std::io::Result<()>
         )),
     );
     set("network", "github", value(prefs.github));
+    set("network", "check_updates", value(prefs.check_updates));
     // The pre-modes single theme name is superseded by `dark`/`light`/`mode` (left in place
     // it would be re-read as the chosen theme).
     if let Some(t) = doc.get_mut("theme").and_then(Item::as_table_like_mut) {
@@ -794,7 +802,7 @@ mod tests {
             "[editor]\nfull_width = true\nmax_width = 1000\n\
              [files]\non_external_change = \"ask\"\ncheck_on_focus = false\nautosave = true\n\
              [spelling]\nenabled = true\nlanguages = [\"it_IT\", \"en_US\"]\n\
-             [network]\ngithub = true\n",
+             [network]\ngithub = true\ncheck_updates = false\n",
         )
         .unwrap();
         let p = resolve(file).prefs;
@@ -806,6 +814,7 @@ mod tests {
         assert!(p.spell_check);
         assert_eq!(p.spell_languages, ["it_IT", "en_US"]);
         assert!(p.github);
+        assert!(!p.check_updates);
         // Defaults: limited width, reload, check on focus, no network.
         let d = resolve(FileConfig::default()).prefs;
         assert_eq!(d, Preferences::default());
@@ -924,6 +933,7 @@ mod tests {
             spell_languages: vec!["it_IT".into(), "en_US".into()],
             github: true,
             github_token: Some("ghp_example".into()),
+            check_updates: false,
         };
         save_preferences(&path, &prefs).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
